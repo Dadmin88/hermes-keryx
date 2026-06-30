@@ -1,0 +1,12 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+service KeryxDaemon {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Doctor(DoctorRequest) returns (DoctorResponse);
+}
+
+message StatusRequest {}
+message StatusResponse { string status = 1; }
+message DoctorRequest {}
+message DoctorResponse { string status = 1; repeated string messages = 2; }

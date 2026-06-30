@@ -1,0 +1,4 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+message PolicyDecision { bool allowed = 1; bool requires_approval = 2; string reason = 3; }

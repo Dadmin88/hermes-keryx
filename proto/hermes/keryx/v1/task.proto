@@ -1,0 +1,25 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+import "hermes/keryx/v1/common.proto";
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_CREATED = 1;
+  TASK_STATUS_ACCEPTED = 2;
+  TASK_STATUS_QUEUED = 3;
+  TASK_STATUS_AWAITING_APPROVAL = 4;
+  TASK_STATUS_LEASED = 5;
+  TASK_STATUS_RUNNING = 6;
+  TASK_STATUS_AWAITING_INPUT = 7;
+  TASK_STATUS_COMPLETED = 8;
+  TASK_STATUS_FAILED = 9;
+  TASK_STATUS_CANCELED = 10;
+  TASK_STATUS_TIMED_OUT = 11;
+  TASK_STATUS_REJECTED = 12;
+  TASK_STATUS_DEAD_LETTERED = 13;
+}
+
+message TaskMessagePart { string media_type = 1; string text = 2; bytes raw = 3; map<string, string> metadata = 4; }
+message TaskMessage { repeated TaskMessagePart parts = 1; map<string, string> metadata = 2; }
+message TaskEnvelope { TaskId task_id = 1; CorrelationId correlation_id = 2; IdempotencyKey idempotency_key = 3; TaskStatus status = 4; repeated TaskMessage messages = 5; map<string, string> metadata = 6; }

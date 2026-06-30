@@ -1,0 +1,25 @@
+[package]
+name = "keryx-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "keryxd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+keryx-core = { path = "../keryx-core" }
+keryx-store = { path = "../keryx-store" }
+keryx-proto = { path = "../keryx-proto" }
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tonic = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,6 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+import "hermes/keryx/v1/common.proto";
+
+message Capability { CapabilityId capability_id = 1; string name = 2; string description = 3; string input_schema_json = 4; string output_schema_json = 5; repeated string tags = 6; string risk_level = 7; bool requires_approval = 8; map<string, string> metadata = 9; }

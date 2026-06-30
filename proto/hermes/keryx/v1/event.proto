@@ -1,0 +1,26 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+import "hermes/keryx/v1/common.proto";
+import "hermes/keryx/v1/task.proto";
+
+enum KeryxEventType {
+  KERYX_EVENT_TYPE_UNSPECIFIED = 0;
+  KERYX_EVENT_TYPE_AGENT_REGISTERED = 1;
+  KERYX_EVENT_TYPE_AGENT_HEARTBEAT = 2;
+  KERYX_EVENT_TYPE_AGENT_OFFLINE = 3;
+  KERYX_EVENT_TYPE_TASK_CREATED = 10;
+  KERYX_EVENT_TYPE_TASK_ACCEPTED = 11;
+  KERYX_EVENT_TYPE_TASK_QUEUED = 12;
+  KERYX_EVENT_TYPE_TASK_LEASED = 13;
+  KERYX_EVENT_TYPE_TASK_STARTED = 14;
+  KERYX_EVENT_TYPE_TASK_COMPLETED = 15;
+  KERYX_EVENT_TYPE_TASK_FAILED = 16;
+  KERYX_EVENT_TYPE_TASK_CANCELED = 17;
+  KERYX_EVENT_TYPE_TASK_TIMED_OUT = 18;
+  KERYX_EVENT_TYPE_TASK_DEAD_LETTERED = 19;
+  KERYX_EVENT_TYPE_POLICY_DENIED = 30;
+  KERYX_EVENT_TYPE_RECOVERY_ACTION = 40;
+}
+
+message KeryxEvent { string event_id = 1; KeryxEventType event_type = 2; TaskId task_id = 3; TaskStatus task_status = 4; CorrelationId correlation_id = 5; Timestamp occurred_at = 6; map<string, string> metadata = 7; }
