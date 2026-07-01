@@ -107,18 +107,64 @@ fn in_memory_recovery_requeues_expired_running_leases_deterministically() {
         )
         .unwrap();
 
-    let recovered = store.recover_stale_leases(501).unwrap();
+    let recovered = store.recover_stale_leases(501, None).unwrap();
 
     assert_eq!(
         recovered
+            .recovered_tasks
             .iter()
             .map(|task| task.task_id().as_str())
             .collect::<Vec<_>>(),
         vec!["lease-task-a", "lease-task-b"]
     );
+    assert_eq!(recovered.cleaned_terminal_leases, 0);
+    assert_eq!(recovered.corruption_count(), 0);
     assert_eq!(
         store.get_task(first.task_id()).unwrap().status,
         TaskStatus::Pending
+    );
+    assert_eq!(
+        store.get_task(second.task_id()).unwrap().status,
+        TaskStatus::Pending
+    );
+}
+
+#[test]
+fn in_memory_recovery_limit_is_applied_after_deterministic_ordering() {
+    let store = InMemoryStore::default();
+
+    let first = task(
+        "lease-task-limit-a",
+        TaskStatus::Pending,
+        Some("lease-idem-limit-a"),
+    );
+    store.accept_task(first.clone()).unwrap();
+    store
+        .lease_task(
+            first.task_id(),
+            lease(first.task_id(), "lease-limit-a", "worker-limit-a", 500),
+        )
+        .unwrap();
+
+    let second = task(
+        "lease-task-limit-b",
+        TaskStatus::Pending,
+        Some("lease-idem-limit-b"),
+    );
+    store.accept_task(second.clone()).unwrap();
+    store
+        .lease_task(
+            second.task_id(),
+            lease(second.task_id(), "lease-limit-b", "worker-limit-b", 400),
+        )
+        .unwrap();
+
+    let recovered = store.recover_stale_leases(501, Some(1)).unwrap();
+
+    assert_eq!(recovered.recovered_tasks, vec![second.clone()]);
+    assert_eq!(
+        store.get_task(first.task_id()).unwrap().status,
+        TaskStatus::Running
     );
     assert_eq!(
         store.get_task(second.task_id()).unwrap().status,
@@ -141,9 +187,10 @@ fn in_memory_recovery_preserves_terminal_tasks_and_cleans_stale_metadata() {
         )
         .unwrap();
 
-    let recovered = store.recover_stale_leases(501).unwrap();
+    let recovered = store.recover_stale_leases(501, None).unwrap();
 
-    assert!(recovered.is_empty());
+    assert!(recovered.recovered_tasks.is_empty());
+    assert_eq!(recovered.cleaned_terminal_leases, 0);
     assert_eq!(
         store.get_task(record.task_id()).unwrap().status,
         TaskStatus::Completed
@@ -166,8 +213,8 @@ fn in_memory_stale_tokens_are_rejected_after_recovery_and_reissue() {
         .lease_task(record.task_id(), first_lease.clone())
         .unwrap();
 
-    let recovered = store.recover_stale_leases(501).unwrap();
-    assert_eq!(recovered, vec![record.clone()]);
+    let recovered = store.recover_stale_leases(501, None).unwrap();
+    assert_eq!(recovered.recovered_tasks, vec![record.clone()]);
 
     assert_eq!(
         store

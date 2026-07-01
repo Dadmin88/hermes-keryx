@@ -11,7 +11,9 @@ async fn main() -> Result<()> {
         component = "keryxd",
         db_path = %runtime.report().db_path.display(),
         schema_version = runtime.report().schema_version,
-        recovered_tasks = runtime.report().recovered_tasks,
+        recovered_tasks = runtime.report().recovery.recovered_task_count(),
+        cleaned_terminal_leases = runtime.report().recovery.cleaned_terminal_leases,
+        corruption_count = runtime.report().recovery.corruption_count(),
         "Hermes Keryx daemon runtime ready"
     );
 

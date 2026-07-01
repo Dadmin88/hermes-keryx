@@ -111,6 +111,45 @@ pub struct TaskEventRecord {
     pub to_status: TaskStatus,
 }
 
+/// Typed summary returned by explicit stale-lease recovery.
+///
+/// Recovery metadata is intentionally split for Phase 4: durable per-task audit
+/// details live in appended `RecoveryAction` event rows, while this report gives
+/// daemon/status callers cheap typed counters and recovered task snapshots without
+/// reading event payloads. `recovered_tasks` preserves the old caller shape as the
+/// ordered list of running tasks returned to `Pending`; terminal and already-pending
+/// lease cleanups are summarized as counts instead of synthetic task transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecoveryReport {
+    /// Running tasks recovered to `Pending`, ordered by stale lease
+    /// `(expires_at_ms ASC, task_id ASC)` after any caller-supplied limit.
+    pub recovered_tasks: Vec<TaskRecord>,
+    /// Count of stale active leases cleaned for terminal tasks without changing
+    /// their terminal status.
+    pub cleaned_terminal_leases: usize,
+    /// Task snapshots whose event stream is missing or does not replay to the
+    /// stored snapshot, ordered by `task_id` for deterministic reports.
+    pub corrupted_tasks: Vec<TaskId>,
+}
+
+impl RecoveryReport {
+    #[must_use]
+    pub fn recovered_task_count(&self) -> usize {
+        self.recovered_tasks.len()
+    }
+
+    #[must_use]
+    pub fn corruption_count(&self) -> usize {
+        self.corrupted_tasks.len()
+    }
+
+    /// Compatibility helper for older callers that only consumed recovered tasks.
+    #[must_use]
+    pub fn into_recovered_tasks(self) -> Vec<TaskRecord> {
+        self.recovered_tasks
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub lease_id: LeaseId,
@@ -317,7 +356,11 @@ impl InMemoryStore {
         Ok(self.lock()?.leases.get(task_id).cloned())
     }
 
-    pub fn recover_stale_leases(&self, now_ms: i64) -> StoreResult<Vec<TaskRecord>> {
+    pub fn recover_stale_leases(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<RecoveryReport> {
         let mut state = self.lock()?;
         let mut stale_leases = state
             .leases
@@ -330,8 +373,12 @@ impl InMemoryStore {
                 .cmp(&right.expires_at_ms)
                 .then_with(|| left.task_id.as_str().cmp(right.task_id.as_str()))
         });
+        if let Some(limit) = limit {
+            stale_leases.truncate(limit);
+        }
 
         let mut recovered = Vec::new();
+        let mut cleaned_terminal_leases = 0;
         for lease in stale_leases {
             state.leases.remove(&lease.task_id);
             let Some(task) = state.tasks.get(&lease.task_id).cloned() else {
@@ -358,9 +405,17 @@ impl InMemoryStore {
             state.tasks.insert(lease.task_id.clone(), updated.clone());
             if should_requeue {
                 recovered.push(updated);
+            } else if from_status.is_terminal() {
+                cleaned_terminal_leases += 1;
             }
         }
-        Ok(recovered)
+
+        let corrupted_tasks = collect_corrupt_in_memory_tasks(&state);
+        Ok(RecoveryReport {
+            recovered_tasks: recovered,
+            cleaned_terminal_leases,
+            corrupted_tasks,
+        })
     }
 }
 
@@ -439,11 +494,14 @@ impl TaskStore for InMemoryStore {
     }
 
     fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>> {
-        self.lock()?
-            .events
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))
+        let state = self.lock()?;
+        match state.events.get(task_id) {
+            Some(events) => Ok(events.clone()),
+            None if state.tasks.contains_key(task_id) => {
+                Err(StoreError::CorruptEventStream(task_id.clone()))
+            }
+            None => Err(StoreError::TaskNotFound(task_id.clone())),
+        }
     }
 
     fn replay_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord> {
@@ -456,14 +514,8 @@ impl TaskStore for InMemoryStore {
         let events = state
             .events
             .get(task_id)
-            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
-        let last_event = events
-            .last()
             .ok_or_else(|| StoreError::CorruptEventStream(task_id.clone()))?;
-
-        let mut replayed = snapshot;
-        replayed.status = last_event.to_status;
-        Ok(replayed)
+        replay_task_from_snapshot_and_events(&snapshot, events)
     }
 }
 
@@ -631,19 +683,19 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await?;
         if rows.is_empty() {
-            return Err(StoreError::TaskNotFound(task_id.clone()));
+            return match self.get_task(task_id).await {
+                Ok(_) => Err(StoreError::CorruptEventStream(task_id.clone())),
+                Err(StoreError::TaskNotFound(_)) => Err(StoreError::TaskNotFound(task_id.clone())),
+                Err(error) => Err(error),
+            };
         }
         rows.into_iter().map(row_to_event).collect()
     }
 
     pub async fn replay_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord> {
-        let mut task = self.get_task(task_id).await?;
+        let task = self.get_task(task_id).await?;
         let events = self.events_for_task(task_id).await?;
-        let last = events
-            .last()
-            .ok_or_else(|| StoreError::CorruptEventStream(task_id.clone()))?;
-        task.status = last.to_status;
-        Ok(task)
+        replay_task_from_snapshot_and_events(&task, &events)
     }
 
     pub async fn lease_task(
@@ -795,17 +847,35 @@ impl SqliteStore {
         row.map(row_to_lease).transpose()
     }
 
-    pub async fn recover_stale_leases(&self, now_ms: i64) -> StoreResult<Vec<TaskRecord>> {
+    pub async fn recover_stale_leases(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<RecoveryReport> {
         let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query(
-            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND expires_at_ms <= ? ORDER BY expires_at_ms ASC, task_id ASC",
-        )
-        .bind(now_ms)
-        .fetch_all(&mut *tx)
-        .await?;
-        let recovered = recover_sqlite_leases_with_executor(&mut tx, rows).await?;
+        let rows = match limit {
+            Some(limit) => {
+                sqlx::query(
+                    "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND expires_at_ms <= ? ORDER BY expires_at_ms ASC, task_id ASC LIMIT ?",
+                )
+                .bind(now_ms)
+                .bind(limit as i64)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND expires_at_ms <= ? ORDER BY expires_at_ms ASC, task_id ASC",
+                )
+                .bind(now_ms)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
+        let mut report = recover_sqlite_leases_with_executor(&mut tx, rows).await?;
+        report.corrupted_tasks = collect_corrupt_sqlite_tasks_with_executor(&mut tx).await?;
         tx.commit().await?;
-        Ok(recovered)
+        Ok(report)
     }
 }
 
@@ -974,8 +1044,9 @@ async fn fetch_active_lease_with_executor(
 async fn recover_sqlite_leases_with_executor(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     rows: Vec<sqlx::sqlite::SqliteRow>,
-) -> StoreResult<Vec<TaskRecord>> {
+) -> StoreResult<RecoveryReport> {
     let mut recovered = Vec::new();
+    let mut cleaned_terminal_leases = 0;
     for row in rows {
         let lease = row_to_lease(row)?;
         let task = fetch_task_optional_with_executor(tx, &lease.task_id).await?;
@@ -1014,9 +1085,140 @@ async fn recover_sqlite_leases_with_executor(
                 to_status,
                 task.idempotency_key,
             ));
+        } else if task.status.is_terminal() {
+            cleaned_terminal_leases += 1;
         }
     }
-    Ok(recovered)
+    Ok(RecoveryReport {
+        recovered_tasks: recovered,
+        cleaned_terminal_leases,
+        corrupted_tasks: Vec::new(),
+    })
+}
+
+async fn collect_corrupt_sqlite_tasks_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> StoreResult<Vec<TaskId>> {
+    let rows = sqlx::query("SELECT task_id FROM tasks ORDER BY task_id ASC")
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut corrupted = Vec::new();
+    for row in rows {
+        let task_id = TaskId::new(row.get::<String, _>("task_id"))?;
+        let task = fetch_task_with_executor(tx, &task_id).await?;
+        match events_for_task_with_executor(tx, &task_id).await {
+            Ok(events)
+                if matches!(
+                    replay_task_from_snapshot_and_events(&task, &events),
+                    Err(StoreError::CorruptEventStream(_))
+                ) =>
+            {
+                corrupted.push(task_id);
+            }
+            Err(StoreError::CorruptEventStream(_)) => corrupted.push(task_id),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(corrupted)
+}
+
+async fn events_for_task_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+) -> StoreResult<Vec<TaskEventRecord>> {
+    let rows = sqlx::query(
+        "SELECT task_id, sequence, event_type, from_status, to_status FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
+    )
+    .bind(task_id.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        return Err(StoreError::CorruptEventStream(task_id.clone()));
+    }
+    rows.into_iter().map(row_to_event).collect()
+}
+
+fn collect_corrupt_in_memory_tasks(state: &InMemoryState) -> Vec<TaskId> {
+    let mut task_ids = state.tasks.keys().cloned().collect::<Vec<_>>();
+    task_ids.sort();
+    task_ids
+        .into_iter()
+        .filter(|task_id| {
+            let Some(task) = state.tasks.get(task_id) else {
+                return false;
+            };
+            let Some(events) = state.events.get(task_id) else {
+                return true;
+            };
+            matches!(
+                replay_task_from_snapshot_and_events(task, events),
+                Err(StoreError::CorruptEventStream(_))
+            )
+        })
+        .collect()
+}
+
+fn replay_task_from_snapshot_and_events(
+    snapshot: &TaskRecord,
+    events: &[TaskEventRecord],
+) -> StoreResult<TaskRecord> {
+    let task_id = snapshot.task_id().clone();
+    let Some(first) = events.first() else {
+        return Err(StoreError::CorruptEventStream(task_id));
+    };
+
+    if first.task_id != task_id
+        || first.sequence != 1
+        || first.event_type != KeryxEventType::TaskAccepted
+        || first.from_status.is_some()
+        || first.to_status != TaskStatus::Pending
+    {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
+
+    let mut current_status = first.to_status;
+    for (index, event) in events.iter().enumerate().skip(1) {
+        if event.task_id != snapshot.task_id().clone()
+            || event.sequence != (index as u64) + 1
+            || event.from_status != Some(current_status)
+        {
+            return Err(StoreError::CorruptEventStream(task_id));
+        }
+
+        match event.event_type {
+            KeryxEventType::TaskStarted
+            | KeryxEventType::TaskCompleted
+            | KeryxEventType::TaskFailed => {
+                let transition = validate_transition(current_status, event.to_status)
+                    .map_err(|_| StoreError::CorruptEventStream(task_id.clone()))?;
+                if transition.event_type != event.event_type {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = transition.to;
+            }
+            KeryxEventType::RecoveryAction => {
+                let expected_to_status = match current_status {
+                    TaskStatus::Running => TaskStatus::Pending,
+                    TaskStatus::Pending => TaskStatus::Pending,
+                    TaskStatus::Completed => TaskStatus::Completed,
+                    TaskStatus::Failed => TaskStatus::Failed,
+                };
+                if event.to_status != expected_to_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = event.to_status;
+            }
+            _ => return Err(StoreError::CorruptEventStream(task_id)),
+        }
+    }
+
+    if snapshot.status != current_status {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
+
+    Ok(snapshot.clone())
 }
 
 async fn next_sequence_with_executor(
@@ -1209,5 +1411,155 @@ fn str_to_event_type(value: &str) -> StoreResult<KeryxEventType> {
         "task_dead_lettered" => Ok(KeryxEventType::TaskDeadLettered),
         "recovery_action" => Ok(KeryxEventType::RecoveryAction),
         other => Err(StoreError::Database(format!("unknown event type: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+
+    use super::{
+        append_in_memory_event, InMemoryState, InMemoryStore, LeaseRecord, StoreError, TaskRecord,
+        TaskStore,
+    };
+
+    fn task(id: &str, status: TaskStatus, idem: Option<&str>) -> TaskRecord {
+        TaskRecord::new(
+            TaskId::new(id).unwrap(),
+            status,
+            idem.map(|value| IdempotencyKey::new(value).unwrap()),
+        )
+    }
+
+    fn lease(task_id: &TaskId, lease_id: &str, worker_id: &str, expires_at_ms: i64) -> LeaseRecord {
+        LeaseRecord::new(
+            LeaseId::new(lease_id).unwrap(),
+            task_id.clone(),
+            AgentId::new(worker_id).unwrap(),
+            100,
+            expires_at_ms,
+        )
+    }
+
+    #[test]
+    fn in_memory_recovery_cleans_terminal_stale_lease_without_changing_terminal_status() {
+        let task = task(
+            "corrupt-terminal-task",
+            TaskStatus::Completed,
+            Some("terminal-idem"),
+        );
+        let mut state = InMemoryState {
+            tasks: HashMap::from([(task.task_id().clone(), task.clone())]),
+            events: HashMap::new(),
+            idempotency: HashMap::new(),
+            leases: HashMap::from([(
+                task.task_id().clone(),
+                lease(task.task_id(), "terminal-lease", "terminal-worker", 500),
+            )]),
+        };
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskAccepted,
+            None,
+            TaskStatus::Pending,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskStarted,
+            Some(TaskStatus::Pending),
+            TaskStatus::Running,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskCompleted,
+            Some(TaskStatus::Running),
+            TaskStatus::Completed,
+        );
+        let store = InMemoryStore {
+            inner: Mutex::new(state),
+        };
+
+        let report = store.recover_stale_leases(501, None).unwrap();
+
+        assert!(report.recovered_tasks.is_empty());
+        assert_eq!(report.cleaned_terminal_leases, 1);
+        assert_eq!(report.corruption_count(), 0);
+        assert_eq!(
+            store.get_task(task.task_id()).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert!(store.active_lease(task.task_id()).unwrap().is_none());
+        let events = store.events_for_task(task.task_id()).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, KeryxEventType::RecoveryAction);
+        assert_eq!(last.from_status, Some(TaskStatus::Completed));
+        assert_eq!(last.to_status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn in_memory_replay_reports_missing_events_as_corruption() {
+        let task = task(
+            "missing-events-task",
+            TaskStatus::Pending,
+            Some("missing-events-idem"),
+        );
+        let store = InMemoryStore {
+            inner: Mutex::new(InMemoryState {
+                tasks: HashMap::from([(task.task_id().clone(), task.clone())]),
+                events: HashMap::new(),
+                idempotency: HashMap::new(),
+                leases: HashMap::new(),
+            }),
+        };
+
+        assert_eq!(
+            store.events_for_task(task.task_id()).unwrap_err(),
+            StoreError::CorruptEventStream(task.task_id().clone())
+        );
+        assert_eq!(
+            store.replay_task(task.task_id()).unwrap_err(),
+            StoreError::CorruptEventStream(task.task_id().clone())
+        );
+        let report = store.recover_stale_leases(0, None).unwrap();
+        assert_eq!(report.corrupted_tasks, vec![task.task_id().clone()]);
+    }
+
+    #[test]
+    fn in_memory_replay_reports_snapshot_event_status_mismatch_as_corruption() {
+        let task = task(
+            "mismatched-snapshot-task",
+            TaskStatus::Running,
+            Some("mismatched-snapshot-idem"),
+        );
+        let mut state = InMemoryState {
+            tasks: HashMap::from([(task.task_id().clone(), task.clone())]),
+            events: HashMap::new(),
+            idempotency: HashMap::new(),
+            leases: HashMap::new(),
+        };
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskAccepted,
+            None,
+            TaskStatus::Pending,
+        );
+        let store = InMemoryStore {
+            inner: Mutex::new(state),
+        };
+
+        assert_eq!(
+            store.replay_task(task.task_id()).unwrap_err(),
+            StoreError::CorruptEventStream(task.task_id().clone())
+        );
+        let report = store.recover_stale_leases(0, None).unwrap();
+        assert_eq!(report.corruption_count(), 1);
+        assert_eq!(report.corrupted_tasks, vec![task.task_id().clone()]);
     }
 }

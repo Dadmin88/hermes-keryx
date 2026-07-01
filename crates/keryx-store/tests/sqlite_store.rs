@@ -416,3 +416,82 @@ async fn sqlite_migration_requeues_legacy_active_leases_without_fabricating_owne
     let leased = store.lease_task(&task_id, new_lease.clone()).await.unwrap();
     assert_eq!(leased.status, TaskStatus::Running);
 }
+
+#[tokio::test]
+async fn sqlite_replay_and_recovery_report_missing_events_as_corruption() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("corrupt-keryx.db");
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let record = task(
+        "sqlite-corrupt-task",
+        TaskStatus::Pending,
+        Some("sqlite-corrupt-idem"),
+    );
+    store.accept_task(record.clone()).await.unwrap();
+
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM task_events WHERE task_id = ?")
+        .bind(record.task_id().as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.events_for_task(record.task_id()).await.unwrap_err(),
+        StoreError::CorruptEventStream(record.task_id().clone())
+    );
+    assert_eq!(
+        store.replay_task(record.task_id()).await.unwrap_err(),
+        StoreError::CorruptEventStream(record.task_id().clone())
+    );
+
+    let report = store.recover_stale_leases(0, None).await.unwrap();
+    assert_eq!(report.corrupted_tasks, vec![record.task_id().clone()]);
+}
+
+#[tokio::test]
+async fn sqlite_replay_and_recovery_report_status_mismatch_as_corruption() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("corrupt-status-keryx.db");
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let record = task(
+        "sqlite-corrupt-status-task",
+        TaskStatus::Pending,
+        Some("sqlite-corrupt-status-idem"),
+    );
+    store.accept_task(record.clone()).await.unwrap();
+
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET status = 'running' WHERE task_id = ?")
+        .bind(record.task_id().as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.replay_task(record.task_id()).await.unwrap_err(),
+        StoreError::CorruptEventStream(record.task_id().clone())
+    );
+
+    let report = store.recover_stale_leases(0, None).await.unwrap();
+    assert_eq!(report.corruption_count(), 1);
+    assert_eq!(report.corrupted_tasks, vec![record.task_id().clone()]);
+}

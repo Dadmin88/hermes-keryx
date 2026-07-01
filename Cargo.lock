@@ -906,6 +906,7 @@ dependencies = [
  "keryx-core",
  "keryx-proto",
  "keryx-store",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-stream",

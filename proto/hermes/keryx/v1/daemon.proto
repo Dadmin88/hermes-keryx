@@ -7,6 +7,17 @@ service KeryxDaemon {
 }
 
 message StatusRequest {}
-message StatusResponse { string status = 1; }
+message StatusResponse {
+  string status = 1;
+  string data_dir = 2;
+  string db_path = 3;
+  int64 schema_version = 4;
+  uint64 recovered_tasks = 5;
+  uint64 cleaned_terminal_leases = 6;
+  uint64 corruption_count = 7;
+  string store_kind = 8;
+  bool store_ready = 9;
+  string store_path = 10;
+}
 message DoctorRequest {}
 message DoctorResponse { string status = 1; repeated string messages = 2; }

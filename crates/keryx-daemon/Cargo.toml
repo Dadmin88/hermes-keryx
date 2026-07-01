@@ -22,4 +22,5 @@ tonic = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile.workspace = true

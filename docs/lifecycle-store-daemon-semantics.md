@@ -99,7 +99,7 @@ lease_task(task_id, lease_request, now_ms) -> LeasedTaskRecord
 renew_lease(task_id, lease_id, now_ms, extend_until_ms) -> LeaseRecord
 complete_task(task_id, lease_id, completion_metadata) -> TaskRecord
 fail_task(task_id, lease_id, failure_metadata) -> TaskRecord
-recover_stale_leases(now_ms, limit) -> Vec<RecoveredTaskRecord>
+recover_stale_leases(now_ms, limit) -> RecoveryReport
 get_task(task_id) -> TaskRecord
 events_for_task(task_id) -> Vec<TaskEventRecord>
 replay_task(task_id) -> TaskRecord
@@ -153,10 +153,12 @@ Operation semantics:
 
 - Requires explicit daemon/store recovery caller.
 - Finds active leases with `expires_at_ms <= now_ms`.
+- Applies `limit` after deterministic ordering by `expires_at_ms ASC, task_id ASC`; `None` means recover all currently stale active leases.
 - For non-terminal `Running` tasks, deactivates lease, updates snapshot to `Pending`, and appends `RecoveryAction` in one transaction.
 - For `Pending` tasks with an active stale lease, deactivates lease and appends `RecoveryAction` if the cleanup changes observable ownership metadata; status remains `Pending`.
 - For terminal tasks, preserves lifecycle state and deactivates stale active lease metadata. Do not append a lifecycle transition; append/emit a cleanup recovery record if needed for audit.
 - Must be deterministic: ordered by `expires_at_ms`, then `task_id`, with a configurable limit for large stores.
+- Returns a typed `RecoveryReport` with `recovered_tasks`, `cleaned_terminal_leases`, and `corrupted_tasks`; convenience counts are derived from those fields so daemon status/doctor can report recovery without parsing event payloads.
 
 ## 5. Lease acquisition, renewal, expiration, stale cleanup, and recovery semantics
 
@@ -205,7 +207,8 @@ Cleanup should handle inconsistent metadata safely:
 Recovery is intentionally a store/daemon operational action rather than a normal core lifecycle transition.
 
 - Recoverable non-terminal stale work returns to `Pending` so another worker can lease it.
-- Recovery must append `RecoveryAction` with enough context to audit previous lease id, old status, new status, and reason (`lease_expired`). If current `TaskEventRecord` cannot carry metadata yet, implementation should add structured fields or a companion recovery table/event payload in a later phase.
+- Recovery must append durable `RecoveryAction` rows for per-task audit. In the current typed API, `TaskEventRecord` carries task id, sequence, event type, `from_status`, and `to_status`; lease id, exact reason (`lease_expired`), and richer payload fields should be added to event payload metadata or a companion recovery table in a later phase rather than overloading the Phase 4 report.
+- `RecoveryReport` is the startup/status summary surface: `recovered_tasks` preserves the previous `Vec<TaskRecord>` caller data, `cleaned_terminal_leases` counts stale terminal lease metadata removed without status changes, and `corrupted_tasks` lists event-log/snapshot mismatches in deterministic `task_id` order.
 - Recovery should increment retry/attempt metadata once that metadata exists. Until then, repeated lease expiry may cause infinite retries; record this as a known limitation and expose counts in logs/doctor.
 
 ## 6. Daemon startup recovery behavior
