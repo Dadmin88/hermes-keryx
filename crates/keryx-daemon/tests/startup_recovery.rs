@@ -1,4 +1,4 @@
-use keryx_core::{IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
 use keryx_daemon::{KeryxDaemonConfig, KeryxDaemonRuntime};
 use keryx_store::{LeaseRecord, SqliteStore, TaskRecord};
 use tempfile::tempdir;
@@ -27,6 +27,7 @@ async fn startup_migrates_sqlite_and_recovers_stale_leases_before_reporting_read
             LeaseRecord::new(
                 LeaseId::new("daemon-lease-1").unwrap(),
                 record.task_id().clone(),
+                AgentId::new("daemon-worker-1").unwrap(),
                 100,
                 500,
             ),
@@ -38,7 +39,7 @@ async fn startup_migrates_sqlite_and_recovers_stale_leases_before_reporting_read
         .await
         .unwrap();
 
-    assert_eq!(runtime.report().schema_version, 1);
+    assert_eq!(runtime.report().schema_version, 2);
     assert_eq!(runtime.report().db_path, db_path);
     assert_eq!(runtime.report().recovered_tasks, 1);
     assert_eq!(
@@ -76,7 +77,7 @@ async fn startup_creates_default_database_under_data_dir() {
         .await
         .unwrap();
 
-    assert_eq!(runtime.report().schema_version, 1);
+    assert_eq!(runtime.report().schema_version, 2);
     assert_eq!(runtime.report().recovered_tasks, 0);
     assert!(data_dir.join("keryx.db").exists());
 }
@@ -94,7 +95,7 @@ async fn runtime_status_report_reflects_ready_sqlite_store() {
     assert!(status.daemon_ready);
     assert_eq!(status.data_dir, data_dir);
     assert_eq!(status.db_path, data_dir.join("keryx.db"));
-    assert_eq!(status.schema_version, 1);
+    assert_eq!(status.schema_version, 2);
     assert_eq!(status.recovered_tasks, 0);
     assert!(status.store.ready);
     assert_eq!(status.store.kind, "sqlite");
@@ -117,7 +118,7 @@ async fn runtime_doctor_report_marks_runtime_healthy_when_store_ready() {
         check.name == "data_dir" && check.ready && check.detail.contains("doctor-keryx-home")
     }));
     assert!(doctor.checks.iter().any(|check| {
-        check.name == "sqlite_store" && check.ready && check.detail.contains("schema_version=1")
+        check.name == "sqlite_store" && check.ready && check.detail.contains("schema_version=2")
     }));
     assert!(doctor.checks.iter().any(|check| {
         check.name == "startup_recovery"

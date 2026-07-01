@@ -27,7 +27,7 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
     assert!(doctor
         .messages
         .iter()
-        .any(|message| message.contains("sqlite_store") && message.contains("schema_version=1")));
+        .any(|message| message.contains("sqlite_store") && message.contains("schema_version=2")));
 
     server.abort();
 }

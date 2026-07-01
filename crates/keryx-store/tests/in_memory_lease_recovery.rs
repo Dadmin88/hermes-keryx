@@ -1,4 +1,4 @@
-use keryx_core::{IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
 use keryx_store::{InMemoryStore, LeaseRecord, TaskRecord, TaskStore};
 
 fn task(id: &str, status: TaskStatus, idem: Option<&str>) -> TaskRecord {
@@ -9,10 +9,15 @@ fn task(id: &str, status: TaskStatus, idem: Option<&str>) -> TaskRecord {
     )
 }
 
-fn lease(task_id: &TaskId, lease_id: &str, expires_at_ms: i64) -> LeaseRecord {
+fn worker(id: &str) -> AgentId {
+    AgentId::new(id).unwrap()
+}
+
+fn lease(task_id: &TaskId, lease_id: &str, worker_id: &str, expires_at_ms: i64) -> LeaseRecord {
     LeaseRecord::new(
         LeaseId::new(lease_id).unwrap(),
         task_id.clone(),
+        worker(worker_id),
         100,
         expires_at_ms,
     )
@@ -25,7 +30,10 @@ fn in_memory_lease_task_persists_lease_and_task_started_event() {
     store.accept_task(record.clone()).unwrap();
 
     let leased = store
-        .lease_task(record.task_id(), lease(record.task_id(), "lease-1", 1_000))
+        .lease_task(
+            record.task_id(),
+            lease(record.task_id(), "lease-1", "worker-1", 1_000),
+        )
         .unwrap();
 
     assert_eq!(leased.status, TaskStatus::Running);
@@ -51,11 +59,17 @@ fn in_memory_lease_renewal_updates_metadata_only_and_keeps_running_status() {
     let store = InMemoryStore::default();
     let record = task("lease-task-2", TaskStatus::Pending, Some("lease-idem-2"));
     store.accept_task(record.clone()).unwrap();
-    let lease = lease(record.task_id(), "lease-2", 500);
+    let lease = lease(record.task_id(), "lease-2", "worker-2", 500);
     store.lease_task(record.task_id(), lease.clone()).unwrap();
 
     let renewed = store
-        .renew_lease(record.task_id(), &lease.lease_id, 400, 900)
+        .renew_lease(
+            record.task_id(),
+            &lease.lease_id,
+            lease.worker_id.as_ref().unwrap(),
+            400,
+            900,
+        )
         .unwrap();
 
     assert_eq!(renewed.expires_at_ms, 900);
@@ -78,13 +92,19 @@ fn in_memory_recovery_requeues_expired_running_leases_deterministically() {
     let first = task("lease-task-a", TaskStatus::Pending, Some("lease-idem-a"));
     store.accept_task(first.clone()).unwrap();
     store
-        .lease_task(first.task_id(), lease(first.task_id(), "lease-a", 500))
+        .lease_task(
+            first.task_id(),
+            lease(first.task_id(), "lease-a", "worker-a", 500),
+        )
         .unwrap();
 
     let second = task("lease-task-b", TaskStatus::Pending, Some("lease-idem-b"));
     store.accept_task(second.clone()).unwrap();
     store
-        .lease_task(second.task_id(), lease(second.task_id(), "lease-b", 500))
+        .lease_task(
+            second.task_id(),
+            lease(second.task_id(), "lease-b", "worker-b", 500),
+        )
         .unwrap();
 
     let recovered = store.recover_stale_leases(501).unwrap();
@@ -111,10 +131,14 @@ fn in_memory_recovery_preserves_terminal_tasks_and_cleans_stale_metadata() {
     let store = InMemoryStore::default();
     let record = task("lease-task-3", TaskStatus::Pending, Some("lease-idem-3"));
     store.accept_task(record.clone()).unwrap();
-    let lease = lease(record.task_id(), "lease-3", 500);
+    let lease = lease(record.task_id(), "lease-3", "worker-3", 500);
     store.lease_task(record.task_id(), lease.clone()).unwrap();
     store
-        .complete_task(record.task_id(), &lease.lease_id)
+        .complete_task(
+            record.task_id(),
+            &lease.lease_id,
+            lease.worker_id.as_ref().unwrap(),
+        )
         .unwrap();
 
     let recovered = store.recover_stale_leases(501).unwrap();
@@ -130,4 +154,110 @@ fn in_memory_recovery_preserves_terminal_tasks_and_cleans_stale_metadata() {
         events.last().unwrap().event_type,
         KeryxEventType::TaskCompleted
     );
+}
+
+#[test]
+fn in_memory_stale_tokens_are_rejected_after_recovery_and_reissue() {
+    let store = InMemoryStore::default();
+    let record = task("lease-task-4", TaskStatus::Pending, Some("lease-idem-4"));
+    store.accept_task(record.clone()).unwrap();
+    let first_lease = lease(record.task_id(), "lease-4a", "worker-4a", 500);
+    store
+        .lease_task(record.task_id(), first_lease.clone())
+        .unwrap();
+
+    let recovered = store.recover_stale_leases(501).unwrap();
+    assert_eq!(recovered, vec![record.clone()]);
+
+    assert_eq!(
+        store
+            .renew_lease(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+                501,
+                900,
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::Validation(keryx_core::ValidationError::InvalidTaskTransition {
+            from: TaskStatus::Pending,
+            to: TaskStatus::Running,
+        },)
+    );
+    assert_eq!(
+        store
+            .complete_task(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::LeaseNotFound(record.task_id().clone())
+    );
+    assert_eq!(
+        store
+            .fail_task(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::LeaseNotFound(record.task_id().clone())
+    );
+
+    let second_lease = lease(record.task_id(), "lease-4b", "worker-4b", 1_000);
+    store
+        .lease_task(record.task_id(), second_lease.clone())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .renew_lease(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+                600,
+                1_100,
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::LeaseMismatch {
+            task_id: record.task_id().clone(),
+            lease_id: first_lease.lease_id.clone(),
+        }
+    );
+    assert_eq!(
+        store
+            .complete_task(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::LeaseMismatch {
+            task_id: record.task_id().clone(),
+            lease_id: first_lease.lease_id.clone(),
+        }
+    );
+    assert_eq!(
+        store
+            .fail_task(
+                record.task_id(),
+                &first_lease.lease_id,
+                first_lease.worker_id.as_ref().unwrap(),
+            )
+            .unwrap_err(),
+        keryx_store::StoreError::LeaseMismatch {
+            task_id: record.task_id().clone(),
+            lease_id: first_lease.lease_id.clone(),
+        }
+    );
+
+    let completed = store
+        .complete_task(
+            record.task_id(),
+            &second_lease.lease_id,
+            second_lease.worker_id.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(completed.status, TaskStatus::Completed);
 }

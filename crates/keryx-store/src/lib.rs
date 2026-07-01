@@ -3,7 +3,7 @@
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Mutex};
 
 use keryx_core::{
-    validate_transition, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, TaskId,
+    validate_transition, AgentId, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, TaskId,
     TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
@@ -32,6 +32,10 @@ pub enum StoreError {
     LeaseConflict { task_id: TaskId },
     #[error("lease {lease_id} does not own task {task_id}")]
     LeaseMismatch { task_id: TaskId, lease_id: LeaseId },
+    #[error("worker {worker_id} does not own active lease for task {task_id}")]
+    LeaseOwnerMismatch { task_id: TaskId, worker_id: AgentId },
+    #[error("lease {lease_id} for task {task_id} is missing a worker owner")]
+    LeaseOwnerMissing { task_id: TaskId, lease_id: LeaseId },
     #[error(
         "invalid lease expiry for {lease_id}: requested={requested_expires_at_ms}, current={current_expires_at_ms}, now={now_ms}"
     )]
@@ -111,21 +115,41 @@ pub struct TaskEventRecord {
 pub struct LeaseRecord {
     pub lease_id: LeaseId,
     pub task_id: TaskId,
+    pub worker_id: Option<AgentId>,
     pub leased_at_ms: i64,
     pub expires_at_ms: i64,
 }
 
 impl LeaseRecord {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         lease_id: LeaseId,
         task_id: TaskId,
+        worker_id: AgentId,
         leased_at_ms: i64,
         expires_at_ms: i64,
     ) -> Self {
         Self {
             lease_id,
             task_id,
+            worker_id: Some(worker_id),
+            leased_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    #[must_use]
+    fn from_parts(
+        lease_id: LeaseId,
+        task_id: TaskId,
+        worker_id: Option<AgentId>,
+        leased_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            lease_id,
+            task_id,
+            worker_id,
             leased_at_ms,
             expires_at_ms,
         }
@@ -184,6 +208,7 @@ impl InMemoryStore {
     pub fn lease_task(&self, task_id: &TaskId, lease: LeaseRecord) -> StoreResult<TaskRecord> {
         let mut state = self.lock()?;
         ensure_matching_task_id(task_id, &lease)?;
+        ensure_lease_has_owner(&lease)?;
         let task = state
             .tasks
             .get(task_id)
@@ -213,6 +238,7 @@ impl InMemoryStore {
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
         now_ms: i64,
         new_expires_at_ms: i64,
     ) -> StoreResult<LeaseRecord> {
@@ -228,23 +254,35 @@ impl InMemoryStore {
             .get_mut(task_id)
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, active, lease_id)?;
+        ensure_matching_worker_id(task_id, active, worker_id)?;
         ensure_valid_lease_expiry(active, now_ms, new_expires_at_ms)?;
         active.expires_at_ms = new_expires_at_ms;
         Ok(active.clone())
     }
 
-    pub fn complete_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, TaskStatus::Completed)
+    pub fn complete_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+    ) -> StoreResult<TaskRecord> {
+        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Completed)
     }
 
-    pub fn fail_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, TaskStatus::Failed)
+    pub fn fail_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+    ) -> StoreResult<TaskRecord> {
+        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
     }
 
     fn finish_task(
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
         to: TaskStatus,
     ) -> StoreResult<TaskRecord> {
         let mut state = self.lock()?;
@@ -259,6 +297,7 @@ impl InMemoryStore {
             .cloned()
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         let transition = validate_transition(task.status, to)?;
         let mut updated = task;
         updated.status = to;
@@ -458,6 +497,27 @@ impl SqliteStore {
         )
         .execute(&mut *tx)
         .await?;
+        let worker_id_column_exists =
+            sqlx::query("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'worker_id'")
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+        if !worker_id_column_exists {
+            for statement in MIGRATION_002 {
+                sqlx::query(statement).execute(&mut *tx).await?;
+            }
+        }
+        let legacy_unowned_rows = sqlx::query(
+            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows).await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -593,6 +653,7 @@ impl SqliteStore {
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         ensure_matching_task_id(task_id, &lease)?;
+        ensure_lease_has_owner(&lease)?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
         if fetch_active_lease_with_executor(&mut tx, task_id)
             .await?
@@ -605,10 +666,17 @@ impl SqliteStore {
         let transition = validate_transition(task.status, TaskStatus::Running)?;
         let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
         sqlx::query(
-            "INSERT OR REPLACE INTO leases (lease_id, task_id, leased_at_ms, expires_at_ms, active) VALUES (?, ?, ?, ?, 1)",
+            "INSERT OR REPLACE INTO leases (lease_id, task_id, worker_id, leased_at_ms, expires_at_ms, active) VALUES (?, ?, ?, ?, ?, 1)",
         )
         .bind(lease.lease_id.as_str())
         .bind(task_id.as_str())
+        .bind(
+            lease
+                .worker_id
+                .as_ref()
+                .expect("validated lease worker owner")
+                .as_str(),
+        )
         .bind(lease.leased_at_ms)
         .bind(lease.expires_at_ms)
         .execute(&mut *tx)
@@ -631,6 +699,7 @@ impl SqliteStore {
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
         now_ms: i64,
         new_expires_at_ms: i64,
     ) -> StoreResult<LeaseRecord> {
@@ -641,22 +710,25 @@ impl SqliteStore {
             .await?
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         ensure_valid_lease_expiry(&active, now_ms, new_expires_at_ms)?;
 
         sqlx::query(
-            "UPDATE leases SET expires_at_ms = ?, active = 1 WHERE task_id = ? AND lease_id = ?",
+            "UPDATE leases SET expires_at_ms = ?, active = 1 WHERE task_id = ? AND lease_id = ? AND worker_id = ?",
         )
         .bind(new_expires_at_ms)
         .bind(task_id.as_str())
         .bind(lease_id.as_str())
+        .bind(worker_id.as_str())
         .execute(&mut *tx)
         .await?;
         touch_task_updated_at_with_executor(&mut tx, task_id).await?;
         tx.commit().await?;
 
-        Ok(LeaseRecord::new(
+        Ok(LeaseRecord::from_parts(
             active.lease_id,
             active.task_id,
+            active.worker_id,
             active.leased_at_ms,
             new_expires_at_ms,
         ))
@@ -666,13 +738,19 @@ impl SqliteStore {
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
     ) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, TaskStatus::Completed)
+        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Completed)
             .await
     }
 
-    pub async fn fail_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, TaskStatus::Failed)
+    pub async fn fail_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+    ) -> StoreResult<TaskRecord> {
+        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
             .await
     }
 
@@ -680,6 +758,7 @@ impl SqliteStore {
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
         to: TaskStatus,
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
@@ -688,6 +767,7 @@ impl SqliteStore {
             .await?
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         let transition = validate_transition(task.status, to)?;
         let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
         deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
@@ -707,7 +787,7 @@ impl SqliteStore {
 
     pub async fn active_lease(&self, task_id: &TaskId) -> StoreResult<Option<LeaseRecord>> {
         let row = sqlx::query(
-            "SELECT lease_id, task_id, leased_at_ms, expires_at_ms FROM leases WHERE task_id = ? AND active = 1",
+            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE task_id = ? AND active = 1",
         )
         .bind(task_id.as_str())
         .fetch_optional(&self.pool)
@@ -718,52 +798,12 @@ impl SqliteStore {
     pub async fn recover_stale_leases(&self, now_ms: i64) -> StoreResult<Vec<TaskRecord>> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
-            "SELECT lease_id, task_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND expires_at_ms <= ? ORDER BY expires_at_ms ASC, task_id ASC",
+            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND expires_at_ms <= ? ORDER BY expires_at_ms ASC, task_id ASC",
         )
         .bind(now_ms)
         .fetch_all(&mut *tx)
         .await?;
-        let mut recovered = Vec::new();
-        for row in rows {
-            let lease = row_to_lease(row)?;
-            let task = fetch_task_optional_with_executor(&mut tx, &lease.task_id).await?;
-            deactivate_lease_for_task_with_executor(&mut tx, &lease.task_id).await?;
-
-            let Some(task) = task else {
-                continue;
-            };
-
-            let (to_status, should_requeue) = match task.status {
-                TaskStatus::Running => (TaskStatus::Pending, true),
-                TaskStatus::Pending => (TaskStatus::Pending, false),
-                TaskStatus::Completed => (TaskStatus::Completed, false),
-                TaskStatus::Failed => (TaskStatus::Failed, false),
-            };
-
-            if to_status != task.status {
-                update_task_status_with_executor(&mut tx, &lease.task_id, to_status).await?;
-            } else {
-                touch_task_updated_at_with_executor(&mut tx, &lease.task_id).await?;
-            }
-            let sequence = next_sequence_with_executor(&mut tx, &lease.task_id).await?;
-            insert_event(
-                &mut tx,
-                &lease.task_id,
-                sequence,
-                KeryxEventType::RecoveryAction,
-                Some(task.status),
-                to_status,
-            )
-            .await?;
-
-            if should_requeue {
-                recovered.push(TaskRecord::new(
-                    lease.task_id,
-                    to_status,
-                    task.idempotency_key,
-                ));
-            }
-        }
+        let recovered = recover_sqlite_leases_with_executor(&mut tx, rows).await?;
         tx.commit().await?;
         Ok(recovered)
     }
@@ -790,6 +830,17 @@ fn ensure_matching_task_id(task_id: &TaskId, lease: &LeaseRecord) -> StoreResult
             "lease task id mismatch: expected {}, got {}",
             task_id, lease.task_id
         )))
+    }
+}
+
+fn ensure_lease_has_owner(lease: &LeaseRecord) -> StoreResult<()> {
+    if lease.worker_id.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::LeaseOwnerMissing {
+            task_id: lease.task_id.clone(),
+            lease_id: lease.lease_id.clone(),
+        })
     }
 }
 
@@ -825,6 +876,24 @@ fn ensure_matching_lease_id(
             task_id: task_id.clone(),
             lease_id: lease_id.clone(),
         })
+    }
+}
+
+fn ensure_matching_worker_id(
+    task_id: &TaskId,
+    active: &LeaseRecord,
+    worker_id: &AgentId,
+) -> StoreResult<()> {
+    match &active.worker_id {
+        Some(active_worker_id) if active_worker_id == worker_id => Ok(()),
+        Some(_) => Err(StoreError::LeaseOwnerMismatch {
+            task_id: task_id.clone(),
+            worker_id: worker_id.clone(),
+        }),
+        None => Err(StoreError::LeaseOwnerMissing {
+            task_id: task_id.clone(),
+            lease_id: active.lease_id.clone(),
+        }),
     }
 }
 
@@ -894,12 +963,60 @@ async fn fetch_active_lease_with_executor(
     task_id: &TaskId,
 ) -> StoreResult<Option<LeaseRecord>> {
     let row = sqlx::query(
-        "SELECT lease_id, task_id, leased_at_ms, expires_at_ms FROM leases WHERE task_id = ? AND active = 1",
+        "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE task_id = ? AND active = 1",
     )
     .bind(task_id.as_str())
     .fetch_optional(&mut **tx)
     .await?;
     row.map(row_to_lease).transpose()
+}
+
+async fn recover_sqlite_leases_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> StoreResult<Vec<TaskRecord>> {
+    let mut recovered = Vec::new();
+    for row in rows {
+        let lease = row_to_lease(row)?;
+        let task = fetch_task_optional_with_executor(tx, &lease.task_id).await?;
+        deactivate_lease_for_task_with_executor(tx, &lease.task_id).await?;
+
+        let Some(task) = task else {
+            continue;
+        };
+
+        let (to_status, should_requeue) = match task.status {
+            TaskStatus::Running => (TaskStatus::Pending, true),
+            TaskStatus::Pending => (TaskStatus::Pending, false),
+            TaskStatus::Completed => (TaskStatus::Completed, false),
+            TaskStatus::Failed => (TaskStatus::Failed, false),
+        };
+
+        if to_status != task.status {
+            update_task_status_with_executor(tx, &lease.task_id, to_status).await?;
+        } else {
+            touch_task_updated_at_with_executor(tx, &lease.task_id).await?;
+        }
+        let sequence = next_sequence_with_executor(tx, &lease.task_id).await?;
+        insert_event(
+            tx,
+            &lease.task_id,
+            sequence,
+            KeryxEventType::RecoveryAction,
+            Some(task.status),
+            to_status,
+        )
+        .await?;
+
+        if should_requeue {
+            recovered.push(TaskRecord::new(
+                lease.task_id,
+                to_status,
+                task.idempotency_key,
+            ));
+        }
+    }
+    Ok(recovered)
 }
 
 async fn next_sequence_with_executor(
@@ -982,9 +1099,12 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskRecord> {
 }
 
 fn row_to_lease(row: sqlx::sqlite::SqliteRow) -> StoreResult<LeaseRecord> {
-    Ok(LeaseRecord::new(
+    Ok(LeaseRecord::from_parts(
         LeaseId::new(row.get::<String, _>("lease_id"))?,
         TaskId::new(row.get::<String, _>("task_id"))?,
+        row.try_get::<Option<String>, _>("worker_id")?
+            .map(AgentId::new)
+            .transpose()?,
         row.get::<i64, _>("leased_at_ms"),
         row.get::<i64, _>("expires_at_ms"),
     ))
@@ -1025,6 +1145,8 @@ const MIGRATION_001: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS idempotency_keys (key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, FOREIGN KEY(task_id) REFERENCES tasks(task_id))",
 ];
+
+const MIGRATION_002: &[&str] = &["ALTER TABLE leases ADD COLUMN worker_id TEXT"];
 
 const fn status_to_str(status: TaskStatus) -> &'static str {
     match status {
