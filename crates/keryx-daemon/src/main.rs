@@ -1,5 +1,6 @@
 use anyhow::Result;
 use keryx_daemon::{serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -17,7 +18,7 @@ async fn main() -> Result<()> {
         "Hermes Keryx daemon runtime ready"
     );
 
-    if let Some(addr) = daemon_addr() {
+    if let Some(addr) = daemon_addr()? {
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
         tracing::info!(
@@ -37,11 +38,20 @@ fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(".keryx"))
 }
 
-fn daemon_addr() -> Option<String> {
+fn daemon_addr() -> Result<Option<SocketAddr>> {
     std::env::var("HERMES_KERYX_DAEMON_ADDR")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .map(|value| {
+            let addr: SocketAddr = value.parse()?;
+            anyhow::ensure!(
+                addr.ip().is_loopback(),
+                "HERMES_KERYX_DAEMON_ADDR must be a loopback address"
+            );
+            Ok(addr)
+        })
+        .transpose()
 }
 
 fn now_ms() -> i64 {
@@ -50,4 +60,66 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::daemon_addr;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_daemon_addr(value: Option<&str>, test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERMES_KERYX_DAEMON_ADDR");
+        match value {
+            Some(value) => std::env::set_var("HERMES_KERYX_DAEMON_ADDR", value),
+            None => std::env::remove_var("HERMES_KERYX_DAEMON_ADDR"),
+        }
+        test();
+        match previous {
+            Some(previous) => std::env::set_var("HERMES_KERYX_DAEMON_ADDR", previous),
+            None => std::env::remove_var("HERMES_KERYX_DAEMON_ADDR"),
+        }
+    }
+
+    #[test]
+    fn daemon_addr_accepts_loopback_addresses() {
+        with_daemon_addr(Some("127.0.0.1:50051"), || {
+            assert_eq!(
+                daemon_addr().unwrap().unwrap().to_string(),
+                "127.0.0.1:50051"
+            );
+        });
+
+        with_daemon_addr(Some("[::1]:50051"), || {
+            assert_eq!(daemon_addr().unwrap().unwrap().to_string(), "[::1]:50051");
+        });
+    }
+
+    #[test]
+    fn daemon_addr_rejects_wildcard_and_non_loopback_addresses() {
+        with_daemon_addr(Some("0.0.0.0:50051"), || {
+            assert!(daemon_addr().unwrap_err().to_string().contains("loopback"));
+        });
+
+        with_daemon_addr(Some("[::]:50051"), || {
+            assert!(daemon_addr().unwrap_err().to_string().contains("loopback"));
+        });
+
+        with_daemon_addr(Some("192.0.2.1:50051"), || {
+            assert!(daemon_addr().unwrap_err().to_string().contains("loopback"));
+        });
+    }
+
+    #[test]
+    fn daemon_addr_ignores_empty_values() {
+        with_daemon_addr(Some("  "), || {
+            assert!(daemon_addr().unwrap().is_none());
+        });
+
+        with_daemon_addr(None, || {
+            assert!(daemon_addr().unwrap().is_none());
+        });
+    }
 }
