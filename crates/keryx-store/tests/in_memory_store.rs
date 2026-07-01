@@ -12,7 +12,7 @@ fn task(id: &str, status: TaskStatus, idem: Option<&str>) -> TaskRecord {
 #[test]
 fn accepted_task_is_persisted_with_task_created_event_before_ack() {
     let store = InMemoryStore::default();
-    let record = task("task-1", TaskStatus::Accepted, Some("idem-1"));
+    let record = task("task-1", TaskStatus::Pending, Some("idem-1"));
 
     store.accept_task(record.clone()).expect("accept task");
 
@@ -20,45 +20,38 @@ fn accepted_task_is_persisted_with_task_created_event_before_ack() {
     let events = store.events_for_task(record.task_id()).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, KeryxEventType::TaskAccepted);
-    assert_eq!(events[0].to_status, TaskStatus::Accepted);
+    assert_eq!(events[0].to_status, TaskStatus::Pending);
 }
 
 #[test]
 fn task_state_transition_persists_snapshot_and_event() {
     let store = InMemoryStore::default();
-    let record = task("task-2", TaskStatus::Accepted, Some("idem-2"));
+    let record = task("task-2", TaskStatus::Pending, Some("idem-2"));
     store.accept_task(record.clone()).unwrap();
 
     store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Leased)
+        .transition_task(record.task_id(), TaskStatus::Running)
         .unwrap();
 
     let updated = store.get_task(record.task_id()).unwrap();
-    assert_eq!(updated.status, TaskStatus::Leased);
+    assert_eq!(updated.status, TaskStatus::Running);
     let events = store.events_for_task(record.task_id()).unwrap();
     assert_eq!(
         events
             .iter()
             .map(|event| event.event_type)
             .collect::<Vec<_>>(),
-        vec![
-            KeryxEventType::TaskAccepted,
-            KeryxEventType::TaskQueued,
-            KeryxEventType::TaskLeased,
-        ]
+        vec![KeryxEventType::TaskAccepted, KeryxEventType::TaskStarted]
     );
 }
 
 #[test]
 fn duplicate_idempotency_key_returns_existing_compatible_task() {
     let store = InMemoryStore::default();
-    let original = task("task-3", TaskStatus::Accepted, Some("idem-3"));
+    let original = task("task-3", TaskStatus::Pending, Some("idem-3"));
     store.accept_task(original.clone()).unwrap();
 
-    let duplicate = task("task-3", TaskStatus::Accepted, Some("idem-3"));
+    let duplicate = task("task-3", TaskStatus::Pending, Some("idem-3"));
     let returned = store.accept_task(duplicate).unwrap();
 
     assert_eq!(returned, original);
@@ -69,11 +62,11 @@ fn duplicate_idempotency_key_returns_existing_compatible_task() {
 fn conflicting_idempotency_key_reuse_is_rejected() {
     let store = InMemoryStore::default();
     store
-        .accept_task(task("task-4", TaskStatus::Accepted, Some("idem-4")))
+        .accept_task(task("task-4", TaskStatus::Pending, Some("idem-4")))
         .unwrap();
 
     let err = store
-        .accept_task(task("task-other", TaskStatus::Accepted, Some("idem-4")))
+        .accept_task(task("task-other", TaskStatus::Pending, Some("idem-4")))
         .unwrap_err();
 
     assert!(matches!(err, StoreError::IdempotencyConflict { .. }));
@@ -82,14 +75,8 @@ fn conflicting_idempotency_key_reuse_is_rejected() {
 #[test]
 fn event_replay_reconstructs_current_task_state() {
     let store = InMemoryStore::default();
-    let record = task("task-5", TaskStatus::Accepted, Some("idem-5"));
+    let record = task("task-5", TaskStatus::Pending, Some("idem-5"));
     store.accept_task(record.clone()).unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Leased)
-        .unwrap();
     store
         .transition_task(record.task_id(), TaskStatus::Running)
         .unwrap();

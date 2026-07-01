@@ -6,7 +6,7 @@ use tempfile::tempdir;
 fn task(id: &str, idem: &str) -> TaskRecord {
     TaskRecord::new(
         TaskId::new(id).unwrap(),
-        TaskStatus::Accepted,
+        TaskStatus::Pending,
         Some(IdempotencyKey::new(idem).unwrap()),
     )
 }
@@ -21,10 +21,6 @@ async fn startup_migrates_sqlite_and_recovers_stale_leases_before_reporting_read
     store.migrate().await.unwrap();
     let record = task("daemon-recovery-task-1", "daemon-recovery-idem-1");
     store.accept_task(record.clone()).await.unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .await
-        .unwrap();
     store
         .lease_task(
             record.task_id(),
@@ -52,7 +48,7 @@ async fn startup_migrates_sqlite_and_recovers_stale_leases_before_reporting_read
             .await
             .unwrap()
             .status,
-        TaskStatus::Queued
+        TaskStatus::Pending
     );
     assert!(runtime
         .store()

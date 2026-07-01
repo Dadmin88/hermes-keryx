@@ -32,14 +32,10 @@ async fn sqlite_lease_task_persists_lease_and_task_leased_event() {
     let store = temp_store().await;
     let record = task(
         "sqlite-lease-task-1",
-        TaskStatus::Accepted,
+        TaskStatus::Pending,
         Some("sqlite-lease-idem-1"),
     );
     store.accept_task(record.clone()).await.unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .await
-        .unwrap();
 
     let leased = store
         .lease_task(
@@ -49,7 +45,7 @@ async fn sqlite_lease_task_persists_lease_and_task_leased_event() {
         .await
         .unwrap();
 
-    assert_eq!(leased.status, TaskStatus::Leased);
+    assert_eq!(leased.status, TaskStatus::Running);
     assert_eq!(
         store
             .active_lease(record.task_id())
@@ -63,7 +59,7 @@ async fn sqlite_lease_task_persists_lease_and_task_leased_event() {
     let events = store.events_for_task(record.task_id()).await.unwrap();
     assert_eq!(
         events.last().unwrap().event_type,
-        KeryxEventType::TaskLeased
+        KeryxEventType::TaskStarted
     );
 }
 
@@ -72,14 +68,10 @@ async fn sqlite_recovery_requeues_stale_leases_and_emits_recovery_event() {
     let store = temp_store().await;
     let record = task(
         "sqlite-lease-task-2",
-        TaskStatus::Accepted,
+        TaskStatus::Pending,
         Some("sqlite-lease-idem-2"),
     );
     store.accept_task(record.clone()).await.unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .await
-        .unwrap();
     store
         .lease_task(
             record.task_id(),
@@ -91,7 +83,7 @@ async fn sqlite_recovery_requeues_stale_leases_and_emits_recovery_event() {
     let recovered = store.recover_stale_leases(501).await.unwrap();
 
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].status, TaskStatus::Queued);
+    assert_eq!(recovered[0].status, TaskStatus::Pending);
     assert!(store
         .active_lease(record.task_id())
         .await
@@ -102,5 +94,5 @@ async fn sqlite_recovery_requeues_stale_leases_and_emits_recovery_event() {
         events.last().unwrap().event_type,
         KeryxEventType::RecoveryAction
     );
-    assert_eq!(events.last().unwrap().to_status, TaskStatus::Queued);
+    assert_eq!(events.last().unwrap().to_status, TaskStatus::Pending);
 }

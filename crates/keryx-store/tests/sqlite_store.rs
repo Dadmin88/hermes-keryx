@@ -28,7 +28,7 @@ async fn sqlite_migration_from_empty_database_creates_schema_version() {
 #[tokio::test]
 async fn sqlite_accept_task_persists_task_event_and_idempotency() {
     let store = temp_store().await;
-    let record = task("sqlite-task-1", TaskStatus::Accepted, Some("sqlite-idem-1"));
+    let record = task("sqlite-task-1", TaskStatus::Pending, Some("sqlite-idem-1"));
 
     store.accept_task(record.clone()).await.unwrap();
 
@@ -36,23 +36,15 @@ async fn sqlite_accept_task_persists_task_event_and_idempotency() {
     let events = store.events_for_task(record.task_id()).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, KeryxEventType::TaskAccepted);
-    assert_eq!(events[0].to_status, TaskStatus::Accepted);
+    assert_eq!(events[0].to_status, TaskStatus::Pending);
 }
 
 #[tokio::test]
 async fn sqlite_transitions_append_events_and_replay_terminal_state() {
     let store = temp_store().await;
-    let record = task("sqlite-task-2", TaskStatus::Accepted, Some("sqlite-idem-2"));
+    let record = task("sqlite-task-2", TaskStatus::Pending, Some("sqlite-idem-2"));
     store.accept_task(record.clone()).await.unwrap();
 
-    store
-        .transition_task(record.task_id(), TaskStatus::Queued)
-        .await
-        .unwrap();
-    store
-        .transition_task(record.task_id(), TaskStatus::Leased)
-        .await
-        .unwrap();
     store
         .transition_task(record.task_id(), TaskStatus::Running)
         .await
@@ -65,13 +57,13 @@ async fn sqlite_transitions_append_events_and_replay_terminal_state() {
     let replayed = store.replay_task(record.task_id()).await.unwrap();
     assert_eq!(replayed.status, TaskStatus::Completed);
     let events = store.events_for_task(record.task_id()).await.unwrap();
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 3);
 }
 
 #[tokio::test]
 async fn sqlite_idempotency_duplicate_and_conflict_behave_like_memory_store() {
     let store = temp_store().await;
-    let original = task("sqlite-task-3", TaskStatus::Accepted, Some("sqlite-idem-3"));
+    let original = task("sqlite-task-3", TaskStatus::Pending, Some("sqlite-idem-3"));
     store.accept_task(original.clone()).await.unwrap();
 
     let duplicate = store.accept_task(original.clone()).await.unwrap();
@@ -88,7 +80,7 @@ async fn sqlite_idempotency_duplicate_and_conflict_behave_like_memory_store() {
     let conflict = store
         .accept_task(task(
             "sqlite-task-conflict",
-            TaskStatus::Accepted,
+            TaskStatus::Pending,
             Some("sqlite-idem-3"),
         ))
         .await

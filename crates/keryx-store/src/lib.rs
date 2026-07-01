@@ -3,8 +3,8 @@
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Mutex};
 
 use keryx_core::{
-    event_for_transition, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus,
-    ValidationError,
+    event_for_transition, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, TaskId,
+    TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
@@ -41,6 +41,18 @@ impl From<sqlx::Error> for StoreError {
 impl From<std::io::Error> for StoreError {
     fn from(value: std::io::Error) -> Self {
         Self::Database(value.to_string())
+    }
+}
+
+impl From<KeryxCoreError> for StoreError {
+    fn from(value: KeryxCoreError) -> Self {
+        match value {
+            KeryxCoreError::Validation(error) => Self::Validation(error),
+            KeryxCoreError::TaskNotFound(task_id) => TaskId::new(&task_id)
+                .map(Self::TaskNotFound)
+                .unwrap_or_else(Self::Validation),
+            KeryxCoreError::PolicyDenied(message) => Self::Database(message),
+        }
     }
 }
 
@@ -150,14 +162,14 @@ impl InMemoryStore {
             .get(task_id)
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
-        let event_type = event_for_transition(task.status, TaskStatus::Leased)?;
+        let event_type = event_for_transition(task.status, TaskStatus::Running)?;
         let sequence = state
             .events
             .get(task_id)
             .map_or(1, |events| events.len() as u64 + 1);
         let mut updated = task;
         let from_status = updated.status;
-        updated.status = TaskStatus::Leased;
+        updated.status = TaskStatus::Running;
         state.leases.insert(task_id.clone(), lease);
         state
             .events
@@ -168,7 +180,7 @@ impl InMemoryStore {
                 sequence,
                 event_type,
                 from_status: Some(from_status),
-                to_status: TaskStatus::Leased,
+                to_status: TaskStatus::Running,
             });
         state.tasks.insert(task_id.clone(), updated.clone());
         Ok(updated)
@@ -201,7 +213,7 @@ impl InMemoryStore {
                 .map_or(1, |events| events.len() as u64 + 1);
             let mut updated = task;
             let from_status = updated.status;
-            updated.status = TaskStatus::Queued;
+            updated.status = TaskStatus::Pending;
             state.leases.remove(&task_id);
             state
                 .events
@@ -212,7 +224,7 @@ impl InMemoryStore {
                     sequence,
                     event_type: KeryxEventType::RecoveryAction,
                     from_status: Some(from_status),
-                    to_status: TaskStatus::Queued,
+                    to_status: TaskStatus::Pending,
                 });
             state.tasks.insert(task_id, updated.clone());
             recovered.push(updated);
@@ -496,7 +508,7 @@ impl SqliteStore {
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
-        let event_type = event_for_transition(task.status, TaskStatus::Leased)?;
+        let event_type = event_for_transition(task.status, TaskStatus::Running)?;
         let row = sqlx::query("SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM task_events WHERE task_id = ?")
             .bind(task_id.as_str())
             .fetch_one(&mut *tx)
@@ -510,7 +522,7 @@ impl SqliteStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE tasks SET status = ? WHERE task_id = ?")
-            .bind(status_to_str(TaskStatus::Leased))
+            .bind(status_to_str(TaskStatus::Running))
             .bind(task_id.as_str())
             .execute(&mut *tx)
             .await?;
@@ -520,7 +532,7 @@ impl SqliteStore {
             sequence,
             event_type,
             Some(task.status),
-            TaskStatus::Leased,
+            TaskStatus::Running,
         )
         .await?;
         tx.commit().await?;
@@ -554,7 +566,7 @@ impl SqliteStore {
                 .await?;
             let sequence = seq_row.get::<i64, _>("next_sequence") as u64;
             sqlx::query("UPDATE tasks SET status = ? WHERE task_id = ?")
-                .bind(status_to_str(TaskStatus::Queued))
+                .bind(status_to_str(TaskStatus::Pending))
                 .bind(lease.task_id.as_str())
                 .execute(&mut *tx)
                 .await?;
@@ -568,12 +580,12 @@ impl SqliteStore {
                 sequence,
                 KeryxEventType::RecoveryAction,
                 Some(task.status),
-                TaskStatus::Queued,
+                TaskStatus::Pending,
             )
             .await?;
             recovered.push(TaskRecord::new(
                 lease.task_id,
-                TaskStatus::Queued,
+                TaskStatus::Pending,
                 task.idempotency_key,
             ));
         }
@@ -672,37 +684,23 @@ const MIGRATION_001: &[&str] = &[
 
 const fn status_to_str(status: TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Created => "created",
-        TaskStatus::Accepted => "accepted",
-        TaskStatus::Queued => "queued",
-        TaskStatus::AwaitingApproval => "awaiting_approval",
-        TaskStatus::Leased => "leased",
+        TaskStatus::Pending => "pending",
         TaskStatus::Running => "running",
-        TaskStatus::AwaitingInput => "awaiting_input",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Canceled => "canceled",
-        TaskStatus::TimedOut => "timed_out",
-        TaskStatus::Rejected => "rejected",
-        TaskStatus::DeadLettered => "dead_lettered",
     }
 }
 
 fn str_to_status(value: &str) -> StoreResult<TaskStatus> {
     match value {
-        "created" => Ok(TaskStatus::Created),
-        "accepted" => Ok(TaskStatus::Accepted),
-        "queued" => Ok(TaskStatus::Queued),
-        "awaiting_approval" => Ok(TaskStatus::AwaitingApproval),
-        "leased" => Ok(TaskStatus::Leased),
-        "running" => Ok(TaskStatus::Running),
-        "awaiting_input" => Ok(TaskStatus::AwaitingInput),
+        "created" | "accepted" | "queued" | "awaiting_approval" | "pending" => {
+            Ok(TaskStatus::Pending)
+        }
+        "leased" | "awaiting_input" | "running" => Ok(TaskStatus::Running),
         "completed" => Ok(TaskStatus::Completed),
-        "failed" => Ok(TaskStatus::Failed),
-        "canceled" => Ok(TaskStatus::Canceled),
-        "timed_out" => Ok(TaskStatus::TimedOut),
-        "rejected" => Ok(TaskStatus::Rejected),
-        "dead_lettered" => Ok(TaskStatus::DeadLettered),
+        "failed" | "canceled" | "timed_out" | "rejected" | "dead_lettered" => {
+            Ok(TaskStatus::Failed)
+        }
         other => Err(StoreError::Database(format!(
             "unknown task status: {other}"
         ))),
