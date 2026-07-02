@@ -12,9 +12,11 @@ message StatusResponse {
   string data_dir = 2;
   string db_path = 3;
   int64 schema_version = 4;
+  int64 supported_schema_version = 11;
   uint64 recovered_tasks = 5;
   uint64 cleaned_terminal_leases = 6;
   uint64 corruption_count = 7;
+  uint64 startup_recovery_duration_ms = 12;
   string store_kind = 8;
   bool store_ready = 9;
   string store_path = 10;

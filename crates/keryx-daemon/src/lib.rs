@@ -10,7 +10,7 @@ use keryx_proto::v1::{
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
-use keryx_store::{RecoveryReport, SqliteStore, StoreResult};
+use keryx_store::{RecoveryReport, SqliteStore, StoreError, StoreResult, CURRENT_SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeryxDaemonConfig {
@@ -56,9 +56,11 @@ pub struct KeryxStatusReport {
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
     pub schema_version: i64,
+    pub supported_schema_version: i64,
     pub recovered_tasks: usize,
     pub cleaned_terminal_leases: usize,
     pub corruption_count: usize,
+    pub startup_recovery_duration_ms: u128,
     pub store: StoreReadinessReport,
 }
 
@@ -79,8 +81,10 @@ pub struct KeryxDoctorReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupReport {
     pub schema_version: i64,
+    pub supported_schema_version: i64,
     pub db_path: PathBuf,
     pub recovery: RecoveryReport,
+    pub startup_recovery_duration_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +99,7 @@ impl KeryxDaemonRuntime {
     /// create/open the SQLite store, run migrations, recover stale leases, then
     /// expose a readiness report. Real RPC/task loops will layer on top of this.
     pub async fn startup(config: KeryxDaemonConfig) -> StoreResult<Self> {
+        let startup_recovery_started_at = std::time::Instant::now();
         std::fs::create_dir_all(config.data_dir())?;
         let db_path = config.db_path();
         let store = SqliteStore::connect(&db_path).await?;
@@ -103,10 +108,17 @@ impl KeryxDaemonRuntime {
         let recovery = store
             .recover_stale_leases(config.startup_recovery_now_ms(), None)
             .await?;
+        if recovery.corruption_count() > 0 {
+            return Err(StoreError::UnrepairedCorruption {
+                corrupted_tasks: recovery.corrupted_tasks.clone(),
+            });
+        }
         let report = StartupReport {
             schema_version,
+            supported_schema_version: CURRENT_SCHEMA_VERSION,
             db_path,
             recovery,
+            startup_recovery_duration_ms: startup_recovery_started_at.elapsed().as_millis(),
         };
         Ok(Self {
             config,
@@ -122,9 +134,11 @@ impl KeryxDaemonRuntime {
             data_dir: self.config.data_dir().to_path_buf(),
             db_path: self.report.db_path.clone(),
             schema_version: self.report.schema_version,
+            supported_schema_version: self.report.supported_schema_version,
             recovered_tasks: self.report.recovery.recovered_task_count(),
             cleaned_terminal_leases: self.report.recovery.cleaned_terminal_leases,
             corruption_count: self.report.recovery.corruption_count(),
+            startup_recovery_duration_ms: self.report.startup_recovery_duration_ms,
             store: StoreReadinessReport {
                 kind: "sqlite",
                 path: self.report.db_path.clone(),
@@ -144,20 +158,30 @@ impl KeryxDaemonRuntime {
             },
             DoctorCheck {
                 name: "sqlite_store",
-                ready: status.store.ready && status.db_path.is_file() && status.schema_version > 0,
+                ready: status.store.ready && status.db_path.is_file(),
                 detail: format!(
-                    "kind={} path={} schema_version={}",
+                    "kind={} path={}",
                     status.store.kind,
                     status.store.path.display(),
-                    status.schema_version
+                ),
+            },
+            DoctorCheck {
+                name: "schema_version",
+                ready: status.schema_version == status.supported_schema_version,
+                detail: format!(
+                    "schema_version={} supported_schema_version={}",
+                    status.schema_version, status.supported_schema_version
                 ),
             },
             DoctorCheck {
                 name: "startup_recovery",
                 ready: status.corruption_count == 0,
                 detail: format!(
-                    "recovered_tasks={} cleaned_terminal_leases={} corruption_count={}",
-                    status.recovered_tasks, status.cleaned_terminal_leases, status.corruption_count
+                    "recovered_tasks={} cleaned_terminal_leases={} corruption_count={} duration_ms={}",
+                    status.recovered_tasks,
+                    status.cleaned_terminal_leases,
+                    status.corruption_count,
+                    status.startup_recovery_duration_ms
                 ),
             },
         ];
@@ -227,9 +251,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             data_dir: report.data_dir.display().to_string(),
             db_path: report.db_path.display().to_string(),
             schema_version: report.schema_version,
+            supported_schema_version: report.supported_schema_version,
             recovered_tasks: report.recovered_tasks as u64,
             cleaned_terminal_leases: report.cleaned_terminal_leases as u64,
             corruption_count: report.corruption_count as u64,
+            startup_recovery_duration_ms: report.startup_recovery_duration_ms as u64,
             store_kind: report.store.kind.to_string(),
             store_ready: report.store.ready,
             store_path: report.store.path.display().to_string(),

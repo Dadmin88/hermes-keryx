@@ -45,6 +45,15 @@ pub enum StoreError {
         requested_expires_at_ms: i64,
         now_ms: i64,
     },
+    #[error("unsupported schema version: found={found_version}, supported={supported_version}")]
+    UnsupportedSchema {
+        found_version: i64,
+        supported_version: i64,
+    },
+    #[error("migration failed: {0}")]
+    MigrationFailed(String),
+    #[error("startup recovery found unrepaired corruption in tasks: {corrupted_tasks:?}")]
+    UnrepairedCorruption { corrupted_tasks: Vec<TaskId> },
     #[error("database error: {0}")]
     Database(String),
 }
@@ -74,6 +83,8 @@ impl From<KeryxCoreError> for StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -540,37 +551,71 @@ impl SqliteStore {
     }
 
     pub async fn migrate(&self) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let existing_version = detect_sqlite_schema_version(&self.pool).await?;
+        if existing_version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found_version: existing_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         for statement in MIGRATION_001 {
-            sqlx::query(statement).execute(&mut *tx).await?;
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         }
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'initial')",
         )
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         let worker_id_column_exists =
             sqlx::query("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'worker_id'")
                 .fetch_optional(&mut *tx)
-                .await?
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
                 .is_some();
         if !worker_id_column_exists {
             for statement in MIGRATION_002 {
-                sqlx::query(statement).execute(&mut *tx).await?;
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
             }
         }
         let legacy_unowned_rows = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
         )
         .fetch_all(&mut *tx)
-        .await?;
-        recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows).await?;
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows)
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
         )
         .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+
+        let final_version = detect_sqlite_schema_version(&self.pool).await?;
+        if final_version != CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found_version: final_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
         Ok(())
     }
 
@@ -877,6 +922,22 @@ impl SqliteStore {
         tx.commit().await?;
         Ok(report)
     }
+}
+
+async fn detect_sqlite_schema_version(pool: &SqlitePool) -> StoreResult<i64> {
+    let schema_table_exists = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if schema_table_exists.is_none() {
+        return Ok(0);
+    }
+
+    let row = sqlx::query("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get::<i64, _>("version"))
 }
 
 fn ensure_pending_accept(task: &TaskRecord) -> StoreResult<()> {

@@ -27,9 +27,11 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
         data_dir.join("keryx.db").display().to_string()
     );
     assert_eq!(status.schema_version, 2);
+    assert_eq!(status.supported_schema_version, 2);
     assert_eq!(status.recovered_tasks, 0);
     assert_eq!(status.cleaned_terminal_leases, 0);
     assert_eq!(status.corruption_count, 0);
+    assert!(status.startup_recovery_duration_ms <= 1_000);
     assert_eq!(status.store_kind, "sqlite");
     assert!(status.store_ready);
     assert_eq!(
@@ -42,7 +44,8 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
     assert!(doctor
         .messages
         .iter()
-        .any(|message| message.contains("sqlite_store") && message.contains("schema_version=2")));
+        .any(|message| message.contains("schema_version")
+            && message.contains("supported_schema_version=2")));
 
     server.abort();
 }

@@ -101,12 +101,15 @@ fn print_daemon_status(endpoint: &str, status: &StatusResponse) {
         "not-ready"
     };
     println!(
-        "store: {store_readiness} {} schema_version={}",
-        status.store_kind, status.schema_version
+        "store: {store_readiness} {} schema_version={} supported_schema_version={}",
+        status.store_kind, status.schema_version, status.supported_schema_version
     );
     println!(
-        "startup_recovery: recovered_tasks={} cleaned_terminal_leases={} corruption_count={}",
-        status.recovered_tasks, status.cleaned_terminal_leases, status.corruption_count
+        "startup_recovery: recovered_tasks={} cleaned_terminal_leases={} corruption_count={} duration_ms={}",
+        status.recovered_tasks,
+        status.cleaned_terminal_leases,
+        status.corruption_count,
+        status.startup_recovery_duration_ms
     );
 }
 
@@ -134,12 +137,15 @@ fn print_status(status: &KeryxStatusReport) {
     println!("data_dir: {}", status.data_dir.display());
     println!("db_path: {}", status.db_path.display());
     println!(
-        "store: {store_readiness} {} schema_version={}",
-        status.store.kind, status.schema_version
+        "store: {store_readiness} {} schema_version={} supported_schema_version={}",
+        status.store.kind, status.schema_version, status.supported_schema_version
     );
     println!(
-        "startup_recovery: recovered_tasks={} cleaned_terminal_leases={} corruption_count={}",
-        status.recovered_tasks, status.cleaned_terminal_leases, status.corruption_count
+        "startup_recovery: recovered_tasks={} cleaned_terminal_leases={} corruption_count={} duration_ms={}",
+        status.recovered_tasks,
+        status.cleaned_terminal_leases,
+        status.corruption_count,
+        status.startup_recovery_duration_ms
     );
 }
 
