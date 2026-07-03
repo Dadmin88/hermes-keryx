@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tonic = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
+uuid.workspace = true
 
 [dev-dependencies]
 async-trait = "0.1"

@@ -9,6 +9,7 @@ message CorrelationId { string value = 1; }
 message IdempotencyKey { string value = 1; }
 message AttemptId { string value = 1; }
 message LeaseId { string value = 1; }
+message ArtifactId { string value = 1; }
 message Timestamp { int64 unix_ms = 1; }
 message VersionInfo { string protocol = 1; string implementation = 2; }
 message ErrorInfo { string code = 1; string message = 2; map<string, string> metadata = 3; }

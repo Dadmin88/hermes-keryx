@@ -15,6 +15,10 @@ service KeryxDaemon {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
   rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+  rpc PutArtifact(PutArtifactRequest) returns (PutArtifactResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
   rpc SendTask(SendTaskRequest) returns (SendTaskResponse);
   rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
   rpc DiscoverSkills(DiscoverSkillsRequest) returns (DiscoverSkillsResponse);
@@ -170,4 +174,73 @@ message DiscoverSkillsRequest {
 
 message DiscoverSkillsResponse {
   repeated Registration registrations = 1;
+}
+
+// --- Artifact RPCs ---
+
+message PutArtifactRequest {
+  TaskId task_id = 1;
+  // Caller-provided artifact id. If empty, daemon generates a UUID.
+  ArtifactId artifact_id = 2;
+  // IANA media type (e.g. "application/json").
+  string media_type = 3;
+  // Raw artifact bytes. Max 256 MiB.
+  bytes content = 4;
+}
+
+message PutArtifactResponse {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  // SHA-256 hex digest computed by the daemon/store.
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+}
+
+message GetArtifactRequest {
+  ArtifactId artifact_id = 1;
+  // If true, return only metadata (no bytes). Default false.
+  bool metadata_only = 2;
+}
+
+message GetArtifactResponse {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+  // Empty when metadata_only=true or artifact is zero-length.
+  bytes content = 8;
+}
+
+message ListArtifactsRequest {
+  // List all artifacts for this task.
+  TaskId task_id = 1;
+}
+
+message ListArtifactsResponse {
+  repeated ArtifactSummary artifacts = 1;
+}
+
+message ArtifactSummary {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+}
+
+message DeleteArtifactRequest {
+  ArtifactId artifact_id = 1;
+}
+
+message DeleteArtifactResponse {
+  // True if the artifact existed and was deleted. False if not found (idempotent).
+  bool deleted = 1;
 }

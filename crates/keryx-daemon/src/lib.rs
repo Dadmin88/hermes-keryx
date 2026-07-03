@@ -11,17 +11,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keryx_core::{AgentId, IdempotencyKey, LeaseId, PeerId, RetryPolicy, TaskId, TaskStatus};
+use keryx_core::{
+    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, LeaseId, MediaType,
+    PeerId, RetryPolicy, TaskId, TaskStatus, MAX_BLOB_BYTES,
+};
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
     keryx_daemon_server::{KeryxDaemon, KeryxDaemonServer},
-    AgentId as ProtoAgentId, ClaimTaskRequest, ClaimTaskResponse, CompleteTaskRequest,
-    CompleteTaskResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
-    DoctorResponse, FailTaskRequest, FailTaskResponse, HeartbeatRequest, HeartbeatResponse,
-    IdempotencyKey as ProtoIdempotencyKey, LeaseId as ProtoLeaseId, ListPeersRequest,
-    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, ReadinessRequest,
-    ReadinessResponse, SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse,
-    SubmitTaskRequest, SubmitTaskResponse, TaskId as ProtoTaskId,
+    AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, ClaimTaskRequest,
+    ClaimTaskResponse, CompleteTaskRequest, CompleteTaskResponse, DeleteArtifactRequest,
+    DeleteArtifactResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
+    DoctorResponse, FailTaskRequest, FailTaskResponse, GetArtifactRequest, GetArtifactResponse,
+    HeartbeatRequest, HeartbeatResponse, IdempotencyKey as ProtoIdempotencyKey,
+    LeaseId as ProtoLeaseId, ListArtifactsRequest, ListArtifactsResponse, ListPeersRequest,
+    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, PutArtifactRequest,
+    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,
+    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskId as ProtoTaskId,
 };
 use tokio::sync::watch;
 use tokio::sync::RwLock;
@@ -60,6 +65,7 @@ const DEFAULT_LEASE_DEFAULT_TTL_MS: i64 = 300_000;
 
 /// Default time to wait for in-flight RPCs during graceful shutdown.
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+const ARTIFACT_RPC_MAX_BYTES: usize = MAX_BLOB_BYTES + (1024 * 1024);
 
 #[derive(Debug)]
 struct ShutdownState {
@@ -150,6 +156,7 @@ const DEFAULT_LOCAL_PEER_ID: &str = "node-local";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeryxDaemonConfig {
     data_dir: PathBuf,
+    blob_dir: PathBuf,
     startup_recovery_now_ms: i64,
     lease_recovery_interval_ms: u64,
     lease_default_ttl_ms: i64,
@@ -164,8 +171,10 @@ pub struct KeryxDaemonConfig {
 impl KeryxDaemonConfig {
     #[must_use]
     pub fn new(data_dir: impl Into<PathBuf>, startup_recovery_now_ms: i64) -> Self {
+        let data_dir = data_dir.into();
         Self {
-            data_dir: data_dir.into(),
+            blob_dir: data_dir.join("blobs"),
+            data_dir,
             startup_recovery_now_ms,
             lease_recovery_interval_ms: DEFAULT_LEASE_RECOVERY_INTERVAL_MS,
             lease_default_ttl_ms: DEFAULT_LEASE_DEFAULT_TTL_MS,
@@ -198,6 +207,11 @@ impl KeryxDaemonConfig {
     #[must_use]
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("keryx.db")
+    }
+
+    #[must_use]
+    pub fn blob_dir(&self) -> &Path {
+        &self.blob_dir
     }
 
     #[must_use]
@@ -690,7 +704,11 @@ pub async fn serve_daemon_rpc(
 ) -> Result<(), tonic::transport::Error> {
     let shutdown_signal = runtime.shutdown.grpc_shutdown_wait();
     tonic::transport::Server::builder()
-        .add_service(KeryxDaemonServer::new(KeryxDaemonRpcService::new(runtime)))
+        .add_service(
+            KeryxDaemonServer::new(KeryxDaemonRpcService::new(runtime))
+                .max_decoding_message_size(ARTIFACT_RPC_MAX_BYTES)
+                .max_encoding_message_size(ARTIFACT_RPC_MAX_BYTES),
+        )
         .serve_with_incoming_shutdown(incoming, shutdown_signal)
         .await
 }
@@ -978,6 +996,138 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         }))
     }
 
+    #[instrument(
+        name = "keryx::rpc::put_artifact",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty, artifact_id = tracing::field::Empty)
+    )]
+    async fn put_artifact(
+        &self,
+        request: Request<PutArtifactRequest>,
+    ) -> Result<Response<PutArtifactResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        let artifact_id = parse_or_generate_artifact_id(inner.artifact_id.as_ref())?;
+        tracing::Span::current()
+            .record("artifact_id", tracing::field::display(artifact_id.as_str()));
+        let digest = Digest::compute(&inner.content);
+        let media_type = MediaType::new(inner.media_type);
+        let byte_len = inner.content.len() as u64;
+        let meta = ArtifactMeta {
+            artifact_id,
+            task_id,
+            digest,
+            media_type,
+            byte_len,
+            inline: should_inline(byte_len),
+            created_at: unix_ms_now().to_string(),
+        };
+        let record = self
+            .runtime
+            .store()
+            .put_artifact(&meta, &inner.content, self.runtime.config().blob_dir())
+            .await
+            .map_err(store_error_to_status)?;
+        Ok(Response::new(PutArtifactResponse {
+            artifact_id: Some(proto_artifact_id(&record.artifact_id)),
+            task_id: Some(proto_task_id(&record.task_id)),
+            digest: record.digest.as_str().to_string(),
+            media_type: record.media_type.as_str().to_string(),
+            byte_len: record.byte_len,
+            inline: record.inline,
+            created_at: record.created_at,
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::get_artifact",
+        skip(self, request),
+        fields(artifact_id = tracing::field::Empty)
+    )]
+    async fn get_artifact(
+        &self,
+        request: Request<GetArtifactRequest>,
+    ) -> Result<Response<GetArtifactResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let artifact_id = parse_required_artifact_id(inner.artifact_id.as_ref())?;
+        tracing::Span::current()
+            .record("artifact_id", tracing::field::display(artifact_id.as_str()));
+        let (record, content) = self
+            .runtime
+            .store()
+            .get_artifact(&artifact_id, self.runtime.config().blob_dir())
+            .await
+            .map_err(store_error_to_status)?;
+        Ok(Response::new(GetArtifactResponse {
+            artifact_id: Some(proto_artifact_id(&record.artifact_id)),
+            task_id: Some(proto_task_id(&record.task_id)),
+            digest: record.digest.as_str().to_string(),
+            media_type: record.media_type.as_str().to_string(),
+            byte_len: record.byte_len,
+            inline: record.inline,
+            created_at: record.created_at,
+            content: if inner.metadata_only {
+                Vec::new()
+            } else {
+                content
+            },
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::list_artifacts",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty)
+    )]
+    async fn list_artifacts(
+        &self,
+        request: Request<ListArtifactsRequest>,
+    ) -> Result<Response<ListArtifactsResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let task_id = parse_required_task_id(request.into_inner().task_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        let artifacts = self
+            .runtime
+            .store()
+            .list_artifacts_for_task(&task_id)
+            .await
+            .map_err(store_error_to_status)?
+            .into_iter()
+            .map(|record| proto_artifact_summary(&record))
+            .collect();
+        Ok(Response::new(ListArtifactsResponse { artifacts }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::delete_artifact",
+        skip(self, request),
+        fields(artifact_id = tracing::field::Empty)
+    )]
+    async fn delete_artifact(
+        &self,
+        request: Request<DeleteArtifactRequest>,
+    ) -> Result<Response<DeleteArtifactResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let artifact_id = parse_required_artifact_id(request.into_inner().artifact_id.as_ref())?;
+        tracing::Span::current()
+            .record("artifact_id", tracing::field::display(artifact_id.as_str()));
+        match self
+            .runtime
+            .store()
+            .delete_artifact(&artifact_id, self.runtime.config().blob_dir())
+            .await
+        {
+            Ok(()) => Ok(Response::new(DeleteArtifactResponse { deleted: true })),
+            Err(StoreError::ArtifactNotFound(_)) => {
+                Ok(Response::new(DeleteArtifactResponse { deleted: false }))
+            }
+            Err(error) => Err(store_error_to_status(error)),
+        }
+    }
+
     #[instrument(name = "keryx::rpc::send_task", skip(self, request))]
     async fn send_task(
         &self,
@@ -1152,6 +1302,46 @@ fn proto_lease_id(lease_id: &LeaseId) -> ProtoLeaseId {
     }
 }
 
+fn proto_artifact_id(artifact_id: &ArtifactId) -> ProtoArtifactId {
+    ProtoArtifactId {
+        value: artifact_id.as_str().to_string(),
+    }
+}
+
+fn proto_artifact_summary(record: &keryx_store::ArtifactRecord) -> ArtifactSummary {
+    ArtifactSummary {
+        artifact_id: Some(proto_artifact_id(&record.artifact_id)),
+        task_id: Some(proto_task_id(&record.task_id)),
+        digest: record.digest.as_str().to_string(),
+        media_type: record.media_type.as_str().to_string(),
+        byte_len: record.byte_len,
+        inline: record.inline,
+        created_at: record.created_at.clone(),
+    }
+}
+
+fn parse_required_artifact_id(id: Option<&ProtoArtifactId>) -> Result<ArtifactId, Status> {
+    let value = id
+        .and_then(|id| {
+            let trimmed = id.value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .ok_or_else(|| Status::invalid_argument("artifact_id is required"))?;
+    ArtifactId::new(value).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn parse_or_generate_artifact_id(id: Option<&ProtoArtifactId>) -> Result<ArtifactId, Status> {
+    match id {
+        Some(id) if !id.value.trim().is_empty() => parse_required_artifact_id(Some(id)),
+        _ => ArtifactId::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|error| Status::internal(error.to_string())),
+    }
+}
+
 pub(crate) fn store_error_to_status(error: StoreError) -> Status {
     let error_detail = error.to_string();
     let status = match error {
@@ -1201,9 +1391,9 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
                 task_id.as_str()
             ))
         }
-        StoreError::ArtifactTooLarge { .. }
-        | StoreError::DigestMismatch { .. }
-        | StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
+        StoreError::ArtifactTooLarge { .. } => Status::resource_exhausted(error_detail.clone()),
+        StoreError::DigestMismatch { .. } => Status::data_loss(error_detail.clone()),
+        StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
         StoreError::UnsupportedSchema { .. }
         | StoreError::MigrationFailed(_)
         | StoreError::BlobDir(_)

@@ -1,8 +1,11 @@
+mod artifact;
 mod node;
 mod relay;
 
 use anyhow::{Context, Result};
+use artifact::ArtifactCommand;
 use clap::{Parser, Subcommand};
+use keryx_core::MAX_BLOB_BYTES;
 use keryx_daemon::{KeryxDaemonConfig, KeryxDaemonRuntime, KeryxDoctorReport, KeryxStatusReport};
 use keryx_proto::v1::{
     keryx_daemon_client::KeryxDaemonClient, AgentId, ClaimTaskRequest, CompleteTaskRequest,
@@ -13,6 +16,7 @@ use node::NodeCommand;
 use relay::RelayCommand;
 
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const ARTIFACT_RPC_MAX_BYTES: usize = MAX_BLOB_BYTES + (1024 * 1024);
 
 #[derive(Debug, Parser)]
 #[command(name = "keryx", about = "Hermes Keryx operator CLI")]
@@ -31,6 +35,11 @@ enum Command {
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    /// Artifact storage operations against the daemon RPC API.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
     },
     /// Relay server and registry operations.
     Relay {
@@ -96,6 +105,7 @@ async fn main() -> Result<()> {
         Command::Status => run_status().await?,
         Command::Doctor => run_doctor().await?,
         Command::Task { command } => run_task(command).await?,
+        Command::Artifact { command } => artifact::run(command).await?,
         Command::Relay { command } => relay::run(command).await?,
         Command::Node { command } => node::run(command).await?,
     }
@@ -258,9 +268,16 @@ async fn connect_daemon(
     endpoint: &str,
     operation: &str,
 ) -> Result<KeryxDaemonClient<tonic::transport::Channel>> {
-    KeryxDaemonClient::connect(endpoint.to_string())
+    let endpoint_url = endpoint.to_string();
+    let endpoint = tonic::transport::Endpoint::from_shared(endpoint_url.clone())
+        .with_context(|| format!("{operation}: invalid daemon endpoint {endpoint_url}"))?;
+    let channel = endpoint
+        .connect()
         .await
-        .with_context(|| format!("{operation}: daemon unavailable at {endpoint}"))
+        .with_context(|| format!("{operation}: daemon unavailable at {endpoint_url}"))?;
+    Ok(KeryxDaemonClient::new(channel)
+        .max_decoding_message_size(ARTIFACT_RPC_MAX_BYTES)
+        .max_encoding_message_size(ARTIFACT_RPC_MAX_BYTES))
 }
 
 async fn run_status() -> Result<()> {
