@@ -1,6 +1,8 @@
 use std::{path::PathBuf, str::FromStr};
 
-use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+use keryx_core::{
+    AgentId, IdempotencyKey, KeryxEventType, LeaseId, RetryPolicy, TaskId, TaskStatus,
+};
 use keryx_store::{LeaseRecord, SqliteStore, TaskRecord};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::tempdir;
@@ -431,6 +433,8 @@ async fn sqlite_stale_tokens_are_rejected_after_recovery_and_reissue() {
                 record.task_id(),
                 &first_lease.lease_id,
                 first_lease.worker_id.as_ref().unwrap(),
+                "",
+                &RetryPolicy::no_retries(),
             )
             .await
             .unwrap_err(),
@@ -484,6 +488,8 @@ async fn sqlite_stale_tokens_are_rejected_after_recovery_and_reissue() {
                 record.task_id(),
                 &first_lease.lease_id,
                 first_lease.worker_id.as_ref().unwrap(),
+                "",
+                &RetryPolicy::no_retries(),
             )
             .await
             .unwrap_err(),

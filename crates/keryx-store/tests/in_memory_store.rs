@@ -1,5 +1,6 @@
 use keryx_core::{
-    AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus, ValidationError,
+    AgentId, IdempotencyKey, KeryxEventType, LeaseId, RetryPolicy, TaskId, TaskStatus,
+    ValidationError,
 };
 use keryx_store::{InMemoryStore, LeaseRecord, StoreError, TaskRecord, TaskStore};
 
@@ -76,6 +77,8 @@ fn pending_running_failed_succeeds_via_lease_and_fail() {
             record.task_id(),
             &lease.lease_id,
             lease.worker_id.as_ref().unwrap(),
+            "",
+            &RetryPolicy::no_retries(),
         )
         .unwrap();
 
@@ -184,6 +187,8 @@ fn completed_and_failed_tasks_are_terminally_immutable() {
             failed.task_id(),
             &failed_lease.lease_id,
             failed_lease.worker_id.as_ref().unwrap(),
+            "",
+            &RetryPolicy::no_retries(),
         )
         .unwrap();
 

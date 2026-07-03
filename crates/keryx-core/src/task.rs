@@ -84,6 +84,10 @@ pub struct Task {
     id: TaskId,
     status: TaskStatus,
     assignee: Option<PeerId>,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    dead_lettered: bool,
 }
 
 impl Task {
@@ -92,6 +96,8 @@ impl Task {
             id,
             status: TaskStatus::Pending,
             assignee: None,
+            retry_count: 0,
+            dead_lettered: false,
         }
     }
 
@@ -100,6 +106,8 @@ impl Task {
             id,
             status: TaskStatus::Pending,
             assignee: Some(assignee),
+            retry_count: 0,
+            dead_lettered: false,
         }
     }
 
@@ -116,6 +124,24 @@ impl Task {
     #[must_use]
     pub fn assignee(&self) -> Option<&PeerId> {
         self.assignee.as_ref()
+    }
+
+    #[must_use]
+    pub const fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    #[must_use]
+    pub const fn dead_lettered(&self) -> bool {
+        self.dead_lettered
+    }
+
+    pub fn set_retry_count(&mut self, retry_count: u32) {
+        self.retry_count = retry_count;
+    }
+
+    pub fn set_dead_lettered(&mut self, dead_lettered: bool) {
+        self.dead_lettered = dead_lettered;
     }
 
     pub fn transition_to(&mut self, next: TaskStatus) -> Result<TaskTransition, KeryxCoreError> {

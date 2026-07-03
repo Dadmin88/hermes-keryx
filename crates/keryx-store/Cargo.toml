@@ -10,6 +10,7 @@ repository.workspace = true
 keryx-core = { path = "../keryx-core" }
 thiserror.workspace = true
 sqlx.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use keryx_core::{
-    AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus, ValidationError,
+    AgentId, IdempotencyKey, KeryxEventType, LeaseId, RetryPolicy, TaskId, TaskStatus,
+    ValidationError,
 };
 use keryx_store::{LeaseRecord, SqliteStore, StoreError, TaskRecord};
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
@@ -128,7 +129,7 @@ async fn seed_schema_v1_database_with_active_lease(
 async fn sqlite_migration_from_empty_database_creates_schema_version() {
     let store = temp_store().await;
 
-    assert_eq!(store.schema_version().await.unwrap(), 2);
+    assert_eq!(store.schema_version().await.unwrap(), 3);
 }
 
 #[tokio::test]
@@ -179,6 +180,8 @@ async fn sqlite_pending_running_failed_succeeds_via_lease_and_fail() {
             record.task_id(),
             &lease.lease_id,
             lease.worker_id.as_ref().unwrap(),
+            "",
+            &RetryPolicy::no_retries(),
         )
         .await
         .unwrap();
@@ -323,6 +326,8 @@ async fn sqlite_completed_and_failed_tasks_are_terminally_immutable() {
             failed.task_id(),
             &failed_lease.lease_id,
             failed_lease.worker_id.as_ref().unwrap(),
+            "",
+            &RetryPolicy::no_retries(),
         )
         .await
         .unwrap();
@@ -384,7 +389,7 @@ async fn sqlite_migration_requeues_legacy_active_leases_without_fabricating_owne
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
 
-    assert_eq!(store.schema_version().await.unwrap(), 2);
+    assert_eq!(store.schema_version().await.unwrap(), 3);
     assert_eq!(
         store.get_task(&task_id).await.unwrap().status,
         TaskStatus::Pending
@@ -494,4 +499,54 @@ async fn sqlite_replay_and_recovery_report_status_mismatch_as_corruption() {
     let report = store.recover_stale_leases(0, None).await.unwrap();
     assert_eq!(report.corruption_count(), 1);
     assert_eq!(report.corrupted_tasks, vec![record.task_id().clone()]);
+}
+
+#[tokio::test]
+async fn sqlite_replay_rejects_dead_lettered_snapshot_without_retry_count() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("corrupt-dead-letter-retry-keryx.db");
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let record = task(
+        "sqlite-dead-letter-without-retry-task",
+        TaskStatus::Pending,
+        Some("sqlite-dead-letter-without-retry-idem"),
+    );
+    store.accept_task(record.clone()).await.unwrap();
+    let lease = lease(
+        record.task_id(),
+        "sqlite-dead-letter-without-retry-lease",
+        "sqlite-dead-letter-without-retry-worker",
+        1_000,
+    );
+    store
+        .lease_task(record.task_id(), lease.clone())
+        .await
+        .unwrap();
+    let dead_lettered = store
+        .dead_letter_task(record.task_id(), "still broken")
+        .await
+        .unwrap();
+    assert!(dead_lettered.dead_lettered);
+    assert_eq!(dead_lettered.retry_count, 1);
+
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET retry_count = 0 WHERE task_id = ?")
+        .bind(record.task_id().as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.replay_task(record.task_id()).await.unwrap_err(),
+        StoreError::CorruptEventStream(record.task_id().clone())
+    );
 }

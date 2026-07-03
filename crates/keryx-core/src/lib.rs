@@ -5,13 +5,19 @@
 
 pub mod agent_card;
 pub mod error;
+pub mod legacy;
 pub mod peer_id;
+pub mod retry_policy;
 pub mod task;
 pub mod task_handle;
 
 pub use agent_card::{AgentCard, AgentId, CapabilityId, Skill};
 pub use error::{CoreResult, KeryxCoreError, ValidationError};
+pub use legacy::{
+    is_valid_operational_legacy, normalize_legacy_transition, CanonicalTransition, LegacyEventType,
+};
 pub use peer_id::{NodeId, PeerId};
+pub use retry_policy::RetryPolicy;
 pub use task::{
     event_for_transition, is_legal_transition, validate_transition, KeryxEventType, Task, TaskId,
     TaskStatus, TaskTransition,

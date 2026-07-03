@@ -3,11 +3,13 @@
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Mutex};
 
 use keryx_core::{
-    validate_transition, AgentId, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, TaskId,
-    TaskStatus, ValidationError,
+    is_valid_operational_legacy, normalize_legacy_transition, validate_transition, AgentId,
+    CanonicalTransition, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, LegacyEventType,
+    RetryPolicy, TaskId, TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
+use tracing::{info, instrument};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -84,13 +86,16 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     id: TaskId,
     pub status: TaskStatus,
     pub idempotency_key: Option<IdempotencyKey>,
+    pub retry_count: u32,
+    pub dead_lettered: bool,
+    pub dead_letter_reason: Option<String>,
 }
 
 impl TaskRecord {
@@ -104,6 +109,9 @@ impl TaskRecord {
             id,
             status,
             idempotency_key,
+            retry_count: 0,
+            dead_lettered: false,
+            dead_letter_reason: None,
         }
     }
 
@@ -250,6 +258,45 @@ fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
     }
 }
 
+enum LegacyAppendPlan {
+    Lifecycle(CanonicalTransition),
+    Operational {
+        event_type: KeryxEventType,
+        status: TaskStatus,
+    },
+}
+
+fn plan_legacy_event_append(
+    from_status: TaskStatus,
+    legacy_event: LegacyEventType,
+) -> StoreResult<LegacyAppendPlan> {
+    if let Some(transition) = normalize_legacy_transition(from_status, legacy_event) {
+        return Ok(LegacyAppendPlan::Lifecycle(transition));
+    }
+    if is_valid_operational_legacy(from_status, legacy_event) {
+        return Ok(LegacyAppendPlan::Operational {
+            event_type: legacy_event.as_keryx_event_type(),
+            status: from_status,
+        });
+    }
+    Err(StoreError::Validation(
+        ValidationError::InvalidTaskTransition {
+            from: from_status,
+            to: from_status,
+        },
+    ))
+}
+
+fn is_replayable_operational_legacy_event(event_type: KeryxEventType) -> bool {
+    matches!(
+        event_type,
+        KeryxEventType::TaskQueued
+            | KeryxEventType::TaskApprovalRequested
+            | KeryxEventType::TaskApprovalGranted
+            | KeryxEventType::TaskAwaitingInput
+    )
+}
+
 impl InMemoryStore {
     fn lock(&self) -> StoreResult<std::sync::MutexGuard<'_, InMemoryState>> {
         self.inner.lock().map_err(|_| StoreError::LockPoisoned)
@@ -324,8 +371,123 @@ impl InMemoryStore {
         task_id: &TaskId,
         lease_id: &LeaseId,
         worker_id: &AgentId,
+        error_reason: &str,
+        policy: &RetryPolicy,
     ) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+
+        if policy.max_retries == 0 {
+            return self.finish_task_in_state(
+                &mut state,
+                task_id,
+                lease_id,
+                worker_id,
+                TaskStatus::Failed,
+                task.retry_count,
+                false,
+                None,
+            );
+        }
+
+        if policy.should_retry_after_failure(task.retry_count) {
+            return self.retry_task_in_state(&mut state, task_id, &active, task);
+        }
+
+        self.dead_letter_task_in_state(&mut state, task_id, &active, task, error_reason)
+    }
+
+    pub fn retry_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        self.retry_task_in_state(&mut state, task_id, &active, task)
+    }
+
+    pub fn dead_letter_task(&self, task_id: &TaskId, reason: &str) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        self.dead_letter_task_in_state(&mut state, task_id, &active, task, reason)
+    }
+
+    fn retry_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        active: &LeaseRecord,
+        mut task: TaskRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_matching_lease_id(task_id, active, &active.lease_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+        task.retry_count = task.retry_count.saturating_add(1);
+        task.status = TaskStatus::Pending;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            state,
+            task_id,
+            KeryxEventType::RecoveryAction,
+            Some(TaskStatus::Running),
+            TaskStatus::Pending,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        Ok(task)
+    }
+
+    fn dead_letter_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        active: &LeaseRecord,
+        mut task: TaskRecord,
+        reason: &str,
+    ) -> StoreResult<TaskRecord> {
+        ensure_matching_lease_id(task_id, active, &active.lease_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+        task.retry_count = task.retry_count.saturating_add(1);
+        task.dead_lettered = true;
+        task.dead_letter_reason = Some(reason.to_owned());
+        let transition = validate_transition(task.status, TaskStatus::Failed)?;
+        task.status = TaskStatus::Failed;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            state,
+            task_id,
+            KeryxEventType::TaskDeadLettered,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        Ok(task)
     }
 
     fn finish_task(
@@ -341,6 +503,35 @@ impl InMemoryStore {
             .get(task_id)
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        self.finish_task_in_state(
+            &mut state,
+            task_id,
+            lease_id,
+            worker_id,
+            to,
+            task.retry_count,
+            task.dead_lettered,
+            task.dead_letter_reason.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        to: TaskStatus,
+        retry_count: u32,
+        dead_lettered: bool,
+        dead_letter_reason: Option<String>,
+    ) -> StoreResult<TaskRecord> {
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
         let active = state
             .leases
             .get(task_id)
@@ -351,9 +542,12 @@ impl InMemoryStore {
         let transition = validate_transition(task.status, to)?;
         let mut updated = task;
         updated.status = to;
+        updated.retry_count = retry_count;
+        updated.dead_lettered = dead_lettered;
+        updated.dead_letter_reason = dead_letter_reason;
         state.leases.remove(task_id);
         append_in_memory_event(
-            &mut state,
+            state,
             task_id,
             transition.event_type,
             Some(transition.from),
@@ -361,6 +555,51 @@ impl InMemoryStore {
         );
         state.tasks.insert(task_id.clone(), updated.clone());
         Ok(updated)
+    }
+
+    pub fn accept_legacy_event(
+        &self,
+        task_id: &TaskId,
+        event_type: KeryxEventType,
+    ) -> StoreResult<TaskRecord> {
+        let legacy_event = LegacyEventType::from_keryx_event_type(event_type).ok_or(
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            }),
+        )?;
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let plan = plan_legacy_event_append(task.status, legacy_event)?;
+        match plan {
+            LegacyAppendPlan::Lifecycle(transition) => {
+                let mut updated = task;
+                updated.status = transition.to;
+                if transition.to.is_terminal() {
+                    state.leases.remove(task_id);
+                }
+                append_in_memory_event(
+                    &mut state,
+                    task_id,
+                    transition.event_type,
+                    Some(transition.from),
+                    transition.to,
+                );
+                state.tasks.insert(task_id.clone(), updated.clone());
+                Ok(updated)
+            }
+            LegacyAppendPlan::Operational {
+                event_type: preserved,
+                status,
+            } => {
+                append_in_memory_event(&mut state, task_id, preserved, Some(status), status);
+                Ok(task)
+            }
+        }
     }
 
     pub fn active_lease(&self, task_id: &TaskId) -> StoreResult<Option<LeaseRecord>> {
@@ -590,6 +829,32 @@ impl SqliteStore {
                     .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
             }
         }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let retry_column_exists =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'retry_count'")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !retry_column_exists {
+            for statement in MIGRATION_003 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (3, 'task_retry_dead_letter')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         let legacy_unowned_rows = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
         )
@@ -599,12 +864,6 @@ impl SqliteStore {
         recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows)
             .await
             .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         tx.commit()
             .await
             .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
@@ -626,6 +885,12 @@ impl SqliteStore {
         Ok(row.get::<i64, _>("version"))
     }
 
+    /// Close the underlying connection pool. Safe to call on any clone of the store.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    #[instrument(skip(self), fields(task_id = %task.task_id().as_str()))]
     pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {
         validate_accepted_task_status(&task)?;
         let mut tx = self.pool.begin().await?;
@@ -658,10 +923,15 @@ impl SqliteStore {
             return Err(StoreError::TaskAlreadyExists(task.task_id().clone()));
         }
 
-        sqlx::query("INSERT INTO tasks (task_id, status, idempotency_key) VALUES (?, ?, ?)")
+        sqlx::query(
+            "INSERT INTO tasks (task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason) VALUES (?, ?, ?, ?, ?, ?)",
+        )
             .bind(task.task_id().as_str())
             .bind(status_to_str(task.status))
             .bind(task.idempotency_key.as_ref().map(IdempotencyKey::as_str))
+            .bind(i64::from(task.retry_count))
+            .bind(i64::from(task.dead_lettered))
+            .bind(task.dead_letter_reason.as_deref())
             .execute(&mut *tx)
             .await?;
         if let Some(key) = &task.idempotency_key {
@@ -686,7 +956,9 @@ impl SqliteStore {
 
     pub async fn get_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord> {
         let row =
-            sqlx::query("SELECT task_id, status, idempotency_key FROM tasks WHERE task_id = ?")
+            sqlx::query(
+                "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason FROM tasks WHERE task_id = ?",
+            )
                 .bind(task_id.as_str())
                 .fetch_optional(&self.pool)
                 .await?
@@ -720,6 +992,48 @@ impl SqliteStore {
         self.get_task(task_id).await
     }
 
+    pub async fn accept_legacy_event(
+        &self,
+        task_id: &TaskId,
+        event_type: KeryxEventType,
+    ) -> StoreResult<TaskRecord> {
+        let legacy_event = LegacyEventType::from_keryx_event_type(event_type).ok_or(
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            }),
+        )?;
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let plan = plan_legacy_event_append(task.status, legacy_event)?;
+        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+        match plan {
+            LegacyAppendPlan::Lifecycle(transition) => {
+                if transition.to.is_terminal() {
+                    deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
+                }
+                update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
+                insert_event(
+                    &mut tx,
+                    task_id,
+                    sequence,
+                    transition.event_type,
+                    Some(transition.from),
+                    transition.to,
+                )
+                .await?;
+            }
+            LegacyAppendPlan::Operational {
+                event_type: preserved,
+                status,
+            } => {
+                insert_event(&mut tx, task_id, sequence, preserved, Some(status), status).await?;
+            }
+        }
+        tx.commit().await?;
+        self.get_task(task_id).await
+    }
+
     pub async fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>> {
         let rows = sqlx::query(
             "SELECT task_id, sequence, event_type, from_status, to_status FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
@@ -743,11 +1057,16 @@ impl SqliteStore {
         replay_task_from_snapshot_and_events(&task, &events)
     }
 
+    #[instrument(skip(self, lease), fields(task_id = %task_id.as_str(), worker_id = tracing::field::Empty))]
     pub async fn lease_task(
         &self,
         task_id: &TaskId,
         lease: LeaseRecord,
     ) -> StoreResult<TaskRecord> {
+        if let Some(worker_id) = lease.worker_id.as_ref() {
+            tracing::Span::current()
+                .record("worker_id", tracing::field::display(worker_id.as_str()));
+        }
         let mut tx = self.pool.begin().await?;
         ensure_matching_task_id(task_id, &lease)?;
         ensure_lease_has_owner(&lease)?;
@@ -792,6 +1111,7 @@ impl SqliteStore {
         self.get_task(task_id).await
     }
 
+    #[instrument(skip(self), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn renew_lease(
         &self,
         task_id: &TaskId,
@@ -831,6 +1151,7 @@ impl SqliteStore {
         ))
     }
 
+    #[instrument(skip(self), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn complete_task(
         &self,
         task_id: &TaskId,
@@ -841,14 +1162,74 @@ impl SqliteStore {
             .await
     }
 
+    #[instrument(skip(self, error_reason, policy), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn fail_task(
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
         worker_id: &AgentId,
+        error_reason: &str,
+        policy: &RetryPolicy,
     ) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
-            .await
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let active = fetch_active_lease_with_executor(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+
+        let updated = if policy.max_retries == 0 {
+            self.finish_task_in_tx(
+                &mut tx,
+                task_id,
+                lease_id,
+                worker_id,
+                TaskStatus::Failed,
+                task.retry_count,
+                false,
+                None,
+            )
+            .await?
+        } else if policy.should_retry_after_failure(task.retry_count) {
+            sqlite_retry_task_in_tx(&mut tx, task_id, &task).await?
+        } else {
+            sqlite_dead_letter_task_in_tx(&mut tx, task_id, &task, error_reason).await?
+        };
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn retry_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let active = fetch_active_lease_with_executor(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        let updated = sqlite_retry_task_in_tx(&mut tx, task_id, &task).await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn dead_letter_task(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let _active = fetch_active_lease_with_executor(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        let updated = sqlite_dead_letter_task_in_tx(&mut tx, task_id, &task, reason).await?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     async fn finish_task(
@@ -860,17 +1241,54 @@ impl SqliteStore {
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
-        let active = fetch_active_lease_with_executor(&mut tx, task_id)
+        let updated = self
+            .finish_task_in_tx(
+                &mut tx,
+                task_id,
+                lease_id,
+                worker_id,
+                to,
+                task.retry_count,
+                task.dead_lettered,
+                task.dead_letter_reason.clone(),
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_task_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        to: TaskStatus,
+        retry_count: u32,
+        dead_lettered: bool,
+        dead_letter_reason: Option<String>,
+    ) -> StoreResult<TaskRecord> {
+        let task = fetch_task_with_executor(tx, task_id).await?;
+        let active = fetch_active_lease_with_executor(tx, task_id)
             .await?
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
         ensure_matching_worker_id(task_id, &active, worker_id)?;
         let transition = validate_transition(task.status, to)?;
-        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
-        deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
-        update_task_status_with_executor(&mut tx, task_id, to).await?;
+        let sequence = next_sequence_with_executor(tx, task_id).await?;
+        deactivate_lease_for_task_with_executor(tx, task_id).await?;
+        update_task_metadata_with_executor(
+            tx,
+            task_id,
+            to,
+            retry_count,
+            dead_lettered,
+            dead_letter_reason.as_deref(),
+        )
+        .await?;
         insert_event(
-            &mut tx,
+            tx,
             task_id,
             sequence,
             transition.event_type,
@@ -878,8 +1296,7 @@ impl SqliteStore {
             transition.to,
         )
         .await?;
-        tx.commit().await?;
-        self.get_task(task_id).await
+        fetch_task_with_executor(tx, task_id).await
     }
 
     pub async fn active_lease(&self, task_id: &TaskId) -> StoreResult<Option<LeaseRecord>> {
@@ -892,6 +1309,7 @@ impl SqliteStore {
         row.map(row_to_lease).transpose()
     }
 
+    #[instrument(skip(self))]
     pub async fn recover_stale_leases(
         &self,
         now_ms: i64,
@@ -920,6 +1338,12 @@ impl SqliteStore {
         let mut report = recover_sqlite_leases_with_executor(&mut tx, rows).await?;
         report.corrupted_tasks = collect_corrupt_sqlite_tasks_with_executor(&mut tx).await?;
         tx.commit().await?;
+        info!(
+            tasks_recovered = report.recovered_task_count(),
+            leases_cleaned = report.cleaned_terminal_leases,
+            corruption_count = report.corruption_count(),
+            "recover_stale_leases completed"
+        );
         Ok(report)
     }
 }
@@ -1082,7 +1506,9 @@ async fn fetch_task_optional_with_executor(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     task_id: &TaskId,
 ) -> StoreResult<Option<TaskRecord>> {
-    let row = sqlx::query("SELECT task_id, status, idempotency_key FROM tasks WHERE task_id = ?")
+    let row = sqlx::query(
+        "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason FROM tasks WHERE task_id = ?",
+    )
         .bind(task_id.as_str())
         .fetch_optional(&mut **tx)
         .await?;
@@ -1240,6 +1666,14 @@ fn replay_task_from_snapshot_and_events(
     }
 
     let mut current_status = first.to_status;
+    // `retry_count`, `dead_lettered`, and `dead_letter_reason` remain authoritative
+    // snapshot metadata for now. Replay only validates lifecycle sequencing plus the
+    // parts of retry/dead-letter state the event log can express unambiguously.
+    //
+    // Today retry-driven requeues and stale-lease recovery both persist as
+    // `RecoveryAction`, so the event stream cannot faithfully reconstruct the full
+    // retry counter without double-counting or conflating retry with recovery.
+    let mut replay_dead_lettered = false;
     for (index, event) in events.iter().enumerate().skip(1) {
         if event.task_id != snapshot.task_id().clone()
             || event.sequence != (index as u64) + 1
@@ -1259,6 +1693,23 @@ fn replay_task_from_snapshot_and_events(
                 }
                 current_status = transition.to;
             }
+            KeryxEventType::TaskLeased
+            | KeryxEventType::TaskCanceled
+            | KeryxEventType::TaskTimedOut
+            | KeryxEventType::TaskDeadLettered
+            | KeryxEventType::TaskApprovalDenied => {
+                let legacy = LegacyEventType::from_keryx_event_type(event.event_type)
+                    .ok_or(StoreError::CorruptEventStream(task_id.clone()))?;
+                let transition = normalize_legacy_transition(current_status, legacy)
+                    .ok_or(StoreError::CorruptEventStream(task_id.clone()))?;
+                if transition.to != event.to_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                if event.event_type == KeryxEventType::TaskDeadLettered {
+                    replay_dead_lettered = true;
+                }
+                current_status = transition.to;
+            }
             KeryxEventType::RecoveryAction => {
                 let expected_to_status = match current_status {
                     TaskStatus::Running => TaskStatus::Pending,
@@ -1271,6 +1722,11 @@ fn replay_task_from_snapshot_and_events(
                 }
                 current_status = event.to_status;
             }
+            event_type if is_replayable_operational_legacy_event(event_type) => {
+                if event.to_status != current_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+            }
             _ => return Err(StoreError::CorruptEventStream(task_id)),
         }
     }
@@ -1278,8 +1734,71 @@ fn replay_task_from_snapshot_and_events(
     if snapshot.status != current_status {
         return Err(StoreError::CorruptEventStream(task_id));
     }
+    if snapshot.dead_lettered != replay_dead_lettered {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
+    if snapshot.dead_lettered && snapshot.retry_count == 0 {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
 
-    Ok(snapshot.clone())
+    let mut rebuilt = snapshot.clone();
+    rebuilt.status = current_status;
+    Ok(rebuilt)
+}
+
+async fn sqlite_retry_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    task: &TaskRecord,
+) -> StoreResult<TaskRecord> {
+    require_status(task.status, TaskStatus::Running)?;
+    let retry_count = task.retry_count.saturating_add(1);
+    let sequence = next_sequence_with_executor(tx, task_id).await?;
+    deactivate_lease_for_task_with_executor(tx, task_id).await?;
+    update_task_metadata_with_executor(tx, task_id, TaskStatus::Pending, retry_count, false, None)
+        .await?;
+    insert_event(
+        tx,
+        task_id,
+        sequence,
+        KeryxEventType::RecoveryAction,
+        Some(TaskStatus::Running),
+        TaskStatus::Pending,
+    )
+    .await?;
+    fetch_task_with_executor(tx, task_id).await
+}
+
+async fn sqlite_dead_letter_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    task: &TaskRecord,
+    reason: &str,
+) -> StoreResult<TaskRecord> {
+    require_status(task.status, TaskStatus::Running)?;
+    let retry_count = task.retry_count.saturating_add(1);
+    let transition = validate_transition(task.status, TaskStatus::Failed)?;
+    let sequence = next_sequence_with_executor(tx, task_id).await?;
+    deactivate_lease_for_task_with_executor(tx, task_id).await?;
+    update_task_metadata_with_executor(
+        tx,
+        task_id,
+        TaskStatus::Failed,
+        retry_count,
+        true,
+        Some(reason),
+    )
+    .await?;
+    insert_event(
+        tx,
+        task_id,
+        sequence,
+        KeryxEventType::TaskDeadLettered,
+        Some(transition.from),
+        transition.to,
+    )
+    .await?;
+    fetch_task_with_executor(tx, task_id).await
 }
 
 async fn next_sequence_with_executor(
@@ -1293,6 +1812,27 @@ async fn next_sequence_with_executor(
     .fetch_one(&mut **tx)
     .await?;
     Ok(row.get::<i64, _>("next_sequence") as u64)
+}
+
+async fn update_task_metadata_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    status: TaskStatus,
+    retry_count: u32,
+    dead_lettered: bool,
+    dead_letter_reason: Option<&str>,
+) -> StoreResult<()> {
+    sqlx::query(
+        "UPDATE tasks SET status = ?, retry_count = ?, dead_lettered = ?, dead_letter_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+    )
+    .bind(status_to_str(status))
+    .bind(i64::from(retry_count))
+    .bind(i64::from(dead_lettered))
+    .bind(dead_letter_reason)
+    .bind(task_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn update_task_status_with_executor(
@@ -1358,7 +1898,20 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskRecord> {
         .try_get::<Option<String>, _>("idempotency_key")?
         .map(IdempotencyKey::new)
         .transpose()?;
-    Ok(TaskRecord::new(task_id, status, idempotency_key))
+    let retry_count = row
+        .try_get::<Option<i64>, _>("retry_count")?
+        .unwrap_or(0)
+        .max(0) as u32;
+    let dead_lettered = row.try_get::<Option<i64>, _>("dead_lettered")?.unwrap_or(0) != 0;
+    let dead_letter_reason = row.try_get::<Option<String>, _>("dead_letter_reason")?;
+    Ok(TaskRecord {
+        id: task_id,
+        status,
+        idempotency_key,
+        retry_count,
+        dead_lettered,
+        dead_letter_reason,
+    })
 }
 
 fn row_to_lease(row: sqlx::sqlite::SqliteRow) -> StoreResult<LeaseRecord> {
@@ -1410,6 +1963,12 @@ const MIGRATION_001: &[&str] = &[
 ];
 
 const MIGRATION_002: &[&str] = &["ALTER TABLE leases ADD COLUMN worker_id TEXT"];
+
+const MIGRATION_003: &[&str] = &[
+    "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN dead_lettered INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN dead_letter_reason TEXT",
+];
 
 const fn status_to_str(status: TaskStatus) -> &'static str {
     match status {
@@ -1480,7 +2039,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+    use keryx_core::{
+        AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus, ValidationError,
+    };
 
     use super::{
         append_in_memory_event, InMemoryState, InMemoryStore, LeaseRecord, StoreError, TaskRecord,
@@ -1622,5 +2183,109 @@ mod tests {
         let report = store.recover_stale_leases(0, None).unwrap();
         assert_eq!(report.corruption_count(), 1);
         assert_eq!(report.corrupted_tasks, vec![task.task_id().clone()]);
+    }
+
+    #[test]
+    fn in_memory_replay_rejects_dead_lettered_snapshot_without_retry_count() {
+        let mut task = task(
+            "dead-letter-without-retry-task",
+            TaskStatus::Failed,
+            Some("dead-letter-without-retry-idem"),
+        );
+        task.dead_lettered = true;
+        task.dead_letter_reason = Some("still broken".to_owned());
+        let mut state = InMemoryState {
+            tasks: HashMap::from([(task.task_id().clone(), task.clone())]),
+            events: HashMap::new(),
+            idempotency: HashMap::new(),
+            leases: HashMap::new(),
+        };
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskAccepted,
+            None,
+            TaskStatus::Pending,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskStarted,
+            Some(TaskStatus::Pending),
+            TaskStatus::Running,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskDeadLettered,
+            Some(TaskStatus::Running),
+            TaskStatus::Failed,
+        );
+        let store = InMemoryStore {
+            inner: Mutex::new(state),
+        };
+
+        assert_eq!(
+            store.replay_task(task.task_id()).unwrap_err(),
+            StoreError::CorruptEventStream(task.task_id().clone())
+        );
+    }
+
+    fn accepted_task(id: &str) -> TaskRecord {
+        task(id, TaskStatus::Pending, Some("legacy-idem"))
+    }
+
+    #[test]
+    fn accept_legacy_event_normalizes_task_leased_to_running_with_task_started_event() {
+        let accepted = accepted_task("legacy-lease-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let updated = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskLeased)
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Running);
+
+        let events = store.events_for_task(accepted.task_id()).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, KeryxEventType::TaskStarted);
+        assert_eq!(last.from_status, Some(TaskStatus::Pending));
+        assert_eq!(last.to_status, TaskStatus::Running);
+        assert!(store.replay_task(accepted.task_id()).is_ok());
+    }
+
+    #[test]
+    fn accept_legacy_event_appends_operational_task_queued_without_status_change() {
+        let accepted = accepted_task("legacy-queued-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let updated = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskQueued)
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Pending);
+
+        let events = store.events_for_task(accepted.task_id()).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, KeryxEventType::TaskQueued);
+        assert!(store.replay_task(accepted.task_id()).is_ok());
+    }
+
+    #[test]
+    fn accept_legacy_event_rejects_unknown_status_combination() {
+        let accepted = accepted_task("legacy-invalid-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let err = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskTimedOut)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            })
+        );
     }
 }
