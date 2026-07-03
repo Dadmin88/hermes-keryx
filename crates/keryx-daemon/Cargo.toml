@@ -12,15 +12,22 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1"
 keryx-core = { path = "../keryx-core" }
 keryx-store = { path = "../keryx-store" }
 keryx-proto = { path = "../keryx-proto" }
-tokio = { workspace = true, features = ["net"] }
+keryx-observe = { path = "../keryx-observe" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tonic = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+keryx-relay = { path = "../keryx-relay" }
 sqlx.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }

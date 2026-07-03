@@ -1,21 +1,164 @@
 //! Local daemon startup/runtime foundation for Hermes Keryx.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+mod discovery;
+mod health_loop;
+mod incoming;
+mod lease_recovery_loop;
+mod routing;
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use keryx_core::{AgentId, IdempotencyKey, LeaseId, PeerId, RetryPolicy, TaskId, TaskStatus};
+use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
     keryx_daemon_server::{KeryxDaemon, KeryxDaemonServer},
-    DoctorRequest, DoctorResponse, StatusRequest, StatusResponse,
+    AgentId as ProtoAgentId, ClaimTaskRequest, ClaimTaskResponse, CompleteTaskRequest,
+    CompleteTaskResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
+    DoctorResponse, FailTaskRequest, FailTaskResponse, HeartbeatRequest, HeartbeatResponse,
+    IdempotencyKey as ProtoIdempotencyKey, LeaseId as ProtoLeaseId, ListPeersRequest,
+    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, ReadinessRequest,
+    ReadinessResponse, SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse,
+    SubmitTaskRequest, SubmitTaskResponse, TaskId as ProtoTaskId,
 };
+use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
+use tracing::{error, instrument, warn};
 
-use keryx_store::{RecoveryReport, SqliteStore, StoreError, StoreResult, CURRENT_SCHEMA_VERSION};
+use keryx_store::{
+    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskRecord,
+    CURRENT_SCHEMA_VERSION,
+};
+
+pub use discovery::{
+    ConfiguredSkill, DiscoveryHandle, DiscoverySettings, RegistrationSettings,
+    DEFAULT_REFRESH_LEAD_SECONDS, DEFAULT_REGISTRATION_TTL_SECONDS,
+};
+pub use health_loop::{probe_store_readiness, HealthLoop, HealthLoopHandle};
+pub use incoming::{
+    handle_incoming_task, IncomingDispatchConfig, IncomingHandleResult, IncomingRelayTask,
+    IncomingTaskLoop, IncomingTaskLoopHandle, SenderAllowlist, StaticSenderAllowlist,
+};
+pub use lease_recovery_loop::{LeaseRecoveryLoop, LeaseRecoveryLoopHandle};
+pub use routing::{
+    routing_error_to_status, DeliveryRoute, NoopRelayPublisher, PeerDirectory, PeerInfo,
+    RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter, DEFAULT_SEND_TASK_TIMEOUT_MS,
+};
+
+/// Default background health probe interval.
+const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 60_000;
+
+/// Default background stale-lease scan interval.
+const DEFAULT_LEASE_RECOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// Default worker lease TTL when callers omit `lease_duration_ms`.
+const DEFAULT_LEASE_DEFAULT_TTL_MS: i64 = 300_000;
+
+/// Default time to wait for in-flight RPCs during graceful shutdown.
+const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug)]
+struct ShutdownState {
+    shutting_down: AtomicBool,
+    in_flight_rpcs: AtomicUsize,
+    grpc_shutdown_tx: watch::Sender<bool>,
+    grpc_shutdown_rx: watch::Receiver<bool>,
+}
+
+impl ShutdownState {
+    fn new() -> Self {
+        let (grpc_shutdown_tx, grpc_shutdown_rx) = watch::channel(false);
+        Self {
+            shutting_down: AtomicBool::new(false),
+            in_flight_rpcs: AtomicUsize::new(0),
+            grpc_shutdown_tx,
+            grpc_shutdown_rx,
+        }
+    }
+
+    fn mark_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    fn signal_grpc_stop(&self) {
+        let _ = self.grpc_shutdown_tx.send(true);
+    }
+
+    fn initiate(&self) {
+        self.mark_shutting_down();
+        self.signal_grpc_stop();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight_rpcs.load(Ordering::SeqCst)
+    }
+
+    fn grpc_shutdown_wait(&self) -> impl std::future::Future<Output = ()> + Send {
+        let mut rx = self.grpc_shutdown_rx.clone();
+        async move {
+            let _ = rx.wait_for(|active| *active).await;
+        }
+    }
+}
+
+struct RpcInFlightGuard {
+    state: Arc<ShutdownState>,
+}
+
+impl RpcInFlightGuard {
+    fn enter(runtime: &KeryxDaemonRuntime) -> Result<Self, Status> {
+        if runtime.shutdown.is_shutting_down() {
+            return Err(Status::unavailable("daemon is shutting down"));
+        }
+        runtime
+            .shutdown
+            .in_flight_rpcs
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(Self {
+            state: Arc::clone(&runtime.shutdown),
+        })
+    }
+}
+
+impl Drop for RpcInFlightGuard {
+    fn drop(&mut self) {
+        self.state.in_flight_rpcs.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn test_rpc_delay() {
+    let delay_ms = std::env::var("KERYX_TEST_RPC_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+/// Default local peer id when callers do not override config.
+const DEFAULT_LOCAL_PEER_ID: &str = "node-local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeryxDaemonConfig {
     data_dir: PathBuf,
     startup_recovery_now_ms: i64,
+    lease_recovery_interval_ms: u64,
+    lease_default_ttl_ms: i64,
+    health_check_interval_ms: u64,
+    shutdown_timeout_ms: u64,
+    fail_retry_policy: RetryPolicy,
+    local_peer_id: PeerId,
+    send_task_timeout_ms: u64,
+    discovery: Option<DiscoverySettings>,
 }
 
 impl KeryxDaemonConfig {
@@ -24,7 +167,27 @@ impl KeryxDaemonConfig {
         Self {
             data_dir: data_dir.into(),
             startup_recovery_now_ms,
+            lease_recovery_interval_ms: DEFAULT_LEASE_RECOVERY_INTERVAL_MS,
+            lease_default_ttl_ms: DEFAULT_LEASE_DEFAULT_TTL_MS,
+            health_check_interval_ms: DEFAULT_HEALTH_CHECK_INTERVAL_MS,
+            shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            fail_retry_policy: RetryPolicy::default(),
+            local_peer_id: PeerId::new(DEFAULT_LOCAL_PEER_ID).expect("static local peer id"),
+            send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
+            discovery: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_lease_recovery_interval_ms(mut self, lease_recovery_interval_ms: u64) -> Self {
+        self.lease_recovery_interval_ms = lease_recovery_interval_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lease_default_ttl_ms(mut self, lease_default_ttl_ms: i64) -> Self {
+        self.lease_default_ttl_ms = lease_default_ttl_ms;
+        self
     }
 
     #[must_use]
@@ -41,6 +204,133 @@ impl KeryxDaemonConfig {
     pub const fn startup_recovery_now_ms(&self) -> i64 {
         self.startup_recovery_now_ms
     }
+
+    #[must_use]
+    pub const fn lease_recovery_interval_ms(&self) -> u64 {
+        self.lease_recovery_interval_ms
+    }
+
+    #[must_use]
+    pub fn with_health_check_interval_ms(mut self, health_check_interval_ms: u64) -> Self {
+        self.health_check_interval_ms = health_check_interval_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn health_check_interval_ms(&self) -> u64 {
+        self.health_check_interval_ms
+    }
+
+    #[must_use]
+    pub fn with_shutdown_timeout_ms(mut self, shutdown_timeout_ms: u64) -> Self {
+        self.shutdown_timeout_ms = shutdown_timeout_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn shutdown_timeout_ms(&self) -> u64 {
+        self.shutdown_timeout_ms
+    }
+
+    #[must_use]
+    pub fn with_fail_retry_policy(mut self, fail_retry_policy: RetryPolicy) -> Self {
+        self.fail_retry_policy = fail_retry_policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn fail_retry_policy(&self) -> RetryPolicy {
+        self.fail_retry_policy
+    }
+
+    #[must_use]
+    pub const fn lease_default_ttl_ms(&self) -> i64 {
+        self.lease_default_ttl_ms
+    }
+
+    #[must_use]
+    pub fn with_local_peer_id(mut self, local_peer_id: PeerId) -> Self {
+        self.local_peer_id = local_peer_id;
+        self
+    }
+
+    #[must_use]
+    pub fn local_peer_id(&self) -> &PeerId {
+        &self.local_peer_id
+    }
+
+    #[must_use]
+    pub fn with_send_task_timeout_ms(mut self, send_task_timeout_ms: u64) -> Self {
+        self.send_task_timeout_ms = send_task_timeout_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn send_task_timeout_ms(&self) -> u64 {
+        self.send_task_timeout_ms
+    }
+
+    #[must_use]
+    pub fn with_discovery(mut self, discovery: Option<DiscoverySettings>) -> Self {
+        self.discovery = discovery;
+        self
+    }
+
+    #[must_use]
+    pub fn discovery(&self) -> Option<&DiscoverySettings> {
+        self.discovery.as_ref()
+    }
+}
+
+const RELAY_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
+const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
+const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
+const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
+const DAEMON_REGISTRATION_TTL_ENV: &str = "HERMES_KERYX_DAEMON_REGISTRATION_TTL_SECONDS";
+
+/// Build discovery settings from environment when a relay registry endpoint is configured.
+#[must_use]
+pub fn discovery_settings_from_env() -> Option<DiscoverySettings> {
+    let registry_endpoint = std::env::var(RELAY_REGISTRY_ENDPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let skills = configured_skills_from_env();
+    let ttl_seconds = std::env::var(DAEMON_REGISTRATION_TTL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_REGISTRATION_TTL_SECONDS);
+    let registration = if skills.is_empty() {
+        None
+    } else {
+        Some(RegistrationSettings {
+            skills,
+            name: std::env::var(DAEMON_NAME_ENV).unwrap_or_else(|_| "keryx-daemon".into()),
+            description: std::env::var(DAEMON_DESCRIPTION_ENV).unwrap_or_default(),
+            ttl_seconds,
+            refresh_interval: RegistrationSettings::refresh_interval_for_ttl(ttl_seconds),
+        })
+    };
+    Some(DiscoverySettings {
+        registry_endpoint,
+        registration,
+    })
+}
+
+fn configured_skills_from_env() -> Vec<ConfiguredSkill> {
+    let Ok(raw) = std::env::var(DAEMON_SKILLS_ENV) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|skill_id| ConfiguredSkill {
+            skill_id: skill_id.to_string(),
+            description: String::new(),
+            tags: Vec::new(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +369,22 @@ pub struct KeryxDoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicReadiness {
+    pub ready: bool,
+    pub not_ready_reasons: Vec<String>,
+}
+
+impl DynamicReadiness {
+    #[must_use]
+    pub const fn ready() -> Self {
+        Self {
+            ready: true,
+            not_ready_reasons: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupReport {
     pub schema_version: i64,
     pub supported_schema_version: i64,
@@ -92,6 +398,11 @@ pub struct KeryxDaemonRuntime {
     config: KeryxDaemonConfig,
     store: SqliteStore,
     report: StartupReport,
+    metrics: Arc<KeryxMetrics>,
+    readiness: Arc<RwLock<DynamicReadiness>>,
+    shutdown: Arc<ShutdownState>,
+    router: Arc<TaskRouter>,
+    discovery: Arc<RwLock<Option<Arc<DiscoveryHandle>>>>,
 }
 
 impl KeryxDaemonRuntime {
@@ -120,11 +431,117 @@ impl KeryxDaemonRuntime {
             recovery,
             startup_recovery_duration_ms: startup_recovery_started_at.elapsed().as_millis(),
         };
-        Ok(Self {
+        let peer_directory = Arc::new(PeerDirectory::new(config.local_peer_id().clone()));
+        let router = Arc::new(TaskRouter::new(
+            peer_directory,
+            Arc::new(NoopRelayPublisher),
+            config.send_task_timeout_ms(),
+        ));
+        let discovery = Arc::new(RwLock::new(None));
+        let runtime = Self {
             config,
             store,
             report,
-        })
+            metrics: Arc::new(KeryxMetrics::new()),
+            readiness: Arc::new(RwLock::new(DynamicReadiness::ready())),
+            shutdown: Arc::new(ShutdownState::new()),
+            router,
+            discovery,
+        };
+        if let Some(settings) = runtime.config.discovery.clone() {
+            runtime
+                .attach_discovery(settings)
+                .await
+                .map_err(|status| StoreError::Database(status.message().to_string()))?;
+        }
+        Ok(runtime)
+    }
+
+    /// Connect to the relay registry, start TTL refresh registration, and enable discovery RPC.
+    pub async fn attach_discovery(&self, settings: DiscoverySettings) -> Result<(), Status> {
+        let handle =
+            DiscoveryHandle::connect(&settings, self.config.local_peer_id().clone()).await?;
+        handle.start_registration_loop().await?;
+        *self.discovery.write().await = Some(Arc::new(handle));
+        Ok(())
+    }
+
+    pub async fn discover_skills(
+        &self,
+        request: DiscoverSkillsRequest,
+    ) -> Result<DiscoverSkillsResponse, Status> {
+        let guard = self.discovery.read().await;
+        let Some(handle) = guard.as_ref() else {
+            return Err(Status::unavailable(
+                "relay skill registry is not configured",
+            ));
+        };
+        handle.discover(request).await
+    }
+
+    /// Reject new RPC handlers while keeping the listener up (used by integration tests).
+    pub fn mark_shutting_down(&self) {
+        self.shutdown.mark_shutting_down();
+    }
+
+    /// Mark the daemon as shutting down and signal the gRPC server to stop accepting
+    /// new connections. Does not close the store; pair with [`shutdown`](Self::shutdown).
+    pub fn initiate_shutdown(&self) {
+        tracing::info!(component = "keryxd", "graceful shutdown initiated");
+        self.shutdown.initiate();
+    }
+
+    /// Drain in-flight RPCs (bounded by config timeout), close the store, and log completion.
+    pub async fn shutdown(self: Arc<Self>) -> StoreResult<()> {
+        let started = Instant::now();
+        self.initiate_shutdown();
+
+        let timeout = Duration::from_millis(self.config.shutdown_timeout_ms());
+        let deadline = started + timeout;
+        loop {
+            let in_flight = self.shutdown.in_flight();
+            if in_flight == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    component = "keryxd",
+                    in_flight_rpcs = in_flight,
+                    shutdown_timeout_ms = self.config.shutdown_timeout_ms(),
+                    "shutdown drain timed out with in-flight RPCs remaining"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if let Some(handle) = self.discovery.write().await.take() {
+            handle.shutdown().await;
+        }
+
+        self.store.close().await;
+        tracing::info!(
+            component = "keryxd",
+            duration_ms = started.elapsed().as_millis() as u64,
+            in_flight_rpcs_at_close = self.shutdown.in_flight(),
+            "daemon shutdown complete"
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn readiness_handle(&self) -> &Arc<RwLock<DynamicReadiness>> {
+        &self.readiness
+    }
+
+    pub async fn readiness_snapshot(&self) -> DynamicReadiness {
+        self.readiness.read().await.clone()
+    }
+
+    /// Re-run store health probes and refresh the cached readiness snapshot.
+    pub async fn refresh_readiness(&self) {
+        let snapshot = probe_store_readiness(&self.store).await;
+        *self.readiness.write().await = snapshot;
     }
 
     #[must_use]
@@ -207,6 +624,49 @@ impl KeryxDaemonRuntime {
     pub const fn report(&self) -> &StartupReport {
         &self.report
     }
+
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<KeryxMetrics> {
+        &self.metrics
+    }
+
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Spawn the background stale-lease recovery loop (see [`LeaseRecoveryLoop`]).
+    #[must_use]
+    pub fn spawn_lease_recovery_loop(self: &Arc<Self>) -> LeaseRecoveryLoopHandle {
+        LeaseRecoveryLoop::spawn(Arc::clone(self))
+    }
+
+    /// Spawn the background store health probe loop (see [`HealthLoop`]).
+    #[must_use]
+    pub fn spawn_health_loop(self: &Arc<Self>) -> HealthLoopHandle {
+        HealthLoop::spawn(Arc::clone(self))
+    }
+
+    /// Spawn the relay incoming-task loop (see [`IncomingTaskLoop`]).
+    #[must_use]
+    pub fn spawn_incoming_task_loop(
+        self: &Arc<Self>,
+        allowlist: Arc<dyn SenderAllowlist>,
+        dispatch: IncomingDispatchConfig,
+        source: tokio::sync::mpsc::Receiver<IncomingRelayTask>,
+    ) -> IncomingTaskLoopHandle {
+        IncomingTaskLoop::spawn(Arc::clone(self), allowlist, dispatch, source)
+    }
+
+    #[must_use]
+    pub fn router(&self) -> &Arc<TaskRouter> {
+        &self.router
+    }
+
+    #[must_use]
+    pub fn shutdown_is_active(&self) -> bool {
+        self.shutdown.is_shutting_down()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -228,19 +688,24 @@ pub async fn serve_daemon_rpc(
     runtime: KeryxDaemonRuntime,
     incoming: TcpListenerStream,
 ) -> Result<(), tonic::transport::Error> {
+    let shutdown_signal = runtime.shutdown.grpc_shutdown_wait();
     tonic::transport::Server::builder()
         .add_service(KeryxDaemonServer::new(KeryxDaemonRpcService::new(runtime)))
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, shutdown_signal)
         .await
 }
 
 #[tonic::async_trait]
 impl KeryxDaemon for KeryxDaemonRpcService {
+    #[instrument(name = "keryx::rpc::status", skip(self))]
     async fn status(
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        test_rpc_delay().await;
         let report = self.runtime.status_report();
+        let metrics = self.runtime.metrics_snapshot();
         let status = if report.daemon_ready {
             "ready"
         } else {
@@ -259,13 +724,24 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             store_kind: report.store.kind.to_string(),
             store_ready: report.store.ready,
             store_path: report.store.path.display().to_string(),
+            tasks_submitted: metrics.tasks_submitted,
+            tasks_claimed: metrics.tasks_claimed,
+            tasks_completed: metrics.tasks_completed,
+            tasks_failed: metrics.tasks_failed,
+            heartbeats: metrics.heartbeats,
+            leases_recovered: metrics.leases_recovered,
+            recovery_ticks: metrics.recovery_ticks,
+            active_leases: metrics.active_leases,
+            dead_letters: metrics.dead_letters,
         }))
     }
 
+    #[instrument(name = "keryx::rpc::doctor", skip(self))]
     async fn doctor(
         &self,
         _request: Request<DoctorRequest>,
     ) -> Result<Response<DoctorResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         let report = self.runtime.doctor_report();
         let status = if report.healthy { "pass" } else { "fail" };
         let messages = report
@@ -281,4 +757,470 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             messages,
         }))
     }
+
+    #[instrument(name = "keryx::rpc::liveness", skip(self))]
+    async fn liveness(
+        &self,
+        _request: Request<LivenessRequest>,
+    ) -> Result<Response<LivenessResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        Ok(Response::new(LivenessResponse { alive: true }))
+    }
+
+    #[instrument(name = "keryx::rpc::readiness", skip(self))]
+    async fn readiness(
+        &self,
+        _request: Request<ReadinessRequest>,
+    ) -> Result<Response<ReadinessResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let snapshot = self.runtime.readiness_snapshot().await;
+        Ok(Response::new(ReadinessResponse {
+            ready: snapshot.ready,
+            not_ready_reasons: snapshot.not_ready_reasons,
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::submit_task",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty)
+    )]
+    async fn submit_task(
+        &self,
+        request: Request<SubmitTaskRequest>,
+    ) -> Result<Response<SubmitTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let envelope = request
+            .into_inner()
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("envelope is required"))?;
+        let task_id = parse_required_task_id(envelope.task_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
+        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let accepted = self
+            .runtime
+            .store()
+            .accept_task(record)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_tasks_submitted();
+        Ok(Response::new(SubmitTaskResponse {
+            task_id: Some(proto_task_id(accepted.task_id())),
+            status: task_status_label(accepted.status).to_string(),
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::claim_task",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty, worker_id = tracing::field::Empty)
+    )]
+    async fn claim_task(
+        &self,
+        request: Request<ClaimTaskRequest>,
+    ) -> Result<Response<ClaimTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let lease_duration_ms =
+            normalize_lease_duration_ms(inner.lease_duration_ms, self.runtime.config());
+        let leased_at_ms = unix_ms_now();
+        let expires_at_ms = leased_at_ms.saturating_add(lease_duration_ms);
+        let lease_id = new_lease_id(&task_id, leased_at_ms);
+        let lease = LeaseRecord::new(
+            lease_id.clone(),
+            task_id.clone(),
+            worker_id.clone(),
+            leased_at_ms,
+            expires_at_ms,
+        );
+        let task = self
+            .runtime
+            .store()
+            .lease_task(&task_id, lease)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_tasks_claimed();
+        Ok(Response::new(ClaimTaskResponse {
+            task_id: Some(proto_task_id(task.task_id())),
+            lease_id: Some(proto_lease_id(&lease_id)),
+            worker_id: Some(proto_agent_id(&worker_id)),
+            leased_at_ms,
+            expires_at_ms,
+            status: task_status_label(task.status).to_string(),
+            retry_count: task.retry_count,
+            dead_lettered: task.dead_lettered,
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::heartbeat",
+        skip(self, request),
+        fields(
+            task_id = tracing::field::Empty,
+            lease_id = tracing::field::Empty,
+            worker_id = tracing::field::Empty
+        )
+    )]
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
+        let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
+        tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let lease_duration_ms =
+            normalize_lease_duration_ms(inner.lease_duration_ms, self.runtime.config());
+        let now_ms = unix_ms_now();
+        let new_expires_at_ms = now_ms.saturating_add(lease_duration_ms);
+        let renewed = self
+            .runtime
+            .store()
+            .renew_lease(&task_id, &lease_id, &worker_id, now_ms, new_expires_at_ms)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_heartbeats();
+        Ok(Response::new(HeartbeatResponse {
+            lease_id: Some(proto_lease_id(&renewed.lease_id)),
+            expires_at_ms: renewed.expires_at_ms,
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::complete_task",
+        skip(self, request),
+        fields(
+            task_id = tracing::field::Empty,
+            lease_id = tracing::field::Empty,
+            worker_id = tracing::field::Empty
+        )
+    )]
+    async fn complete_task(
+        &self,
+        request: Request<CompleteTaskRequest>,
+    ) -> Result<Response<CompleteTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
+        let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
+        tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let task = self
+            .runtime
+            .store()
+            .complete_task(&task_id, &lease_id, &worker_id)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_tasks_completed();
+        Ok(Response::new(CompleteTaskResponse {
+            task_id: Some(proto_task_id(task.task_id())),
+            status: task_status_label(task.status).to_string(),
+            duration_ms: inner.duration_ms,
+            result_metadata: inner.result_metadata,
+            output_artifacts: inner.output_artifacts,
+        }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::fail_task",
+        skip(self, request),
+        fields(
+            task_id = tracing::field::Empty,
+            lease_id = tracing::field::Empty,
+            worker_id = tracing::field::Empty,
+            error_reason = tracing::field::Empty
+        )
+    )]
+    async fn fail_task(
+        &self,
+        request: Request<FailTaskRequest>,
+    ) -> Result<Response<FailTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
+        let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+        let error_reason = inner.error_reason.clone();
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
+        tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        tracing::Span::current().record("error_reason", tracing::field::display(&error_reason));
+        let policy = self.runtime.config().fail_retry_policy();
+        let task = self
+            .runtime
+            .store()
+            .fail_task(&task_id, &lease_id, &worker_id, &error_reason, &policy)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_tasks_failed();
+        if task.dead_lettered {
+            self.runtime.metrics().increment_dead_letters();
+        }
+        Ok(Response::new(FailTaskResponse {
+            task_id: Some(proto_task_id(task.task_id())),
+            status: task_status_label(task.status).to_string(),
+            duration_ms: inner.duration_ms,
+            error_reason,
+            failure_metadata: inner.failure_metadata,
+            retry_count: task.retry_count,
+            dead_lettered: task.dead_lettered,
+        }))
+    }
+
+    #[instrument(name = "keryx::rpc::send_task", skip(self, request))]
+    async fn send_task(
+        &self,
+        request: Request<SendTaskRequest>,
+    ) -> Result<Response<SendTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        test_rpc_delay().await;
+        let inner = request.into_inner();
+        let envelope = inner
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("envelope is required"))?;
+        let trimmed = inner.target_peer_id.trim();
+        if trimmed.is_empty() {
+            return Err(Status::invalid_argument("target_peer_id is required"));
+        }
+        let target_peer_id =
+            PeerId::new(trimmed).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .runtime
+            .router()
+            .send_task(
+                self.runtime.store(),
+                target_peer_id,
+                envelope,
+                inner.timeout_ms,
+            )
+            .await
+            .map_err(routing_error_to_status)?;
+        if outcome.route == DeliveryRoute::Local {
+            self.runtime.metrics().increment_tasks_submitted();
+        }
+        Ok(Response::new(SendTaskResponse {
+            task_id: Some(proto_task_id(&outcome.task_id)),
+            status: outcome.status,
+            routed_to: outcome.routed_to.to_string(),
+            delivery_route: outcome.route.as_str().to_string(),
+        }))
+    }
+
+    #[instrument(name = "keryx::rpc::list_peers", skip(self))]
+    async fn list_peers(
+        &self,
+        _request: Request<ListPeersRequest>,
+    ) -> Result<Response<ListPeersResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        test_rpc_delay().await;
+        let peers = self.runtime.router().list_peers().await;
+        let peers = peers
+            .into_iter()
+            .map(|peer| PeerDescriptor {
+                peer_id: peer.peer_id.to_string(),
+                connected: peer.connected,
+                local: peer.local,
+            })
+            .collect();
+        Ok(Response::new(ListPeersResponse { peers }))
+    }
+
+    #[instrument(name = "keryx::rpc::discover_skills", skip(self, request))]
+    async fn discover_skills(
+        &self,
+        request: Request<DiscoverSkillsRequest>,
+    ) -> Result<Response<DiscoverSkillsResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        test_rpc_delay().await;
+        let response = self.runtime.discover_skills(request.into_inner()).await?;
+        Ok(Response::new(response))
+    }
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn normalize_lease_duration_ms(duration_ms: i64, config: &KeryxDaemonConfig) -> i64 {
+    if duration_ms <= 0 {
+        config.lease_default_ttl_ms()
+    } else {
+        duration_ms
+    }
+}
+
+fn new_lease_id(task_id: &TaskId, leased_at_ms: i64) -> LeaseId {
+    LeaseId::new(format!("lease-{}-{}", task_id.as_str(), leased_at_ms))
+        .expect("daemon-generated lease id is valid")
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+    }
+}
+
+fn parse_required_task_id(id: Option<&ProtoTaskId>) -> Result<TaskId, Status> {
+    let value = id
+        .and_then(|id| {
+            let trimmed = id.value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .ok_or_else(|| Status::invalid_argument("task_id is required"))?;
+    TaskId::new(value).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn parse_required_agent_id(id: Option<&ProtoAgentId>) -> Result<AgentId, Status> {
+    let value = id
+        .and_then(|id| {
+            let trimmed = id.value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+    AgentId::new(value).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn parse_required_lease_id(id: Option<&ProtoLeaseId>) -> Result<LeaseId, Status> {
+    let value = id
+        .and_then(|id| {
+            let trimmed = id.value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .ok_or_else(|| Status::invalid_argument("lease_id is required"))?;
+    LeaseId::new(value).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn parse_optional_idempotency_key(
+    key: Option<&ProtoIdempotencyKey>,
+) -> Result<Option<IdempotencyKey>, Status> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let trimmed = key.value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    IdempotencyKey::new(trimmed)
+        .map(Some)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn proto_task_id(task_id: &TaskId) -> ProtoTaskId {
+    ProtoTaskId {
+        value: task_id.as_str().to_string(),
+    }
+}
+
+fn proto_agent_id(worker_id: &AgentId) -> ProtoAgentId {
+    ProtoAgentId {
+        value: worker_id.as_str().to_string(),
+    }
+}
+
+fn proto_lease_id(lease_id: &LeaseId) -> ProtoLeaseId {
+    ProtoLeaseId {
+        value: lease_id.as_str().to_string(),
+    }
+}
+
+pub(crate) fn store_error_to_status(error: StoreError) -> Status {
+    let error_detail = error.to_string();
+    let status = match error {
+        StoreError::TaskNotFound(task_id) => {
+            Status::not_found(format!("task not found: {task_id}"))
+        }
+        StoreError::TaskAlreadyExists(task_id) => {
+            Status::already_exists(format!("task already exists: {task_id}"))
+        }
+        StoreError::IdempotencyConflict {
+            key,
+            existing_task_id,
+        } => Status::already_exists(format!(
+            "idempotency key {} already belongs to task {}",
+            key.as_str(),
+            existing_task_id.as_str()
+        )),
+        StoreError::Validation(error) => Status::failed_precondition(error.to_string()),
+        StoreError::CorruptEventStream(task_id) => {
+            Status::data_loss(format!("corrupt event stream for task {task_id}"))
+        }
+        StoreError::LeaseNotFound(task_id) => {
+            Status::not_found(format!("lease not found for task {task_id}"))
+        }
+        StoreError::LeaseConflict { task_id } => {
+            Status::aborted(format!("task {task_id} already has an active lease"))
+        }
+        StoreError::LeaseMismatch { task_id, lease_id } => Status::permission_denied(format!(
+            "lease {} does not own task {}",
+            lease_id.as_str(),
+            task_id.as_str()
+        )),
+        StoreError::LeaseOwnerMismatch { task_id, worker_id } => {
+            Status::permission_denied(format!(
+                "worker {} does not own active lease for task {}",
+                worker_id.as_str(),
+                task_id.as_str()
+            ))
+        }
+        StoreError::LeaseOwnerMissing { task_id, lease_id } => {
+            Status::failed_precondition(format!(
+                "lease {} for task {} is missing a worker owner",
+                lease_id.as_str(),
+                task_id.as_str()
+            ))
+        }
+        StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
+        StoreError::UnsupportedSchema { .. }
+        | StoreError::MigrationFailed(_)
+        | StoreError::UnrepairedCorruption { .. } => Status::internal(error_detail.clone()),
+        StoreError::LockPoisoned | StoreError::Database(_) => {
+            Status::internal(error_detail.clone())
+        }
+    };
+    match status.code() {
+        Code::Internal | Code::DataLoss | Code::Unknown => {
+            error!(
+                error = %error_detail,
+                grpc_code = ?status.code(),
+                "rpc store error"
+            );
+        }
+        _ => {
+            warn!(
+                error = %error_detail,
+                grpc_code = ?status.code(),
+                "rpc store error"
+            );
+        }
+    }
+    status
 }

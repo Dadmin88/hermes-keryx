@@ -1,5 +1,6 @@
 use keryx_daemon::{serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime};
 use keryx_proto::v1::{keryx_daemon_client::KeryxDaemonClient, DoctorRequest, StatusRequest};
+use keryx_store::CURRENT_SCHEMA_VERSION;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -26,8 +27,8 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
         status.db_path,
         data_dir.join("keryx.db").display().to_string()
     );
-    assert_eq!(status.schema_version, 2);
-    assert_eq!(status.supported_schema_version, 2);
+    assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(status.supported_schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(status.recovered_tasks, 0);
     assert_eq!(status.cleaned_terminal_leases, 0);
     assert_eq!(status.corruption_count, 0);
@@ -38,6 +39,15 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
         status.store_path,
         data_dir.join("keryx.db").display().to_string()
     );
+    assert_eq!(status.tasks_submitted, 0);
+    assert_eq!(status.tasks_claimed, 0);
+    assert_eq!(status.tasks_completed, 0);
+    assert_eq!(status.tasks_failed, 0);
+    assert_eq!(status.heartbeats, 0);
+    assert_eq!(status.leases_recovered, 0);
+    assert_eq!(status.recovery_ticks, 0);
+    assert_eq!(status.active_leases, 0);
+    assert_eq!(status.dead_letters, 0);
 
     let doctor = client.doctor(DoctorRequest {}).await.unwrap().into_inner();
     assert_eq!(doctor.status, "pass");
@@ -45,7 +55,9 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
         .messages
         .iter()
         .any(|message| message.contains("schema_version")
-            && message.contains("supported_schema_version=2")));
+            && message.contains(&format!(
+                "supported_schema_version={CURRENT_SCHEMA_VERSION}"
+            ))));
 
     server.abort();
 }

@@ -1,13 +1,20 @@
 use anyhow::Result;
-use keryx_daemon::{serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime};
+use keryx_daemon::{
+    discovery_settings_from_env, serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime,
+};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir(), now_ms())).await?;
+    let mut config = KeryxDaemonConfig::new(data_dir(), now_ms());
+    if let Some(discovery) = discovery_settings_from_env() {
+        config = config.with_discovery(Some(discovery));
+    }
+    let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await?);
     tracing::info!(
         component = "keryxd",
         db_path = %runtime.report().db_path.display(),
@@ -19,6 +26,15 @@ async fn main() -> Result<()> {
     );
 
     if let Some(addr) = daemon_addr()? {
+        let recovery = runtime.spawn_lease_recovery_loop();
+        let health = runtime.spawn_health_loop();
+        tracing::info!(
+            component = "keryxd",
+            lease_recovery_interval_ms = runtime.config().lease_recovery_interval_ms(),
+            health_check_interval_ms = runtime.config().health_check_interval_ms(),
+            "Hermes Keryx background loops started"
+        );
+
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
         tracing::info!(
@@ -26,7 +42,20 @@ async fn main() -> Result<()> {
             listen_addr = %local_addr,
             "Hermes Keryx daemon RPC service listening"
         );
-        serve_daemon_rpc(runtime, TcpListenerStream::new(listener)).await?;
+
+        let rpc_runtime = (*runtime).clone();
+        let serve_handle = tokio::spawn(serve_daemon_rpc(
+            rpc_runtime,
+            TcpListenerStream::new(listener),
+        ));
+
+        tokio::signal::ctrl_c().await?;
+        tracing::info!(component = "keryxd", "shutdown signal received");
+
+        recovery.shutdown().await;
+        health.shutdown().await;
+        Arc::clone(&runtime).shutdown().await?;
+        serve_handle.await??;
     }
 
     Ok(())
