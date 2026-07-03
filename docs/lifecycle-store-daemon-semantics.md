@@ -8,6 +8,30 @@ Phase 1 decision: Keryx store and daemon code must adopt the strict public `kery
 Pending -> Running -> Completed | Failed
 ```
 
+Phase 6–7 adds worker RPCs and failure retries without new persisted lifecycle states. Retries return to `Pending`; exhausted retries dead-letter into `Failed` with `dead_lettered` metadata (see [worker-loop.md](worker-loop.md)).
+
+```text
+                         claim (ClaimTask / lease_task)
+              ┌──────────────────────────────────────────┐
+              ▼                                          │
+         ┌─────────┐   complete (CompleteTask)      ┌───────────┐
+         │ Pending │───────────────────────────────►│ Completed │
+         └────┬────┘                                └───────────┘
+              │                                          ▲
+              │ claim                                    │ complete
+              ▼                                          │
+         ┌─────────┐   fail + RetryPolicy          ┌────┴──────┐
+         │ Running │── should_retry ──────────────►│  Pending  │ (retry_count++)
+         └────┬────┘                                └───────────┘
+              │ fail (no retry / dead-letter)
+              ▼
+         ┌─────────┐
+         │ Failed  │  (dead_lettered + reason when policy exhausts retries)
+         └─────────┘
+
+Stale lease on Running ── recover_stale_leases ──► Pending (RecoveryAction)
+```
+
 The store may keep operational metadata, including leases, retry counters, worker identity, timestamps, and recovery notes, but that metadata must not introduce extra lifecycle states. In particular, `leased`, `queued`, `awaiting_input`, `timed_out`, `canceled`, `rejected`, and `dead_lettered` are not canonical persisted `TaskStatus` values after this phase. Legacy values may be read through a compatibility adapter, but new writes must use only `pending`, `running`, `completed`, or `failed`.
 
 Decisions:
@@ -33,6 +57,9 @@ Canonical task snapshot fields for the local store:
 | `idempotency_key` | no | Dispatch retry identity | Unique when present. |
 | `created_at` | yes | Snapshot creation time | Store-owned timestamp. |
 | `updated_at` | yes | Last snapshot mutation time | Must update on lifecycle transition and relevant metadata mutation. |
+| `retry_count` | yes (Phase 7) | Failure-driven requeue attempts | Incremented on retry requeue and dead-letter; surfaced on `ClaimTask` / `FailTask` RPC responses. |
+| `dead_lettered` | yes (Phase 7) | Task exhausted retry policy | Lifecycle status remains `failed`; not a fifth `TaskStatus` variant. |
+| `dead_letter_reason` | no | Human-readable dead-letter cause | Set when `fail_task` dead-letters. |
 
 Canonical lifecycle states:
 
@@ -145,9 +172,10 @@ Operation semantics:
 
 - Requires task snapshot `Running`.
 - Requires matching active lease unless an explicit recovery failure path is introduced.
-- Validates `Running -> Failed` through `keryx-core`.
-- Updates snapshot to `Failed`, deactivates active lease, persists failure metadata, and appends `TaskFailed` in one transaction.
-- Cancellation, timeout, rejection, and dead-letter are represented as `Failed` plus a typed reason for this strict phase.
+- Accepts `RetryPolicy` (Phase 7). When `max_retries > 0` and `should_retry_after_failure` holds, deactivates lease, increments `retry_count`, sets snapshot to `Pending`, and appends `RecoveryAction` (failure-driven requeue, not a core `Running -> Pending` transition).
+- When retries are exhausted, validates `Running -> Failed`, sets `dead_lettered` and `dead_letter_reason`, deactivates lease, and appends `TaskDeadLettered`.
+- When `max_retries == 0`, validates `Running -> Failed` immediately without dead-letter metadata (terminal fail).
+- Cancellation, timeout, rejection, and dead-letter at the API boundary are still represented as `Failed` plus typed reason metadata for this strict phase when those paths are used.
 
 ### `recover_stale_leases`
 
@@ -207,9 +235,9 @@ Cleanup should handle inconsistent metadata safely:
 Recovery is intentionally a store/daemon operational action rather than a normal core lifecycle transition.
 
 - Recoverable non-terminal stale work returns to `Pending` so another worker can lease it.
-- Recovery must append durable `RecoveryAction` rows for per-task audit. In the current typed API, `TaskEventRecord` carries task id, sequence, event type, `from_status`, and `to_status`; lease id, exact reason (`lease_expired`), and richer payload fields should be added to event payload metadata or a companion recovery table in a later phase rather than overloading the Phase 4 report.
+- Recovery must append durable `RecoveryAction` rows for per-task audit (stale lease requeue and failure-driven retry requeue). `retry_count`, `dead_lettered`, and `dead_letter_reason` live on the task snapshot (schema migration v3).
 - `RecoveryReport` is the startup/status summary surface: `recovered_tasks` preserves the previous `Vec<TaskRecord>` caller data, `cleaned_terminal_leases` counts stale terminal lease metadata removed without status changes, and `corrupted_tasks` lists event-log/snapshot mismatches in deterministic `task_id` order.
-- Recovery should increment retry/attempt metadata once that metadata exists. Until then, repeated lease expiry may cause infinite retries; record this as a known limitation and expose counts in logs/doctor.
+- Repeated lease expiry without worker failure still requeues via `RecoveryAction`; failure-driven retries increment `retry_count` and are bounded by daemon `RetryPolicy`.
 
 ## 6. Daemon startup recovery behavior
 
@@ -242,6 +270,18 @@ Status/doctor requirements:
 - Startup recovery must complete before `daemon_ready = true`.
 
 ## 7. Runtime worker/lease recovery behavior
+
+Phase 6 exposes the worker loop as gRPC on `KeryxDaemon` (`proto/hermes/keryx/v1/daemon.proto`). Each RPC maps to store intent-specific APIs:
+
+| RPC | Store operation | Notes |
+| --- | --- | --- |
+| `SubmitTask` | `accept_task` | Creates `pending` task from envelope `task_id` / idempotency |
+| `ClaimTask` | `lease_task` | `Pending -> Running`; returns `lease_id`, TTL, `retry_count`, `dead_lettered` |
+| `Heartbeat` | `renew_lease` | Extends lease; default TTL 300s when `lease_duration_ms` is 0 |
+| `CompleteTask` | `complete_task` | Requires lease + worker match |
+| `FailTask` | `fail_task` + daemon `RetryPolicy` | Requeue, dead-letter, or terminal fail; response includes `retry_count`, `dead_lettered` |
+
+Operator CLI: `keryx task submit|claim|heartbeat|complete|fail` requires `HERMES_KERYX_DAEMON_ENDPOINT`. See [worker-loop.md](worker-loop.md).
 
 Runtime behavior after startup:
 
@@ -295,6 +335,14 @@ Read compatibility:
 | `leased`, `awaiting_input`, `running` | `Running` | Lease/awaiting details become operational metadata. |
 | `completed` | `Completed` | Terminal success. |
 | `failed`, `canceled`, `timed_out`, `rejected`, `dead_lettered` | `Failed` | Preserve reason as failure metadata when possible. |
+
+SQLite snapshot reads use `keryx-store` `str_to_status` for the table above. Unknown status strings fail load with a typed database error.
+
+Legacy **event** normalization (`keryx-core::legacy`):
+
+- Lifecycle collapse: e.g. `TaskLeased` / `TaskStarted` from `Pending` → canonical `TaskStarted` to `Running`; `TaskCanceled`, `TaskTimedOut`, `TaskDeadLettered` from `Running` → `TaskFailed` to `Failed`.
+- Operational events (`TaskQueued`, approval events, `TaskAwaitingInput`) append without changing canonical status; validated via `is_valid_operational_legacy`.
+- Store `accept_legacy_event` / replay uses `normalize_legacy_transition` and rejects unknown `(status, event)` pairs.
 
 Write policy:
 
@@ -429,7 +477,7 @@ Acceptance criteria:
 - Startup failure paths report not-ready/typed errors and do not accept work.
 - CLI status/doctor includes recovered/cleaned/corruption counts without reading payloads.
 
-### Phase 6: Runtime worker loop lease behavior
+### Phase 6: Runtime worker loop lease behavior — **implemented**
 
 Goal: daemon runtime uses lease APIs correctly during work execution.
 
@@ -447,40 +495,49 @@ Acceptance criteria:
 - Expired lease is recovered and can be re-leased by another worker.
 - Periodic recovery and startup recovery produce the same durable semantics.
 
-### Phase 7: Legacy migration compatibility
+**Current:** gRPC `SubmitTask`, `ClaimTask`, `Heartbeat`, `CompleteTask`, `FailTask`; background lease recovery loop; `keryx task` CLI subcommands.
 
-Goal: normalize or safely read pre-strict lifecycle stores.
+### Phase 7: Retry, dead-letter, and legacy migration compatibility — **implemented**
+
+Goal: failure retries, dead-letter metadata, and safe read/replay of legacy stores.
 
 Tasks:
 
-- Keep read adapter for legacy status strings.
-- Add migration test fixtures for legacy `queued`, `leased`, `timed_out`, `canceled`, and `dead_lettered` rows.
-- Decide whether event rows are normalized or preserved.
-- Update stale docs that conflict with strict `Pending`/`Running` language.
+- Keep read adapter for legacy status strings and legacy event normalization in `keryx-core::legacy`.
+- Persist `retry_count`, `dead_lettered`, `dead_letter_reason` (schema v3).
+- Apply `RetryPolicy` on `fail_task`; expose counts on claim/fail RPC responses.
+- Run migration ordering so retry columns exist before legacy lease recovery reads them.
 
 Acceptance criteria:
 
 - Legacy snapshots map to canonical states according to the table in this document.
 - New writes after migration use only canonical status strings.
 - Unknown legacy values fail with typed compatibility error.
-- Docs no longer imply `Queued` or `Leased` are canonical core/store statuses.
+- Docs describe retry loop and RPC worker surface ([worker-loop.md](worker-loop.md)).
 
-### Phase 8: Observability and operational hardening
+**Prior Phase 7 doc slice (legacy-only) merged above with retry/dead-letter deliverables.**
+
+### Phase 8: Observability and operational hardening — **implemented**
 
 Goal: make lifecycle/recovery behavior diagnosable in production.
 
-Tasks:
+Deliverables:
 
-- Add structured tracing fields for store lifecycle operations.
-- Add metrics counters/gauges for transition, lease, recovery, startup, and corruption events.
-- Add tests or golden output for CLI status/doctor observability fields.
-- Document operator playbooks for corrupt event streams and stuck leases.
+- Structured tracing: `keryx::rpc::*` RPC spans, store `#[instrument]` on lifecycle APIs, `keryx::daemon::health_tick` / `lease_recovery_tick`, structured store error logs on RPC.
+- In-process metrics (`keryx-observe`): task counters, `active_leases` gauge, recovery/dead-letter counters; exposed on daemon `Status` RPC.
+- Health probes: gRPC `Liveness`, `Readiness` (dynamic store probes), existing `Status` / `Doctor`.
+- Graceful shutdown: in-flight RPC drain, gRPC `serve_with_incoming_shutdown`, store `close`.
+- Operator docs: [observability.md](observability.md), [operations.md](operations.md).
 
 Acceptance criteria:
 
 - Logs include task/lease ids and enum reasons but not payloads/secrets.
-- Metrics distinguish validation errors, conflicts, and database failures.
+- Metrics distinguish validation errors, conflicts, and database failures (via gRPC codes + structured error logs; counters for successful transitions).
 - Doctor output gives actionable messages for stale lease cleanup and event-log corruption.
+
+#### Observability (operator reference)
+
+For tracing configuration, span names, metrics field reference, and health RPC semantics, see [observability.md](observability.md). For startup/shutdown order, health procedures, troubleshooting, and environment variables, see [operations.md](operations.md).
 
 ## 13. Open questions / explicit non-goals
 
