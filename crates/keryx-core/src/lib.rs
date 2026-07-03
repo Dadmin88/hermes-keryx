@@ -4,6 +4,7 @@
 //! networking, persistence, daemon, or filesystem concerns.
 
 pub mod agent_card;
+pub mod artifact;
 pub mod error;
 pub mod legacy;
 pub mod peer_id;
@@ -12,6 +13,10 @@ pub mod task;
 pub mod task_handle;
 
 pub use agent_card::{AgentCard, AgentId, CapabilityId, Skill};
+pub use artifact::{
+    should_inline, validate_artifact_size, ArtifactId, ArtifactMeta, Digest, MediaType,
+    MAX_BLOB_BYTES, MAX_INLINE_ARTIFACT_BYTES,
+};
 pub use error::{CoreResult, KeryxCoreError, ValidationError};
 pub use legacy::{
     is_valid_operational_legacy, normalize_legacy_transition, CanonicalTransition, LegacyEventType,

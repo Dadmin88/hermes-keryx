@@ -37,6 +37,12 @@ pub enum ValidationError {
     MissingIdValue { kind: &'static str },
     #[error("invalid {kind} value: {value:?}")]
     InvalidIdValue { kind: &'static str, value: String },
+    #[error("artifact too large: {byte_len} bytes exceeds limit of {limit_bytes}")]
+    ArtifactTooLarge { byte_len: u64, limit_bytes: u64 },
+    #[error("invalid digest: {0}")]
+    InvalidDigest(String),
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(String),
     #[error("invalid task state transition: {from:?} -> {to:?}")]
     InvalidTaskTransition { from: TaskStatus, to: TaskStatus },
     #[error("terminal task state cannot transition: {from:?} -> {to:?}")]

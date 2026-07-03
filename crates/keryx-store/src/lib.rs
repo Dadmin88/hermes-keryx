@@ -1,10 +1,17 @@
 //! Storage traits plus in-memory and SQLite implementations for Hermes Keryx.
 
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Mutex};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Mutex,
+};
 
 use keryx_core::{
-    is_valid_operational_legacy, normalize_legacy_transition, validate_transition, AgentId,
-    CanonicalTransition, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, LegacyEventType,
+    is_valid_operational_legacy, normalize_legacy_transition, should_inline,
+    validate_artifact_size, validate_transition, AgentId, ArtifactId, CanonicalTransition, Digest,
+    IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, LegacyEventType, MediaType,
     RetryPolicy, TaskId, TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
@@ -17,6 +24,12 @@ pub enum StoreError {
     TaskNotFound(TaskId),
     #[error("task already exists: {0}")]
     TaskAlreadyExists(TaskId),
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(ArtifactId),
+    #[error("artifact too large: {byte_len} bytes exceeds {limit_bytes}")]
+    ArtifactTooLarge { byte_len: u64, limit_bytes: u64 },
+    #[error("digest mismatch: expected {expected}, computed {actual}")]
+    DigestMismatch { expected: String, actual: String },
     #[error("idempotency key {key} already belongs to task {existing_task_id}")]
     IdempotencyConflict {
         key: IdempotencyKey,
@@ -56,6 +69,8 @@ pub enum StoreError {
     MigrationFailed(String),
     #[error("startup recovery found unrepaired corruption in tasks: {corrupted_tasks:?}")]
     UnrepairedCorruption { corrupted_tasks: Vec<TaskId> },
+    #[error("blob directory error: {0}")]
+    BlobDir(String),
     #[error("database error: {0}")]
     Database(String),
 }
@@ -86,7 +101,7 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -178,6 +193,17 @@ pub struct LeaseRecord {
     pub expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub artifact_id: ArtifactId,
+    pub task_id: TaskId,
+    pub digest: Digest,
+    pub media_type: MediaType,
+    pub byte_len: u64,
+    pub inline: bool,
+    pub created_at: String,
+}
+
 impl LeaseRecord {
     #[must_use]
     pub fn new(
@@ -243,6 +269,9 @@ struct InMemoryState {
     events: HashMap<TaskId, Vec<TaskEventRecord>>,
     idempotency: HashMap<IdempotencyKey, TaskId>,
     leases: HashMap<TaskId, LeaseRecord>,
+    artifacts: HashMap<ArtifactId, ArtifactRecord>,
+    inline_artifacts: HashMap<ArtifactId, Vec<u8>>,
+    blobs: HashMap<Digest, (Vec<u8>, u32)>,
 }
 
 fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
@@ -606,6 +635,112 @@ impl InMemoryStore {
         Ok(self.lock()?.leases.get(task_id).cloned())
     }
 
+    pub async fn put_artifact(
+        &self,
+        meta: &keryx_core::ArtifactMeta,
+        bytes: &[u8],
+        blob_dir: &Path,
+    ) -> StoreResult<ArtifactRecord> {
+        validate_artifact_size(bytes.len() as u64).map_err(map_artifact_validation_error)?;
+        let computed = Digest::compute(bytes);
+        if computed != meta.digest {
+            return Err(StoreError::DigestMismatch {
+                expected: meta.digest.as_str().to_owned(),
+                actual: computed.as_str().to_owned(),
+            });
+        }
+
+        let mut state = self.lock()?;
+        if !state.tasks.contains_key(&meta.task_id) {
+            return Err(StoreError::TaskNotFound(meta.task_id.clone()));
+        }
+
+        let record = artifact_record_from_meta(meta, computed, bytes.len() as u64);
+        if let Some(existing) = state.artifacts.get(&record.artifact_id).cloned() {
+            drop_in_memory_artifact_association(&mut state, &existing, blob_dir)?;
+        }
+
+        if record.inline {
+            state
+                .inline_artifacts
+                .insert(record.artifact_id.clone(), bytes.to_vec());
+        } else {
+            ensure_blob_dir(blob_dir)?;
+            std::fs::write(blob_path(blob_dir, &record.digest), bytes)?;
+            let entry = state
+                .blobs
+                .entry(record.digest.clone())
+                .or_insert_with(|| (bytes.to_vec(), 0));
+            entry.0 = bytes.to_vec();
+            entry.1 = entry.1.saturating_add(1);
+        }
+
+        state
+            .artifacts
+            .insert(record.artifact_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        _blob_dir: &Path,
+    ) -> StoreResult<(ArtifactRecord, Vec<u8>)> {
+        let state = self.lock()?;
+        let record = state
+            .artifacts
+            .get(artifact_id)
+            .cloned()
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        let bytes = if record.inline {
+            state
+                .inline_artifacts
+                .get(artifact_id)
+                .cloned()
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        } else {
+            state
+                .blobs
+                .get(&record.digest)
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        };
+        Ok((record, bytes))
+    }
+
+    pub async fn list_artifacts_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Vec<ArtifactRecord>> {
+        let state = self.lock()?;
+        let mut records = state
+            .artifacts
+            .values()
+            .filter(|record| &record.task_id == task_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.artifact_id.as_str().cmp(right.artifact_id.as_str()));
+        Ok(records)
+    }
+
+    pub async fn delete_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<()> {
+        let mut state = self.lock()?;
+        let record = state
+            .artifacts
+            .remove(artifact_id)
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        if record.inline {
+            state.inline_artifacts.remove(artifact_id);
+        } else {
+            decrement_in_memory_blob_ref(&mut state, &record.digest, blob_dir)?;
+        }
+        Ok(())
+    }
+
     pub fn recover_stale_leases(
         &self,
         now_ms: i64,
@@ -855,6 +990,20 @@ impl SqliteStore {
         .execute(&mut *tx)
         .await
         .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let artifact_storage_exists =
+            sqlx::query("SELECT 1 FROM schema_migrations WHERE version = 4 LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !artifact_storage_exists {
+            for statement in MIGRATION_004 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
         let legacy_unowned_rows = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
         )
@@ -888,6 +1037,139 @@ impl SqliteStore {
     /// Close the underlying connection pool. Safe to call on any clone of the store.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    pub async fn put_artifact(
+        &self,
+        meta: &keryx_core::ArtifactMeta,
+        bytes: &[u8],
+        blob_dir: &Path,
+    ) -> StoreResult<ArtifactRecord> {
+        validate_artifact_size(bytes.len() as u64).map_err(map_artifact_validation_error)?;
+        let computed = Digest::compute(bytes);
+        if computed != meta.digest {
+            return Err(StoreError::DigestMismatch {
+                expected: meta.digest.as_str().to_owned(),
+                actual: computed.as_str().to_owned(),
+            });
+        }
+
+        let record = artifact_record_from_meta(meta, computed, bytes.len() as u64);
+        let mut tx = self.pool.begin().await?;
+        fetch_task_with_executor(&mut tx, &record.task_id).await?;
+
+        let existing = fetch_artifact_optional_with_executor(&mut tx, &record.artifact_id).await?;
+        let prepared_blob = if should_prepare_blob_write(existing.as_ref(), &record) {
+            Some(prepare_blob_write_with_executor(&mut tx, &record.digest, bytes, blob_dir).await?)
+        } else {
+            None
+        };
+
+        let tx_result = async {
+            let mut cleanup_digests = Vec::new();
+            if let Some(existing) = existing.as_ref() {
+                if should_drop_blob_association(existing, &record)
+                    && decrement_blob_ref_with_executor(&mut tx, &existing.digest).await?
+                {
+                    cleanup_digests.push(existing.digest.clone());
+                }
+            }
+            if should_write_blob_association(existing.as_ref(), &record) {
+                increment_blob_ref_with_executor(&mut tx, &record.digest, bytes.len() as u64).await?;
+            }
+
+            sqlx::query(
+                "INSERT INTO artifacts (artifact_id, task_id, digest, media_type, byte_len, inline, inline_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(artifact_id) DO UPDATE SET task_id = excluded.task_id, digest = excluded.digest, media_type = excluded.media_type, byte_len = excluded.byte_len, inline = excluded.inline, inline_blob = excluded.inline_blob, created_at = excluded.created_at",
+            )
+            .bind(record.artifact_id.as_str())
+            .bind(record.task_id.as_str())
+            .bind(record.digest.as_str())
+            .bind(record.media_type.as_str())
+            .bind(record.byte_len as i64)
+            .bind(i64::from(record.inline))
+            .bind(record.inline.then_some(bytes))
+            .bind(&record.created_at)
+            .execute(&mut *tx)
+            .await?;
+
+            StoreResult::Ok(cleanup_digests)
+        }
+        .await;
+
+        let cleanup_digests = match tx_result {
+            Ok(cleanup_digests) => cleanup_digests,
+            Err(error) => {
+                tx.rollback().await.ok();
+                rollback_prepared_blob_write(prepared_blob.as_ref())?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = tx.commit().await {
+            rollback_prepared_blob_write(prepared_blob.as_ref())?;
+            return Err(error.into());
+        }
+        finalize_blob_cleanup(&self.pool, &cleanup_digests, blob_dir).await?;
+        Ok(record)
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<(ArtifactRecord, Vec<u8>)> {
+        let record = fetch_artifact_optional_from_pool(&self.pool, artifact_id)
+            .await?
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+
+        let bytes = if record.inline {
+            let row = sqlx::query("SELECT inline_blob FROM artifacts WHERE artifact_id = ?")
+                .bind(artifact_id.as_str())
+                .fetch_one(&self.pool)
+                .await?;
+            row.try_get::<Option<Vec<u8>>, _>("inline_blob")?
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        } else {
+            std::fs::read(blob_path(blob_dir, &record.digest))?
+        };
+
+        Ok((record, bytes))
+    }
+
+    pub async fn list_artifacts_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Vec<ArtifactRecord>> {
+        let rows = sqlx::query(
+            "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE task_id = ? ORDER BY artifact_id ASC",
+        )
+        .bind(task_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_artifact).collect()
+    }
+
+    pub async fn delete_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let record = fetch_artifact_optional_with_executor(&mut tx, artifact_id)
+            .await?
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        sqlx::query("DELETE FROM artifacts WHERE artifact_id = ?")
+            .bind(artifact_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let mut cleanup_digests = Vec::new();
+        if !record.inline && decrement_blob_ref_with_executor(&mut tx, &record.digest).await? {
+            cleanup_digests.push(record.digest.clone());
+        }
+        tx.commit().await?;
+        finalize_blob_cleanup(&self.pool, &cleanup_digests, blob_dir).await?;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(task_id = %task.task_id().as_str()))]
@@ -1945,6 +2227,246 @@ fn row_to_event(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskEventRecord> {
     })
 }
 
+fn row_to_artifact(row: sqlx::sqlite::SqliteRow) -> StoreResult<ArtifactRecord> {
+    Ok(ArtifactRecord {
+        artifact_id: ArtifactId::new(row.get::<String, _>("artifact_id"))?,
+        task_id: TaskId::new(row.get::<String, _>("task_id"))?,
+        digest: Digest::new(row.get::<String, _>("digest"))?,
+        media_type: MediaType::new(row.get::<String, _>("media_type")),
+        byte_len: row.get::<i64, _>("byte_len").max(0) as u64,
+        inline: row.get::<i64, _>("inline") != 0,
+        created_at: row.get::<String, _>("created_at"),
+    })
+}
+
+fn artifact_record_from_meta(
+    meta: &keryx_core::ArtifactMeta,
+    digest: Digest,
+    byte_len: u64,
+) -> ArtifactRecord {
+    ArtifactRecord {
+        artifact_id: meta.artifact_id.clone(),
+        task_id: meta.task_id.clone(),
+        digest,
+        media_type: meta.media_type.clone(),
+        byte_len,
+        inline: should_inline(byte_len),
+        created_at: meta.created_at.clone(),
+    }
+}
+
+fn map_artifact_validation_error(error: ValidationError) -> StoreError {
+    match error {
+        ValidationError::ArtifactTooLarge {
+            byte_len,
+            limit_bytes,
+        } => StoreError::ArtifactTooLarge {
+            byte_len,
+            limit_bytes,
+        },
+        other => StoreError::Validation(other),
+    }
+}
+
+fn blob_path(blob_dir: &Path, digest: &Digest) -> PathBuf {
+    blob_dir.join(digest.as_str())
+}
+
+fn ensure_blob_dir(blob_dir: &Path) -> StoreResult<()> {
+    std::fs::create_dir_all(blob_dir)
+        .map_err(|error| StoreError::BlobDir(format!("{}: {error}", blob_dir.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(blob_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| StoreError::BlobDir(format!("{}: {error}", blob_dir.display())))?;
+    }
+    Ok(())
+}
+
+fn remove_blob_file_if_present(path: &Path) -> StoreResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Database(error.to_string())),
+    }
+}
+
+fn drop_in_memory_artifact_association(
+    state: &mut InMemoryState,
+    existing: &ArtifactRecord,
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    if existing.inline {
+        state.inline_artifacts.remove(&existing.artifact_id);
+    } else {
+        decrement_in_memory_blob_ref(state, &existing.digest, blob_dir)?;
+    }
+    Ok(())
+}
+
+fn decrement_in_memory_blob_ref(
+    state: &mut InMemoryState,
+    digest: &Digest,
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    let mut remove_file = false;
+    match state.blobs.get_mut(digest) {
+        Some((_, ref_count)) if *ref_count > 1 => *ref_count -= 1,
+        Some(_) => {
+            state.blobs.remove(digest);
+            remove_file = true;
+        }
+        None => {}
+    }
+    if remove_file {
+        remove_blob_file_if_present(&blob_path(blob_dir, digest))?;
+    }
+    Ok(())
+}
+
+async fn fetch_artifact_optional_from_pool(
+    pool: &SqlitePool,
+    artifact_id: &ArtifactId,
+) -> StoreResult<Option<ArtifactRecord>> {
+    let row = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE artifact_id = ?",
+    )
+    .bind(artifact_id.as_str())
+    .fetch_optional(pool)
+    .await?;
+    row.map(row_to_artifact).transpose()
+}
+
+async fn fetch_artifact_optional_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact_id: &ArtifactId,
+) -> StoreResult<Option<ArtifactRecord>> {
+    let row = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE artifact_id = ?",
+    )
+    .bind(artifact_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(row_to_artifact).transpose()
+}
+
+#[derive(Debug)]
+struct PreparedBlobWrite {
+    path: PathBuf,
+    remove_on_rollback: bool,
+}
+
+fn should_drop_blob_association(existing: &ArtifactRecord, replacement: &ArtifactRecord) -> bool {
+    !existing.inline && (replacement.inline || existing.digest != replacement.digest)
+}
+
+fn should_write_blob_association(
+    existing: Option<&ArtifactRecord>,
+    replacement: &ArtifactRecord,
+) -> bool {
+    !replacement.inline
+        && existing
+            .map(|existing| existing.inline || existing.digest != replacement.digest)
+            .unwrap_or(true)
+}
+
+fn should_prepare_blob_write(
+    existing: Option<&ArtifactRecord>,
+    replacement: &ArtifactRecord,
+) -> bool {
+    should_write_blob_association(existing, replacement)
+}
+
+async fn prepare_blob_write_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+    bytes: &[u8],
+    blob_dir: &Path,
+) -> StoreResult<PreparedBlobWrite> {
+    let blob_previously_tracked = sqlx::query("SELECT 1 FROM blobs WHERE digest = ? LIMIT 1")
+        .bind(digest.as_str())
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some();
+    let path = blob_path(blob_dir, digest);
+    ensure_blob_dir(blob_dir)?;
+    if !blob_previously_tracked || !path.exists() {
+        std::fs::write(&path, bytes)?;
+    }
+    Ok(PreparedBlobWrite {
+        path,
+        remove_on_rollback: !blob_previously_tracked,
+    })
+}
+
+fn rollback_prepared_blob_write(prepared_blob: Option<&PreparedBlobWrite>) -> StoreResult<()> {
+    if let Some(prepared_blob) =
+        prepared_blob.filter(|prepared_blob| prepared_blob.remove_on_rollback)
+    {
+        remove_blob_file_if_present(&prepared_blob.path)?;
+    }
+    Ok(())
+}
+
+async fn increment_blob_ref_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+    byte_len: u64,
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO blobs (digest, ref_count, byte_len) VALUES (?, 1, ?) ON CONFLICT(digest) DO UPDATE SET ref_count = ref_count + 1, byte_len = excluded.byte_len",
+    )
+    .bind(digest.as_str())
+    .bind(byte_len as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn decrement_blob_ref_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+) -> StoreResult<bool> {
+    let row = sqlx::query("SELECT ref_count FROM blobs WHERE digest = ?")
+        .bind(digest.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let ref_count = row.get::<i64, _>("ref_count");
+    if ref_count > 1 {
+        sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE digest = ?")
+            .bind(digest.as_str())
+            .execute(&mut **tx)
+            .await?;
+        return Ok(false);
+    }
+
+    sqlx::query("UPDATE blobs SET ref_count = 0 WHERE digest = ?")
+        .bind(digest.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(true)
+}
+
+async fn finalize_blob_cleanup(
+    pool: &SqlitePool,
+    cleanup_digests: &[Digest],
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    for digest in cleanup_digests {
+        remove_blob_file_if_present(&blob_path(blob_dir, digest))?;
+        sqlx::query("DELETE FROM blobs WHERE digest = ? AND ref_count = 0")
+            .bind(digest.as_str())
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 const MIGRATION_001: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY)",
@@ -1968,6 +2490,16 @@ const MIGRATION_003: &[&str] = &[
     "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN dead_lettered INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN dead_letter_reason TEXT",
+];
+
+const MIGRATION_004: &[&str] = &[
+    "DROP TABLE IF EXISTS artifacts",
+    "DROP TABLE IF EXISTS blobs",
+    "CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, digest TEXT NOT NULL, media_type TEXT NOT NULL DEFAULT 'application/octet-stream', byte_len INTEGER NOT NULL, inline INTEGER NOT NULL DEFAULT 0, inline_blob BLOB, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (task_id) REFERENCES tasks(task_id))",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_digest ON artifacts(digest)",
+    "CREATE TABLE blobs (digest TEXT PRIMARY KEY, ref_count INTEGER NOT NULL DEFAULT 0, byte_len INTEGER NOT NULL)",
+    "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (4, 'artifact_storage')",
 ];
 
 const fn status_to_str(status: TaskStatus) -> &'static str {
@@ -2081,6 +2613,9 @@ mod tests {
                 task.task_id().clone(),
                 lease(task.task_id(), "terminal-lease", "terminal-worker", 500),
             )]),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -2137,6 +2672,9 @@ mod tests {
                 events: HashMap::new(),
                 idempotency: HashMap::new(),
                 leases: HashMap::new(),
+                artifacts: HashMap::new(),
+                inline_artifacts: HashMap::new(),
+                blobs: HashMap::new(),
             }),
         };
 
@@ -2164,6 +2702,9 @@ mod tests {
             events: HashMap::new(),
             idempotency: HashMap::new(),
             leases: HashMap::new(),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -2199,6 +2740,9 @@ mod tests {
             events: HashMap::new(),
             idempotency: HashMap::new(),
             leases: HashMap::new(),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,

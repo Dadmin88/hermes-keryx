@@ -1161,6 +1161,9 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         StoreError::TaskAlreadyExists(task_id) => {
             Status::already_exists(format!("task already exists: {task_id}"))
         }
+        StoreError::ArtifactNotFound(artifact_id) => {
+            Status::not_found(format!("artifact not found: {artifact_id}"))
+        }
         StoreError::IdempotencyConflict {
             key,
             existing_task_id,
@@ -1198,9 +1201,12 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
                 task_id.as_str()
             ))
         }
-        StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
+        StoreError::ArtifactTooLarge { .. }
+        | StoreError::DigestMismatch { .. }
+        | StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
         StoreError::UnsupportedSchema { .. }
         | StoreError::MigrationFailed(_)
+        | StoreError::BlobDir(_)
         | StoreError::UnrepairedCorruption { .. } => Status::internal(error_detail.clone()),
         StoreError::LockPoisoned | StoreError::Database(_) => {
             Status::internal(error_detail.clone())

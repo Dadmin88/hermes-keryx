@@ -129,7 +129,7 @@ async fn seed_schema_v1_database_with_active_lease(
 async fn sqlite_migration_from_empty_database_creates_schema_version() {
     let store = temp_store().await;
 
-    assert_eq!(store.schema_version().await.unwrap(), 3);
+    assert_eq!(store.schema_version().await.unwrap(), 4);
 }
 
 #[tokio::test]
@@ -389,7 +389,7 @@ async fn sqlite_migration_requeues_legacy_active_leases_without_fabricating_owne
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
 
-    assert_eq!(store.schema_version().await.unwrap(), 3);
+    assert_eq!(store.schema_version().await.unwrap(), 4);
     assert_eq!(
         store.get_task(&task_id).await.unwrap().status,
         TaskStatus::Pending

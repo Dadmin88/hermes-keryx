@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
 
 [dev-dependencies]
