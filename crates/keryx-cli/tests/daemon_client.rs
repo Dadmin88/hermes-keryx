@@ -35,7 +35,7 @@ async fn cli_status_uses_daemon_endpoint_when_configured() {
     assert!(stdout.contains("source: daemon http://"));
     assert!(stdout.contains("data_dir:"));
     assert!(stdout.contains("db_path:"));
-    assert!(stdout.contains("store: ready sqlite schema_version=2 supported_schema_version=2"));
+    assert!(stdout.contains("store: ready sqlite schema_version=3 supported_schema_version=3"));
     assert!(stdout.contains(
         "startup_recovery: recovered_tasks=0 cleaned_terminal_leases=0 corruption_count=0 duration_ms="
     ));

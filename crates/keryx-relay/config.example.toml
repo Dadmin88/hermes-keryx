@@ -1,0 +1,22 @@
+# Example Hermes Keryx relay configuration (TOML).
+# Point HERMES_KERYX_RELAY_CONFIG at this file to enable security allowlisting.
+
+[relay]
+listen_addresses = ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/udp/4001/quic-v1"]
+bootstrap_peers = []
+enable_mdns = false
+max_connections = 256
+max_reservations = 128
+max_reservations_per_peer = 4
+connection_timeout_ms = 30000
+use_ipv6 = false
+
+[security]
+# Path to a TOML file listing allowed peers (see allowlist.example.toml).
+allowlist_path = "allowlist.toml"
+# When the allowlist file has no entries: "deny" (default) or "allow".
+empty_allowlist_policy = "deny"
+
+[registry]
+ttl_seconds = 300
+max_skills_per_peer = 64

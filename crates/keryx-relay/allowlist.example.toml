@@ -1,0 +1,10 @@
+# Peers authorized to connect to the Keryx relay.
+# Referenced from config.example.toml via security.allowlist_path.
+
+[[allowed]]
+# libp2p PeerId string (base58)
+peer_id = "12D3KooWExamplePeerIdReplaceMe"
+
+# Alternatively, derive PeerId from an Ed25519 public key (32 bytes, standard base64):
+# [[allowed]]
+# ed25519_public_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="

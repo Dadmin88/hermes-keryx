@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/hermes/keryx/v1/policy.proto",
         "../../proto/hermes/keryx/v1/daemon.proto",
         "../../proto/hermes/keryx/v1/relay.proto",
+        "../../proto/hermes/keryx/v1/registry.proto",
     ];
 
     println!("cargo:rerun-if-changed={proto_root}");

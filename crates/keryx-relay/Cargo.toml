@@ -10,9 +10,31 @@ repository.workspace = true
 name = "keryx-relay"
 path = "src/main.rs"
 
+[[bin]]
+name = "keryx-node"
+path = "src/node_main.rs"
+
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
+futures = "0.3"
 keryx-core = { path = "../keryx-core" }
-tokio.workspace = true
+keryx-observe = { path = "../keryx-observe" }
+keryx-proto = { path = "../keryx-proto" }
+libp2p = { version = "0.54", features = ["tcp", "quic", "noise", "yamux", "relay", "autonat", "identify", "mdns", "ping", "tokio", "serde", "dns", "macros"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+toml = "0.8"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-timer = "3"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "process", "net", "io-util"] }

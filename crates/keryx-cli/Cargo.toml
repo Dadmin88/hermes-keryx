@@ -16,9 +16,12 @@ clap.workspace = true
 keryx-core = { path = "../keryx-core" }
 keryx-daemon = { path = "../keryx-daemon" }
 keryx-proto = { path = "../keryx-proto" }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "process"] }
 tonic = "0.14"
 
 [dev-dependencies]
+keryx-relay = { path = "../keryx-relay" }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
