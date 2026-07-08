@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use keryx_core::PeerId;
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::{
     AckTaskRequest, NodeFrame, NodeId, PublishTaskRequest, RegisterNodeRequest, TaskEnvelope,
     TaskId, TaskStatus,
 };
-use keryx_core::PeerId;
 use keryx_relay::health_server::{serve_grpc_health, NODE_ID_METADATA_KEY};
 use keryx_relay::registry::SkillRegistry;
 use keryx_relay::runtime::RelayRuntime;

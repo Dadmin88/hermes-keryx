@@ -309,7 +309,11 @@ fn publish_registry_gossip(
         return;
     }
     let topic = gossipsub::IdentTopic::new(REGISTRY_GOSSIP_TOPIC);
-    if let Err(err) = swarm.behaviour_mut().registry_gossip.publish(topic, payload) {
+    if let Err(err) = swarm
+        .behaviour_mut()
+        .registry_gossip
+        .publish(topic, payload)
+    {
         tracing::debug!(error = %err, "registry gossip publish skipped");
     }
 }

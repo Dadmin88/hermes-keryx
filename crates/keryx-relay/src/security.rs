@@ -695,6 +695,8 @@ mod tests {
             .unwrap();
         let node_id: NodeId = "node:worker".parse().unwrap();
         assert!(auth.is_configured());
-        assert!(auth.authenticate(&node_id, "node-token-secure-1234567890").is_ok());
+        assert!(auth
+            .authenticate(&node_id, "node-token-secure-1234567890")
+            .is_ok());
     }
 }

@@ -69,9 +69,16 @@ struct GossipRegistration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RegistryGossipMessage {
-    Upsert { registration: GossipRegistration },
-    Remove { peer_id: String, updated_at_unix_ms: u64 },
-    Snapshot { registrations: Vec<GossipRegistration> },
+    Upsert {
+        registration: GossipRegistration,
+    },
+    Remove {
+        peer_id: String,
+        updated_at_unix_ms: u64,
+    },
+    Snapshot {
+        registrations: Vec<GossipRegistration>,
+    },
 }
 
 /// Error returned when a remote registry gossip payload cannot be applied.
@@ -132,7 +139,13 @@ impl SkillRegistry {
             let mut guard = self.inner.write().await;
             guard.purge_expired_locked();
             let mut registration = guard.nodes.get(&peer_id).cloned().unwrap_or_else(|| {
-                self.registration_for(peer_id.clone(), Vec::new(), String::new(), String::new(), ttl)
+                self.registration_for(
+                    peer_id.clone(),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                    ttl,
+                )
             });
             let now_ms = unix_ms_now();
             let ttl = ttl.unwrap_or(self.default_ttl);
@@ -155,7 +168,8 @@ impl SkillRegistry {
 
     /// Refresh a peer expiry without changing its advertised skills.
     pub async fn touch_node(&self, peer_id: PeerId, ttl: Option<Duration>) {
-        self.upsert_node(peer_id, String::new(), String::new(), ttl).await;
+        self.upsert_node(peer_id, String::new(), String::new(), ttl)
+            .await;
     }
 
     /// Merge additional skills into a peer registration without dropping existing skills.
@@ -176,7 +190,13 @@ impl SkillRegistry {
             let mut guard = self.inner.write().await;
             guard.purge_expired_locked();
             let mut registration = guard.nodes.get(&peer_id).cloned().unwrap_or_else(|| {
-                self.registration_for(peer_id.clone(), Vec::new(), String::new(), String::new(), ttl)
+                self.registration_for(
+                    peer_id.clone(),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                    ttl,
+                )
             });
             let now_ms = unix_ms_now();
             let ttl = ttl.unwrap_or(self.default_ttl);
@@ -421,7 +441,8 @@ impl RegistryState {
                     .insert(registration.peer_id.clone());
             }
         }
-        self.nodes.insert(registration.peer_id.clone(), registration);
+        self.nodes
+            .insert(registration.peer_id.clone(), registration);
     }
 
     fn remove_peer(&mut self, peer_id: &PeerId) -> Option<Registration> {

@@ -11,15 +11,23 @@ STATE_DIR=${KERYX_DUAL_RUN_STATE_DIR:-"${HOME}/.hermes/.keryx"}
 LOG_DIR=${KERYX_DUAL_RUN_LOG_DIR:-"${STATE_DIR}/logs"}
 RUN_DIR=${KERYX_DUAL_RUN_RUN_DIR:-"${STATE_DIR}/run"}
 DATA_DIR=${HERMES_KERYX_DATA_DIR:-"${STATE_DIR}/data"}
-RELAY_CONFIG=${HERMES_KERYX_RELAY_CONFIG:-"${STATE_DIR}/relay.json"}
+if [[ -n "${HERMES_KERYX_RELAY_CONFIG:-}" ]]; then
+  RELAY_CONFIG=${HERMES_KERYX_RELAY_CONFIG}
+  RELAY_CONFIG_EXPLICIT=1
+else
+  RELAY_CONFIG=${STATE_DIR}/relay.json
+  RELAY_CONFIG_EXPLICIT=0
+fi
 
 DAEMON_ADDR=${HERMES_KERYX_DAEMON_ADDR:-127.0.0.1:50051}
 DAEMON_ENDPOINT=${HERMES_KERYX_DAEMON_ENDPOINT:-"http://${DAEMON_ADDR}"}
-RELAY_HEALTH_GRPC_ADDR=${HERMES_KERYX_RELAY_HEALTH_GRPC_ADDR:-127.0.0.1:50052}
-RELAY_HTTP_ADDR=${HERMES_KERYX_RELAY_HEALTH_HTTP_ADDR:-127.0.0.1:8081}
-RELAY_REGISTRY_ADDR=${HERMES_KERYX_REGISTRY_ENDPOINT:-127.0.0.1:50053}
-RELAY_LISTEN_TCP=${HERMES_KERYX_RELAY_LISTEN_TCP:-/ip4/127.0.0.1/tcp/4001}
-RELAY_LISTEN_QUIC=${HERMES_KERYX_RELAY_LISTEN_QUIC:-/ip4/127.0.0.1/udp/4001/quic-v1}
+# Dual-run defaults intentionally avoid common legacy AgentAnycast relay ports
+# (for example 4001/libp2p and 50052/health) while staying loopback-only.
+RELAY_HEALTH_GRPC_ADDR=${HERMES_KERYX_RELAY_HEALTH_GRPC_ADDR:-127.0.0.1:51052}
+RELAY_HTTP_ADDR=${HERMES_KERYX_RELAY_HEALTH_HTTP_ADDR:-127.0.0.1:18081}
+RELAY_REGISTRY_ADDR=${HERMES_KERYX_REGISTRY_ENDPOINT:-127.0.0.1:51053}
+RELAY_LISTEN_TCP=${HERMES_KERYX_RELAY_LISTEN_TCP:-/ip4/127.0.0.1/tcp/4101}
+RELAY_LISTEN_QUIC=${HERMES_KERYX_RELAY_LISTEN_QUIC:-/ip4/127.0.0.1/udp/4101/quic-v1}
 
 DAEMON_PID_FILE=${RUN_DIR}/keryxd.pid
 RELAY_PID_FILE=${RUN_DIR}/keryx-relay.pid
@@ -106,7 +114,7 @@ tcp_listening() {
 }
 
 ensure_relay_config() {
-  if [[ -f "$RELAY_CONFIG" ]]; then
+  if [[ "$RELAY_CONFIG_EXPLICIT" == 1 && -f "$RELAY_CONFIG" ]]; then
     return 0
   fi
   cat >"$RELAY_CONFIG" <<EOF
@@ -114,7 +122,6 @@ ensure_relay_config() {
   "listen_addresses": ["${RELAY_LISTEN_TCP}", "${RELAY_LISTEN_QUIC}"],
   "bootstrap_peers": [],
   "enable_mdns": false,
-  "keypair_path": "${STATE_DIR}/relay.key",
   "max_circuits": 256,
   "max_reservations": 128,
   "max_reservations_per_peer": 4,

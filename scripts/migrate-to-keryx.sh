@@ -18,8 +18,8 @@ Options:
   -h, --help             Show this help.
 
 Environment overrides:
-  HERMES_HOME                    Hermes home directory (default: ~/.hermes)
-  HERMES_CONFIG                  Config file path (default: $HERMES_HOME/config.yaml)
+  HERMES_KERYX_MIGRATION_HOME    Hermes root home (default: ~/.hermes)
+  HERMES_CONFIG                  Config file path (default: $HERMES_KERYX_MIGRATION_HOME/config.yaml)
   HERMES_KERYX_DAEMON_ENDPOINT   Daemon endpoint (default: 127.0.0.1:50051)
 USAGE
 }
@@ -67,12 +67,12 @@ if [[ -z "${KERYX_DAEMON}" ]]; then
   if command -v keryxd >/dev/null 2>&1; then
     KERYX_DAEMON="$(command -v keryxd)"
   else
-    KERYX_DAEMON="${HERMES_HOME:-$HOME/.hermes}/.keryx/bin/keryxd"
+    KERYX_DAEMON="${HERMES_KERYX_MIGRATION_HOME:-$HOME/.hermes}/.keryx/bin/keryxd"
   fi
 fi
 
 export DRY_RUN REVERT REVERT_BACKUP KERYX_DAEMON
-export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+export HERMES_HOME="${HERMES_KERYX_MIGRATION_HOME:-$HOME/.hermes}"
 export HERMES_CONFIG="${HERMES_CONFIG:-$HERMES_HOME/config.yaml}"
 export HERMES_KERYX_DAEMON_ENDPOINT="${HERMES_KERYX_DAEMON_ENDPOINT:-127.0.0.1:50051}"
 
