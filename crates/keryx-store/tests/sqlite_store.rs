@@ -374,7 +374,7 @@ async fn sqlite_idempotency_duplicate_and_conflict_behave_like_memory_store() {
 }
 
 #[tokio::test]
-async fn sqlite_migration_requeues_legacy_active_leases_without_fabricating_owner() {
+async fn sqlite_migration_preserves_unexpired_legacy_active_leases_without_fabricating_owner() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("legacy-keryx.db");
     let task_id = TaskId::new("legacy-running-task").unwrap();
@@ -387,34 +387,42 @@ async fn sqlite_migration_requeues_legacy_active_leases_without_fabricating_owne
     assert_eq!(store.schema_version().await.unwrap(), 2);
     assert_eq!(
         store.get_task(&task_id).await.unwrap().status,
-        TaskStatus::Pending
+        TaskStatus::Running
     );
-    assert!(store.active_lease(&task_id).await.unwrap().is_none());
+    let active_lease = store.active_lease(&task_id).await.unwrap().unwrap();
+    assert_eq!(active_lease.lease_id, lease_id);
+    assert!(active_lease.worker_id.is_none());
+    assert_eq!(active_lease.expires_at_ms, 9_999);
     let events = store.events_for_task(&task_id).await.unwrap();
+    assert_eq!(events.len(), 2);
     assert_eq!(
         events.last().unwrap().event_type,
-        KeryxEventType::RecoveryAction
+        KeryxEventType::TaskStarted
     );
-    assert_eq!(
-        events.last().unwrap().from_status,
-        Some(TaskStatus::Running)
-    );
-    assert_eq!(events.last().unwrap().to_status, TaskStatus::Pending);
 
     assert_eq!(
         store
             .renew_lease(&task_id, &lease_id, &worker("legacy-worker"), 500, 1_500)
             .await
             .unwrap_err(),
-        StoreError::Validation(ValidationError::InvalidTaskTransition {
-            from: TaskStatus::Pending,
-            to: TaskStatus::Running,
-        })
+        StoreError::LeaseOwnerMissing {
+            task_id: task_id.clone(),
+            lease_id: lease_id.clone(),
+        }
     );
 
-    let new_lease = lease(&task_id, "legacy-new-lease", "legacy-worker", 1_500);
-    let leased = store.lease_task(&task_id, new_lease.clone()).await.unwrap();
-    assert_eq!(leased.status, TaskStatus::Running);
+    assert_eq!(
+        store
+            .lease_task(
+                &task_id,
+                lease(&task_id, "legacy-new-lease", "legacy-worker", 1_500),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::LeaseConflict {
+            task_id: task_id.clone(),
+        }
+    );
 }
 
 #[tokio::test]

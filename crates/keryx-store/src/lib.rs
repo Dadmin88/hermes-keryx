@@ -559,12 +559,6 @@ impl SqliteStore {
                 sqlx::query(statement).execute(&mut *tx).await?;
             }
         }
-        let legacy_unowned_rows = sqlx::query(
-            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows).await?;
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
         )
