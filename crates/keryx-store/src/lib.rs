@@ -1,13 +1,22 @@
 //! Storage traits plus in-memory and SQLite implementations for Hermes Keryx.
 
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Mutex};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Mutex,
+};
 
 use keryx_core::{
-    validate_transition, AgentId, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, TaskId,
-    TaskStatus, ValidationError,
+    is_valid_operational_legacy, normalize_legacy_transition, should_inline,
+    validate_artifact_size, validate_cancel_transition, validate_transition, AgentId, ArtifactId,
+    CanonicalTransition, Digest, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId,
+    LegacyEventType, MediaType, RetryPolicy, TaskId, TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
+use tracing::{info, instrument};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -15,6 +24,12 @@ pub enum StoreError {
     TaskNotFound(TaskId),
     #[error("task already exists: {0}")]
     TaskAlreadyExists(TaskId),
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(ArtifactId),
+    #[error("artifact too large: {byte_len} bytes exceeds {limit_bytes}")]
+    ArtifactTooLarge { byte_len: u64, limit_bytes: u64 },
+    #[error("digest mismatch: expected {expected}, computed {actual}")]
+    DigestMismatch { expected: String, actual: String },
     #[error("idempotency key {key} already belongs to task {existing_task_id}")]
     IdempotencyConflict {
         key: IdempotencyKey,
@@ -45,6 +60,17 @@ pub enum StoreError {
         requested_expires_at_ms: i64,
         now_ms: i64,
     },
+    #[error("unsupported schema version: found={found_version}, supported={supported_version}")]
+    UnsupportedSchema {
+        found_version: i64,
+        supported_version: i64,
+    },
+    #[error("migration failed: {0}")]
+    MigrationFailed(String),
+    #[error("startup recovery found unrepaired corruption in tasks: {corrupted_tasks:?}")]
+    UnrepairedCorruption { corrupted_tasks: Vec<TaskId> },
+    #[error("blob directory error: {0}")]
+    BlobDir(String),
     #[error("database error: {0}")]
     Database(String),
 }
@@ -75,11 +101,17 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     id: TaskId,
     pub status: TaskStatus,
     pub idempotency_key: Option<IdempotencyKey>,
+    pub deadline_ms: Option<i64>,
+    pub retry_count: u32,
+    pub dead_lettered: bool,
+    pub dead_letter_reason: Option<String>,
 }
 
 impl TaskRecord {
@@ -93,6 +125,10 @@ impl TaskRecord {
             id,
             status,
             idempotency_key,
+            deadline_ms: None,
+            retry_count: 0,
+            dead_lettered: false,
+            dead_letter_reason: None,
         }
     }
 
@@ -159,6 +195,17 @@ pub struct LeaseRecord {
     pub expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub artifact_id: ArtifactId,
+    pub task_id: TaskId,
+    pub digest: Digest,
+    pub media_type: MediaType,
+    pub byte_len: u64,
+    pub inline: bool,
+    pub created_at: String,
+}
+
 impl LeaseRecord {
     #[must_use]
     pub fn new(
@@ -209,6 +256,7 @@ pub trait TaskStore {
     fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord>;
     fn get_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord>;
     fn transition_task(&self, task_id: &TaskId, to: TaskStatus) -> StoreResult<TaskRecord>;
+    fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64>;
     fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>>;
     fn replay_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord>;
 }
@@ -224,6 +272,9 @@ struct InMemoryState {
     events: HashMap<TaskId, Vec<TaskEventRecord>>,
     idempotency: HashMap<IdempotencyKey, TaskId>,
     leases: HashMap<TaskId, LeaseRecord>,
+    artifacts: HashMap<ArtifactId, ArtifactRecord>,
+    inline_artifacts: HashMap<ArtifactId, Vec<u8>>,
+    blobs: HashMap<Digest, (Vec<u8>, u32)>,
 }
 
 fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
@@ -237,6 +288,61 @@ fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
             },
         ))
     }
+}
+
+enum LegacyAppendPlan {
+    Lifecycle(CanonicalTransition),
+    Operational {
+        event_type: KeryxEventType,
+        status: TaskStatus,
+    },
+}
+
+fn plan_legacy_event_append(
+    from_status: TaskStatus,
+    legacy_event: LegacyEventType,
+) -> StoreResult<LegacyAppendPlan> {
+    if let Some(transition) = normalize_legacy_transition(from_status, legacy_event) {
+        return Ok(LegacyAppendPlan::Lifecycle(transition));
+    }
+    if is_valid_operational_legacy(from_status, legacy_event) {
+        return Ok(LegacyAppendPlan::Operational {
+            event_type: legacy_event.as_keryx_event_type(),
+            status: from_status,
+        });
+    }
+    Err(StoreError::Validation(
+        ValidationError::InvalidTaskTransition {
+            from: from_status,
+            to: from_status,
+        },
+    ))
+}
+
+fn is_replayable_operational_legacy_event(event_type: KeryxEventType) -> bool {
+    matches!(
+        event_type,
+        KeryxEventType::TaskQueued
+            | KeryxEventType::TaskApprovalRequested
+            | KeryxEventType::TaskApprovalGranted
+            | KeryxEventType::TaskAwaitingInput
+    )
+}
+
+fn validate_deadline_transition(from: TaskStatus) -> StoreResult<()> {
+    match from {
+        TaskStatus::Pending | TaskStatus::Running => Ok(()),
+        TaskStatus::Completed | TaskStatus::Failed => Err(StoreError::Validation(
+            ValidationError::TerminalTaskTransition {
+                from,
+                to: TaskStatus::Failed,
+            },
+        )),
+    }
+}
+
+fn ensure_active_lease_unexpired(active: &LeaseRecord, now_ms: i64) -> StoreResult<()> {
+    ensure_valid_lease_expiry(active, now_ms, active.expires_at_ms.saturating_add(1))
 }
 
 impl InMemoryStore {
@@ -313,8 +419,211 @@ impl InMemoryStore {
         task_id: &TaskId,
         lease_id: &LeaseId,
         worker_id: &AgentId,
+        error_reason: &str,
+        policy: &RetryPolicy,
     ) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+
+        if policy.max_retries == 0 {
+            return self.finish_task_in_state(
+                &mut state,
+                task_id,
+                lease_id,
+                worker_id,
+                TaskStatus::Failed,
+                task.retry_count,
+                false,
+                None,
+            );
+        }
+
+        if policy.should_retry_after_failure(task.retry_count) {
+            return self.retry_task_in_state(&mut state, task_id, &active, task);
+        }
+
+        self.dead_letter_task_in_state(&mut state, task_id, &active, task, error_reason)
+    }
+
+    pub fn retry_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        self.retry_task_in_state(&mut state, task_id, &active, task)
+    }
+
+    pub fn dead_letter_task(&self, task_id: &TaskId, reason: &str) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let active = state
+            .leases
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        self.dead_letter_task_in_state(&mut state, task_id, &active, task, reason)
+    }
+
+    pub fn cancel_task(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+    ) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        if task.status.is_terminal() {
+            return Ok(task);
+        }
+        if task.status == TaskStatus::Running {
+            let active = state
+                .leases
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        let mut updated = task;
+        updated.status = transition.to;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            &mut state,
+            task_id,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), updated.clone());
+        Ok(updated)
+    }
+
+    pub fn fail_expired_deadlines(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let mut state = self.lock()?;
+        let mut expired: Vec<(i64, TaskId)> = state
+            .tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+            .filter_map(|task| {
+                task.deadline_ms
+                    .filter(|deadline_ms| *deadline_ms <= now_ms)
+                    .map(|deadline_ms| (deadline_ms, task.task_id().clone()))
+            })
+            .collect();
+        expired.sort_by(|(left_deadline, left_id), (right_deadline, right_id)| {
+            left_deadline
+                .cmp(right_deadline)
+                .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+        });
+        if let Some(limit) = limit {
+            expired.truncate(limit);
+        }
+
+        let mut failed = Vec::with_capacity(expired.len());
+        for (_, expired_task_id) in expired {
+            let task = state
+                .tasks
+                .get(&expired_task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::TaskNotFound(expired_task_id.clone()))?;
+            validate_deadline_transition(task.status)?;
+            let mut updated = task;
+            let from_status = updated.status;
+            updated.status = TaskStatus::Failed;
+            state.leases.remove(&expired_task_id);
+            append_in_memory_event(
+                &mut state,
+                &expired_task_id,
+                KeryxEventType::TaskTimedOut,
+                Some(from_status),
+                TaskStatus::Failed,
+            );
+            state.tasks.insert(expired_task_id, updated.clone());
+            failed.push(updated);
+        }
+        Ok(failed)
+    }
+
+    fn retry_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        active: &LeaseRecord,
+        mut task: TaskRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_matching_lease_id(task_id, active, &active.lease_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+        task.retry_count = task.retry_count.saturating_add(1);
+        task.status = TaskStatus::Pending;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            state,
+            task_id,
+            KeryxEventType::RecoveryAction,
+            Some(TaskStatus::Running),
+            TaskStatus::Pending,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        Ok(task)
+    }
+
+    fn dead_letter_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        active: &LeaseRecord,
+        mut task: TaskRecord,
+        reason: &str,
+    ) -> StoreResult<TaskRecord> {
+        ensure_matching_lease_id(task_id, active, &active.lease_id)?;
+        require_status(task.status, TaskStatus::Running)?;
+        task.retry_count = task.retry_count.saturating_add(1);
+        task.dead_lettered = true;
+        task.dead_letter_reason = Some(reason.to_owned());
+        let transition = validate_transition(task.status, TaskStatus::Failed)?;
+        task.status = TaskStatus::Failed;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            state,
+            task_id,
+            KeryxEventType::TaskDeadLettered,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        Ok(task)
     }
 
     fn finish_task(
@@ -330,6 +639,35 @@ impl InMemoryStore {
             .get(task_id)
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        self.finish_task_in_state(
+            &mut state,
+            task_id,
+            lease_id,
+            worker_id,
+            to,
+            task.retry_count,
+            task.dead_lettered,
+            task.dead_letter_reason.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_task_in_state(
+        &self,
+        state: &mut InMemoryState,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        to: TaskStatus,
+        retry_count: u32,
+        dead_lettered: bool,
+        dead_letter_reason: Option<String>,
+    ) -> StoreResult<TaskRecord> {
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
         let active = state
             .leases
             .get(task_id)
@@ -340,9 +678,12 @@ impl InMemoryStore {
         let transition = validate_transition(task.status, to)?;
         let mut updated = task;
         updated.status = to;
+        updated.retry_count = retry_count;
+        updated.dead_lettered = dead_lettered;
+        updated.dead_letter_reason = dead_letter_reason;
         state.leases.remove(task_id);
         append_in_memory_event(
-            &mut state,
+            state,
             task_id,
             transition.event_type,
             Some(transition.from),
@@ -352,8 +693,159 @@ impl InMemoryStore {
         Ok(updated)
     }
 
+    pub fn accept_legacy_event(
+        &self,
+        task_id: &TaskId,
+        event_type: KeryxEventType,
+    ) -> StoreResult<TaskRecord> {
+        let legacy_event = LegacyEventType::from_keryx_event_type(event_type).ok_or(
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            }),
+        )?;
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        let plan = plan_legacy_event_append(task.status, legacy_event)?;
+        match plan {
+            LegacyAppendPlan::Lifecycle(transition) => {
+                let mut updated = task;
+                updated.status = transition.to;
+                if transition.to.is_terminal() {
+                    state.leases.remove(task_id);
+                }
+                append_in_memory_event(
+                    &mut state,
+                    task_id,
+                    transition.event_type,
+                    Some(transition.from),
+                    transition.to,
+                );
+                state.tasks.insert(task_id.clone(), updated.clone());
+                Ok(updated)
+            }
+            LegacyAppendPlan::Operational {
+                event_type: preserved,
+                status,
+            } => {
+                append_in_memory_event(&mut state, task_id, preserved, Some(status), status);
+                Ok(task)
+            }
+        }
+    }
+
     pub fn active_lease(&self, task_id: &TaskId) -> StoreResult<Option<LeaseRecord>> {
         Ok(self.lock()?.leases.get(task_id).cloned())
+    }
+
+    pub async fn put_artifact(
+        &self,
+        meta: &keryx_core::ArtifactMeta,
+        bytes: &[u8],
+        blob_dir: &Path,
+    ) -> StoreResult<ArtifactRecord> {
+        validate_artifact_size(bytes.len() as u64).map_err(map_artifact_validation_error)?;
+        let computed = Digest::compute(bytes);
+        if computed != meta.digest {
+            return Err(StoreError::DigestMismatch {
+                expected: meta.digest.as_str().to_owned(),
+                actual: computed.as_str().to_owned(),
+            });
+        }
+
+        let mut state = self.lock()?;
+        if !state.tasks.contains_key(&meta.task_id) {
+            return Err(StoreError::TaskNotFound(meta.task_id.clone()));
+        }
+
+        let record = artifact_record_from_meta(meta, computed, bytes.len() as u64);
+        if let Some(existing) = state.artifacts.get(&record.artifact_id).cloned() {
+            drop_in_memory_artifact_association(&mut state, &existing, blob_dir)?;
+        }
+
+        if record.inline {
+            state
+                .inline_artifacts
+                .insert(record.artifact_id.clone(), bytes.to_vec());
+        } else {
+            ensure_blob_dir(blob_dir)?;
+            std::fs::write(blob_path(blob_dir, &record.digest), bytes)?;
+            let entry = state
+                .blobs
+                .entry(record.digest.clone())
+                .or_insert_with(|| (bytes.to_vec(), 0));
+            entry.0 = bytes.to_vec();
+            entry.1 = entry.1.saturating_add(1);
+        }
+
+        state
+            .artifacts
+            .insert(record.artifact_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        _blob_dir: &Path,
+    ) -> StoreResult<(ArtifactRecord, Vec<u8>)> {
+        let state = self.lock()?;
+        let record = state
+            .artifacts
+            .get(artifact_id)
+            .cloned()
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        let bytes = if record.inline {
+            state
+                .inline_artifacts
+                .get(artifact_id)
+                .cloned()
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        } else {
+            state
+                .blobs
+                .get(&record.digest)
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        };
+        Ok((record, bytes))
+    }
+
+    pub async fn list_artifacts_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Vec<ArtifactRecord>> {
+        let state = self.lock()?;
+        let mut records = state
+            .artifacts
+            .values()
+            .filter(|record| &record.task_id == task_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.artifact_id.as_str().cmp(right.artifact_id.as_str()));
+        Ok(records)
+    }
+
+    pub async fn delete_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<()> {
+        let mut state = self.lock()?;
+        let record = state
+            .artifacts
+            .remove(artifact_id)
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        if record.inline {
+            state.inline_artifacts.remove(artifact_id);
+        } else {
+            decrement_in_memory_blob_ref(&mut state, &record.digest, blob_dir)?;
+        }
+        Ok(())
     }
 
     pub fn recover_stale_leases(
@@ -493,6 +985,15 @@ impl TaskStore for InMemoryStore {
         Ok(updated)
     }
 
+    fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64> {
+        let state = self.lock()?;
+        Ok(state
+            .tasks
+            .values()
+            .filter(|task| task.status == status)
+            .count() as u64)
+    }
+
     fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>> {
         let state = self.lock()?;
         match state.events.get(task_id) {
@@ -540,31 +1041,125 @@ impl SqliteStore {
     }
 
     pub async fn migrate(&self) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let existing_version = detect_sqlite_schema_version(&self.pool).await?;
+        if existing_version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found_version: existing_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         for statement in MIGRATION_001 {
-            sqlx::query(statement).execute(&mut *tx).await?;
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         }
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'initial')",
         )
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         let worker_id_column_exists =
             sqlx::query("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'worker_id'")
                 .fetch_optional(&mut *tx)
-                .await?
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
                 .is_some();
         if !worker_id_column_exists {
             for statement in MIGRATION_002 {
-                sqlx::query(statement).execute(&mut *tx).await?;
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
             }
         }
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'lease_worker_identity')",
         )
         .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let retry_column_exists =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'retry_count'")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !retry_column_exists {
+            for statement in MIGRATION_003 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (3, 'task_retry_dead_letter')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let artifact_storage_exists =
+            sqlx::query("SELECT 1 FROM schema_migrations WHERE version = 4 LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !artifact_storage_exists {
+            for statement in MIGRATION_004 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        let deadline_column_exists =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'deadline_ms'")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !deadline_column_exists {
+            for statement in MIGRATION_005 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (5, 'task_deadlines')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let legacy_unowned_rows = sqlx::query(
+            "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        recover_sqlite_leases_with_executor(&mut tx, legacy_unowned_rows)
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+
+        let final_version = detect_sqlite_schema_version(&self.pool).await?;
+        if final_version != CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found_version: final_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
         Ok(())
     }
 
@@ -575,6 +1170,145 @@ impl SqliteStore {
         Ok(row.get::<i64, _>("version"))
     }
 
+    /// Close the underlying connection pool. Safe to call on any clone of the store.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    pub async fn put_artifact(
+        &self,
+        meta: &keryx_core::ArtifactMeta,
+        bytes: &[u8],
+        blob_dir: &Path,
+    ) -> StoreResult<ArtifactRecord> {
+        validate_artifact_size(bytes.len() as u64).map_err(map_artifact_validation_error)?;
+        let computed = Digest::compute(bytes);
+        if computed != meta.digest {
+            return Err(StoreError::DigestMismatch {
+                expected: meta.digest.as_str().to_owned(),
+                actual: computed.as_str().to_owned(),
+            });
+        }
+
+        let record = artifact_record_from_meta(meta, computed, bytes.len() as u64);
+        let mut tx = self.pool.begin().await?;
+        fetch_task_with_executor(&mut tx, &record.task_id).await?;
+
+        let existing = fetch_artifact_optional_with_executor(&mut tx, &record.artifact_id).await?;
+        let prepared_blob = if should_prepare_blob_write(existing.as_ref(), &record) {
+            Some(prepare_blob_write_with_executor(&mut tx, &record.digest, bytes, blob_dir).await?)
+        } else {
+            None
+        };
+
+        let tx_result = async {
+            let mut cleanup_digests = Vec::new();
+            if let Some(existing) = existing.as_ref() {
+                if should_drop_blob_association(existing, &record)
+                    && decrement_blob_ref_with_executor(&mut tx, &existing.digest).await?
+                {
+                    cleanup_digests.push(existing.digest.clone());
+                }
+            }
+            if should_write_blob_association(existing.as_ref(), &record) {
+                increment_blob_ref_with_executor(&mut tx, &record.digest, bytes.len() as u64).await?;
+            }
+
+            sqlx::query(
+                "INSERT INTO artifacts (artifact_id, task_id, digest, media_type, byte_len, inline, inline_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(artifact_id) DO UPDATE SET task_id = excluded.task_id, digest = excluded.digest, media_type = excluded.media_type, byte_len = excluded.byte_len, inline = excluded.inline, inline_blob = excluded.inline_blob, created_at = excluded.created_at",
+            )
+            .bind(record.artifact_id.as_str())
+            .bind(record.task_id.as_str())
+            .bind(record.digest.as_str())
+            .bind(record.media_type.as_str())
+            .bind(record.byte_len as i64)
+            .bind(i64::from(record.inline))
+            .bind(record.inline.then_some(bytes))
+            .bind(&record.created_at)
+            .execute(&mut *tx)
+            .await?;
+
+            StoreResult::Ok(cleanup_digests)
+        }
+        .await;
+
+        let cleanup_digests = match tx_result {
+            Ok(cleanup_digests) => cleanup_digests,
+            Err(error) => {
+                tx.rollback().await.ok();
+                rollback_prepared_blob_write(prepared_blob.as_ref())?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = tx.commit().await {
+            rollback_prepared_blob_write(prepared_blob.as_ref())?;
+            return Err(error.into());
+        }
+        finalize_blob_cleanup(&self.pool, &cleanup_digests, blob_dir).await?;
+        Ok(record)
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<(ArtifactRecord, Vec<u8>)> {
+        let record = fetch_artifact_optional_from_pool(&self.pool, artifact_id)
+            .await?
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+
+        let bytes = if record.inline {
+            let row = sqlx::query("SELECT inline_blob FROM artifacts WHERE artifact_id = ?")
+                .bind(artifact_id.as_str())
+                .fetch_one(&self.pool)
+                .await?;
+            row.try_get::<Option<Vec<u8>>, _>("inline_blob")?
+                .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
+        } else {
+            std::fs::read(blob_path(blob_dir, &record.digest))?
+        };
+
+        Ok((record, bytes))
+    }
+
+    pub async fn list_artifacts_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Vec<ArtifactRecord>> {
+        let rows = sqlx::query(
+            "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE task_id = ? ORDER BY artifact_id ASC",
+        )
+        .bind(task_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_artifact).collect()
+    }
+
+    pub async fn delete_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        blob_dir: &Path,
+    ) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let record = fetch_artifact_optional_with_executor(&mut tx, artifact_id)
+            .await?
+            .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?;
+        sqlx::query("DELETE FROM artifacts WHERE artifact_id = ?")
+            .bind(artifact_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let mut cleanup_digests = Vec::new();
+        if !record.inline && decrement_blob_ref_with_executor(&mut tx, &record.digest).await? {
+            cleanup_digests.push(record.digest.clone());
+        }
+        tx.commit().await?;
+        finalize_blob_cleanup(&self.pool, &cleanup_digests, blob_dir).await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(task_id = %task.task_id().as_str()))]
     pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {
         validate_accepted_task_status(&task)?;
         let mut tx = self.pool.begin().await?;
@@ -607,10 +1341,16 @@ impl SqliteStore {
             return Err(StoreError::TaskAlreadyExists(task.task_id().clone()));
         }
 
-        sqlx::query("INSERT INTO tasks (task_id, status, idempotency_key) VALUES (?, ?, ?)")
+        sqlx::query(
+            "INSERT INTO tasks (task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
             .bind(task.task_id().as_str())
             .bind(status_to_str(task.status))
             .bind(task.idempotency_key.as_ref().map(IdempotencyKey::as_str))
+            .bind(i64::from(task.retry_count))
+            .bind(i64::from(task.dead_lettered))
+            .bind(task.dead_letter_reason.as_deref())
+            .bind(task.deadline_ms)
             .execute(&mut *tx)
             .await?;
         if let Some(key) = &task.idempotency_key {
@@ -635,7 +1375,9 @@ impl SqliteStore {
 
     pub async fn get_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord> {
         let row =
-            sqlx::query("SELECT task_id, status, idempotency_key FROM tasks WHERE task_id = ?")
+            sqlx::query(
+                "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE task_id = ?",
+            )
                 .bind(task_id.as_str())
                 .fetch_optional(&self.pool)
                 .await?
@@ -669,6 +1411,56 @@ impl SqliteStore {
         self.get_task(task_id).await
     }
 
+    pub async fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM tasks WHERE status = ?")
+            .bind(status_to_str(status))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("count") as u64)
+    }
+
+    pub async fn accept_legacy_event(
+        &self,
+        task_id: &TaskId,
+        event_type: KeryxEventType,
+    ) -> StoreResult<TaskRecord> {
+        let legacy_event = LegacyEventType::from_keryx_event_type(event_type).ok_or(
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            }),
+        )?;
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let plan = plan_legacy_event_append(task.status, legacy_event)?;
+        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+        match plan {
+            LegacyAppendPlan::Lifecycle(transition) => {
+                if transition.to.is_terminal() {
+                    deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
+                }
+                update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
+                insert_event(
+                    &mut tx,
+                    task_id,
+                    sequence,
+                    transition.event_type,
+                    Some(transition.from),
+                    transition.to,
+                )
+                .await?;
+            }
+            LegacyAppendPlan::Operational {
+                event_type: preserved,
+                status,
+            } => {
+                insert_event(&mut tx, task_id, sequence, preserved, Some(status), status).await?;
+            }
+        }
+        tx.commit().await?;
+        self.get_task(task_id).await
+    }
+
     pub async fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>> {
         let rows = sqlx::query(
             "SELECT task_id, sequence, event_type, from_status, to_status FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
@@ -692,11 +1484,16 @@ impl SqliteStore {
         replay_task_from_snapshot_and_events(&task, &events)
     }
 
+    #[instrument(skip(self, lease), fields(task_id = %task_id.as_str(), worker_id = tracing::field::Empty))]
     pub async fn lease_task(
         &self,
         task_id: &TaskId,
         lease: LeaseRecord,
     ) -> StoreResult<TaskRecord> {
+        if let Some(worker_id) = lease.worker_id.as_ref() {
+            tracing::Span::current()
+                .record("worker_id", tracing::field::display(worker_id.as_str()));
+        }
         let mut tx = self.pool.begin().await?;
         ensure_matching_task_id(task_id, &lease)?;
         ensure_lease_has_owner(&lease)?;
@@ -741,6 +1538,7 @@ impl SqliteStore {
         self.get_task(task_id).await
     }
 
+    #[instrument(skip(self), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn renew_lease(
         &self,
         task_id: &TaskId,
@@ -780,6 +1578,7 @@ impl SqliteStore {
         ))
     }
 
+    #[instrument(skip(self), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn complete_task(
         &self,
         task_id: &TaskId,
@@ -790,22 +1589,14 @@ impl SqliteStore {
             .await
     }
 
+    #[instrument(skip(self, error_reason, policy), fields(task_id = %task_id.as_str(), lease_id = %lease_id.as_str()))]
     pub async fn fail_task(
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
         worker_id: &AgentId,
-    ) -> StoreResult<TaskRecord> {
-        self.finish_task(task_id, lease_id, worker_id, TaskStatus::Failed)
-            .await
-    }
-
-    async fn finish_task(
-        &self,
-        task_id: &TaskId,
-        lease_id: &LeaseId,
-        worker_id: &AgentId,
-        to: TaskStatus,
+        error_reason: &str,
+        policy: &RetryPolicy,
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
@@ -814,10 +1605,82 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
         ensure_matching_worker_id(task_id, &active, worker_id)?;
-        let transition = validate_transition(task.status, to)?;
+        require_status(task.status, TaskStatus::Running)?;
+
+        let updated = if policy.max_retries == 0 {
+            self.finish_task_in_tx(
+                &mut tx,
+                task_id,
+                lease_id,
+                worker_id,
+                TaskStatus::Failed,
+                task.retry_count,
+                false,
+                None,
+            )
+            .await?
+        } else if policy.should_retry_after_failure(task.retry_count) {
+            sqlite_retry_task_in_tx(&mut tx, task_id, &task).await?
+        } else {
+            sqlite_dead_letter_task_in_tx(&mut tx, task_id, &task, error_reason).await?
+        };
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn retry_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let active = fetch_active_lease_with_executor(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        let updated = sqlite_retry_task_in_tx(&mut tx, task_id, &task).await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn dead_letter_task(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let _active = fetch_active_lease_with_executor(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        let updated = sqlite_dead_letter_task_in_tx(&mut tx, task_id, &task, reason).await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn cancel_task(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        if task.status.is_terminal() {
+            tx.commit().await?;
+            return Ok(task);
+        }
+        if task.status == TaskStatus::Running {
+            let active = fetch_active_lease_with_executor(&mut tx, task_id)
+                .await?
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
         let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
         deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
-        update_task_status_with_executor(&mut tx, task_id, to).await?;
+        update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
         insert_event(
             &mut tx,
             task_id,
@@ -831,6 +1694,123 @@ impl SqliteStore {
         self.get_task(task_id).await
     }
 
+    pub async fn fail_expired_deadlines(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = match limit {
+            Some(limit) => {
+                sqlx::query(
+                    "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE deadline_ms IS NOT NULL AND deadline_ms <= ? AND status IN ('pending', 'running') ORDER BY deadline_ms ASC, task_id ASC LIMIT ?",
+                )
+                .bind(now_ms)
+                .bind(limit as i64)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE deadline_ms IS NOT NULL AND deadline_ms <= ? AND status IN ('pending', 'running') ORDER BY deadline_ms ASC, task_id ASC",
+                )
+                .bind(now_ms)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
+
+        let mut failed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task = row_to_task(row)?;
+            validate_deadline_transition(task.status)?;
+            let sequence = next_sequence_with_executor(&mut tx, task.task_id()).await?;
+            deactivate_lease_for_task_with_executor(&mut tx, task.task_id()).await?;
+            update_task_status_with_executor(&mut tx, task.task_id(), TaskStatus::Failed).await?;
+            insert_event(
+                &mut tx,
+                task.task_id(),
+                sequence,
+                KeryxEventType::TaskTimedOut,
+                Some(task.status),
+                TaskStatus::Failed,
+            )
+            .await?;
+            let mut updated = task;
+            updated.status = TaskStatus::Failed;
+            failed.push(updated);
+        }
+        tx.commit().await?;
+        Ok(failed)
+    }
+
+    async fn finish_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        to: TaskStatus,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        let updated = self
+            .finish_task_in_tx(
+                &mut tx,
+                task_id,
+                lease_id,
+                worker_id,
+                to,
+                task.retry_count,
+                task.dead_lettered,
+                task.dead_letter_reason.clone(),
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_task_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        to: TaskStatus,
+        retry_count: u32,
+        dead_lettered: bool,
+        dead_letter_reason: Option<String>,
+    ) -> StoreResult<TaskRecord> {
+        let task = fetch_task_with_executor(tx, task_id).await?;
+        let active = fetch_active_lease_with_executor(tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
+        let transition = validate_transition(task.status, to)?;
+        let sequence = next_sequence_with_executor(tx, task_id).await?;
+        deactivate_lease_for_task_with_executor(tx, task_id).await?;
+        update_task_metadata_with_executor(
+            tx,
+            task_id,
+            to,
+            retry_count,
+            dead_lettered,
+            dead_letter_reason.as_deref(),
+        )
+        .await?;
+        insert_event(
+            tx,
+            task_id,
+            sequence,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        )
+        .await?;
+        fetch_task_with_executor(tx, task_id).await
+    }
+
     pub async fn active_lease(&self, task_id: &TaskId) -> StoreResult<Option<LeaseRecord>> {
         let row = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE task_id = ? AND active = 1",
@@ -841,6 +1821,7 @@ impl SqliteStore {
         row.map(row_to_lease).transpose()
     }
 
+    #[instrument(skip(self))]
     pub async fn recover_stale_leases(
         &self,
         now_ms: i64,
@@ -869,8 +1850,30 @@ impl SqliteStore {
         let mut report = recover_sqlite_leases_with_executor(&mut tx, rows).await?;
         report.corrupted_tasks = collect_corrupt_sqlite_tasks_with_executor(&mut tx).await?;
         tx.commit().await?;
+        info!(
+            tasks_recovered = report.recovered_task_count(),
+            leases_cleaned = report.cleaned_terminal_leases,
+            corruption_count = report.corruption_count(),
+            "recover_stale_leases completed"
+        );
         Ok(report)
     }
+}
+
+async fn detect_sqlite_schema_version(pool: &SqlitePool) -> StoreResult<i64> {
+    let schema_table_exists = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if schema_table_exists.is_none() {
+        return Ok(0);
+    }
+
+    let row = sqlx::query("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get::<i64, _>("version"))
 }
 
 fn ensure_pending_accept(task: &TaskRecord) -> StoreResult<()> {
@@ -966,7 +1969,10 @@ fn ensure_valid_lease_expiry(
     now_ms: i64,
     new_expires_at_ms: i64,
 ) -> StoreResult<()> {
-    if new_expires_at_ms > now_ms && new_expires_at_ms > active.expires_at_ms {
+    if active.expires_at_ms > now_ms
+        && new_expires_at_ms > now_ms
+        && new_expires_at_ms > active.expires_at_ms
+    {
         Ok(())
     } else {
         Err(StoreError::InvalidLeaseExpiry {
@@ -1015,7 +2021,9 @@ async fn fetch_task_optional_with_executor(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     task_id: &TaskId,
 ) -> StoreResult<Option<TaskRecord>> {
-    let row = sqlx::query("SELECT task_id, status, idempotency_key FROM tasks WHERE task_id = ?")
+    let row = sqlx::query(
+        "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE task_id = ?",
+    )
         .bind(task_id.as_str())
         .fetch_optional(&mut **tx)
         .await?;
@@ -1074,11 +2082,9 @@ async fn recover_sqlite_leases_with_executor(
         .await?;
 
         if should_requeue {
-            recovered.push(TaskRecord::new(
-                lease.task_id,
-                to_status,
-                task.idempotency_key,
-            ));
+            let mut recovered_task = task;
+            recovered_task.status = to_status;
+            recovered.push(recovered_task);
         } else if task.status.is_terminal() {
             cleaned_terminal_leases += 1;
         }
@@ -1173,6 +2179,14 @@ fn replay_task_from_snapshot_and_events(
     }
 
     let mut current_status = first.to_status;
+    // `retry_count`, `dead_lettered`, and `dead_letter_reason` remain authoritative
+    // snapshot metadata for now. Replay only validates lifecycle sequencing plus the
+    // parts of retry/dead-letter state the event log can express unambiguously.
+    //
+    // Today retry-driven requeues and stale-lease recovery both persist as
+    // `RecoveryAction`, so the event stream cannot faithfully reconstruct the full
+    // retry counter without double-counting or conflating retry with recovery.
+    let mut replay_dead_lettered = false;
     for (index, event) in events.iter().enumerate().skip(1) {
         if event.task_id != snapshot.task_id().clone()
             || event.sequence != (index as u64) + 1
@@ -1192,6 +2206,37 @@ fn replay_task_from_snapshot_and_events(
                 }
                 current_status = transition.to;
             }
+            KeryxEventType::TaskCanceled => {
+                let transition = validate_cancel_transition(current_status)
+                    .map_err(|_| StoreError::CorruptEventStream(task_id.clone()))?;
+                if transition.to != event.to_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = transition.to;
+            }
+            KeryxEventType::TaskTimedOut => {
+                validate_deadline_transition(current_status)
+                    .map_err(|_| StoreError::CorruptEventStream(task_id.clone()))?;
+                if event.to_status != TaskStatus::Failed {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = event.to_status;
+            }
+            KeryxEventType::TaskLeased
+            | KeryxEventType::TaskDeadLettered
+            | KeryxEventType::TaskApprovalDenied => {
+                let legacy = LegacyEventType::from_keryx_event_type(event.event_type)
+                    .ok_or(StoreError::CorruptEventStream(task_id.clone()))?;
+                let transition = normalize_legacy_transition(current_status, legacy)
+                    .ok_or(StoreError::CorruptEventStream(task_id.clone()))?;
+                if transition.to != event.to_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                if event.event_type == KeryxEventType::TaskDeadLettered {
+                    replay_dead_lettered = true;
+                }
+                current_status = transition.to;
+            }
             KeryxEventType::RecoveryAction => {
                 let expected_to_status = match current_status {
                     TaskStatus::Running => TaskStatus::Pending,
@@ -1204,6 +2249,11 @@ fn replay_task_from_snapshot_and_events(
                 }
                 current_status = event.to_status;
             }
+            event_type if is_replayable_operational_legacy_event(event_type) => {
+                if event.to_status != current_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+            }
             _ => return Err(StoreError::CorruptEventStream(task_id)),
         }
     }
@@ -1211,8 +2261,71 @@ fn replay_task_from_snapshot_and_events(
     if snapshot.status != current_status {
         return Err(StoreError::CorruptEventStream(task_id));
     }
+    if snapshot.dead_lettered != replay_dead_lettered {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
+    if snapshot.dead_lettered && snapshot.retry_count == 0 {
+        return Err(StoreError::CorruptEventStream(task_id));
+    }
 
-    Ok(snapshot.clone())
+    let mut rebuilt = snapshot.clone();
+    rebuilt.status = current_status;
+    Ok(rebuilt)
+}
+
+async fn sqlite_retry_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    task: &TaskRecord,
+) -> StoreResult<TaskRecord> {
+    require_status(task.status, TaskStatus::Running)?;
+    let retry_count = task.retry_count.saturating_add(1);
+    let sequence = next_sequence_with_executor(tx, task_id).await?;
+    deactivate_lease_for_task_with_executor(tx, task_id).await?;
+    update_task_metadata_with_executor(tx, task_id, TaskStatus::Pending, retry_count, false, None)
+        .await?;
+    insert_event(
+        tx,
+        task_id,
+        sequence,
+        KeryxEventType::RecoveryAction,
+        Some(TaskStatus::Running),
+        TaskStatus::Pending,
+    )
+    .await?;
+    fetch_task_with_executor(tx, task_id).await
+}
+
+async fn sqlite_dead_letter_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    task: &TaskRecord,
+    reason: &str,
+) -> StoreResult<TaskRecord> {
+    require_status(task.status, TaskStatus::Running)?;
+    let retry_count = task.retry_count.saturating_add(1);
+    let transition = validate_transition(task.status, TaskStatus::Failed)?;
+    let sequence = next_sequence_with_executor(tx, task_id).await?;
+    deactivate_lease_for_task_with_executor(tx, task_id).await?;
+    update_task_metadata_with_executor(
+        tx,
+        task_id,
+        TaskStatus::Failed,
+        retry_count,
+        true,
+        Some(reason),
+    )
+    .await?;
+    insert_event(
+        tx,
+        task_id,
+        sequence,
+        KeryxEventType::TaskDeadLettered,
+        Some(transition.from),
+        transition.to,
+    )
+    .await?;
+    fetch_task_with_executor(tx, task_id).await
 }
 
 async fn next_sequence_with_executor(
@@ -1226,6 +2339,27 @@ async fn next_sequence_with_executor(
     .fetch_one(&mut **tx)
     .await?;
     Ok(row.get::<i64, _>("next_sequence") as u64)
+}
+
+async fn update_task_metadata_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+    status: TaskStatus,
+    retry_count: u32,
+    dead_lettered: bool,
+    dead_letter_reason: Option<&str>,
+) -> StoreResult<()> {
+    sqlx::query(
+        "UPDATE tasks SET status = ?, retry_count = ?, dead_lettered = ?, dead_letter_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+    )
+    .bind(status_to_str(status))
+    .bind(i64::from(retry_count))
+    .bind(i64::from(dead_lettered))
+    .bind(dead_letter_reason)
+    .bind(task_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn update_task_status_with_executor(
@@ -1291,7 +2425,22 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskRecord> {
         .try_get::<Option<String>, _>("idempotency_key")?
         .map(IdempotencyKey::new)
         .transpose()?;
-    Ok(TaskRecord::new(task_id, status, idempotency_key))
+    let retry_count = row
+        .try_get::<Option<i64>, _>("retry_count")?
+        .unwrap_or(0)
+        .max(0) as u32;
+    let dead_lettered = row.try_get::<Option<i64>, _>("dead_lettered")?.unwrap_or(0) != 0;
+    let dead_letter_reason = row.try_get::<Option<String>, _>("dead_letter_reason")?;
+    let deadline_ms = row.try_get::<Option<i64>, _>("deadline_ms")?;
+    Ok(TaskRecord {
+        id: task_id,
+        status,
+        idempotency_key,
+        deadline_ms,
+        retry_count,
+        dead_lettered,
+        dead_letter_reason,
+    })
 }
 
 fn row_to_lease(row: sqlx::sqlite::SqliteRow) -> StoreResult<LeaseRecord> {
@@ -1325,6 +2474,246 @@ fn row_to_event(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskEventRecord> {
     })
 }
 
+fn row_to_artifact(row: sqlx::sqlite::SqliteRow) -> StoreResult<ArtifactRecord> {
+    Ok(ArtifactRecord {
+        artifact_id: ArtifactId::new(row.get::<String, _>("artifact_id"))?,
+        task_id: TaskId::new(row.get::<String, _>("task_id"))?,
+        digest: Digest::new(row.get::<String, _>("digest"))?,
+        media_type: MediaType::new(row.get::<String, _>("media_type")),
+        byte_len: row.get::<i64, _>("byte_len").max(0) as u64,
+        inline: row.get::<i64, _>("inline") != 0,
+        created_at: row.get::<String, _>("created_at"),
+    })
+}
+
+fn artifact_record_from_meta(
+    meta: &keryx_core::ArtifactMeta,
+    digest: Digest,
+    byte_len: u64,
+) -> ArtifactRecord {
+    ArtifactRecord {
+        artifact_id: meta.artifact_id.clone(),
+        task_id: meta.task_id.clone(),
+        digest,
+        media_type: meta.media_type.clone(),
+        byte_len,
+        inline: should_inline(byte_len),
+        created_at: meta.created_at.clone(),
+    }
+}
+
+fn map_artifact_validation_error(error: ValidationError) -> StoreError {
+    match error {
+        ValidationError::ArtifactTooLarge {
+            byte_len,
+            limit_bytes,
+        } => StoreError::ArtifactTooLarge {
+            byte_len,
+            limit_bytes,
+        },
+        other => StoreError::Validation(other),
+    }
+}
+
+fn blob_path(blob_dir: &Path, digest: &Digest) -> PathBuf {
+    blob_dir.join(digest.as_str())
+}
+
+fn ensure_blob_dir(blob_dir: &Path) -> StoreResult<()> {
+    std::fs::create_dir_all(blob_dir)
+        .map_err(|error| StoreError::BlobDir(format!("{}: {error}", blob_dir.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(blob_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| StoreError::BlobDir(format!("{}: {error}", blob_dir.display())))?;
+    }
+    Ok(())
+}
+
+fn remove_blob_file_if_present(path: &Path) -> StoreResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Database(error.to_string())),
+    }
+}
+
+fn drop_in_memory_artifact_association(
+    state: &mut InMemoryState,
+    existing: &ArtifactRecord,
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    if existing.inline {
+        state.inline_artifacts.remove(&existing.artifact_id);
+    } else {
+        decrement_in_memory_blob_ref(state, &existing.digest, blob_dir)?;
+    }
+    Ok(())
+}
+
+fn decrement_in_memory_blob_ref(
+    state: &mut InMemoryState,
+    digest: &Digest,
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    let mut remove_file = false;
+    match state.blobs.get_mut(digest) {
+        Some((_, ref_count)) if *ref_count > 1 => *ref_count -= 1,
+        Some(_) => {
+            state.blobs.remove(digest);
+            remove_file = true;
+        }
+        None => {}
+    }
+    if remove_file {
+        remove_blob_file_if_present(&blob_path(blob_dir, digest))?;
+    }
+    Ok(())
+}
+
+async fn fetch_artifact_optional_from_pool(
+    pool: &SqlitePool,
+    artifact_id: &ArtifactId,
+) -> StoreResult<Option<ArtifactRecord>> {
+    let row = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE artifact_id = ?",
+    )
+    .bind(artifact_id.as_str())
+    .fetch_optional(pool)
+    .await?;
+    row.map(row_to_artifact).transpose()
+}
+
+async fn fetch_artifact_optional_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact_id: &ArtifactId,
+) -> StoreResult<Option<ArtifactRecord>> {
+    let row = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE artifact_id = ?",
+    )
+    .bind(artifact_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(row_to_artifact).transpose()
+}
+
+#[derive(Debug)]
+struct PreparedBlobWrite {
+    path: PathBuf,
+    remove_on_rollback: bool,
+}
+
+fn should_drop_blob_association(existing: &ArtifactRecord, replacement: &ArtifactRecord) -> bool {
+    !existing.inline && (replacement.inline || existing.digest != replacement.digest)
+}
+
+fn should_write_blob_association(
+    existing: Option<&ArtifactRecord>,
+    replacement: &ArtifactRecord,
+) -> bool {
+    !replacement.inline
+        && existing
+            .map(|existing| existing.inline || existing.digest != replacement.digest)
+            .unwrap_or(true)
+}
+
+fn should_prepare_blob_write(
+    existing: Option<&ArtifactRecord>,
+    replacement: &ArtifactRecord,
+) -> bool {
+    should_write_blob_association(existing, replacement)
+}
+
+async fn prepare_blob_write_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+    bytes: &[u8],
+    blob_dir: &Path,
+) -> StoreResult<PreparedBlobWrite> {
+    let blob_previously_tracked = sqlx::query("SELECT 1 FROM blobs WHERE digest = ? LIMIT 1")
+        .bind(digest.as_str())
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some();
+    let path = blob_path(blob_dir, digest);
+    ensure_blob_dir(blob_dir)?;
+    if !blob_previously_tracked || !path.exists() {
+        std::fs::write(&path, bytes)?;
+    }
+    Ok(PreparedBlobWrite {
+        path,
+        remove_on_rollback: !blob_previously_tracked,
+    })
+}
+
+fn rollback_prepared_blob_write(prepared_blob: Option<&PreparedBlobWrite>) -> StoreResult<()> {
+    if let Some(prepared_blob) =
+        prepared_blob.filter(|prepared_blob| prepared_blob.remove_on_rollback)
+    {
+        remove_blob_file_if_present(&prepared_blob.path)?;
+    }
+    Ok(())
+}
+
+async fn increment_blob_ref_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+    byte_len: u64,
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO blobs (digest, ref_count, byte_len) VALUES (?, 1, ?) ON CONFLICT(digest) DO UPDATE SET ref_count = ref_count + 1, byte_len = excluded.byte_len",
+    )
+    .bind(digest.as_str())
+    .bind(byte_len as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn decrement_blob_ref_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    digest: &Digest,
+) -> StoreResult<bool> {
+    let row = sqlx::query("SELECT ref_count FROM blobs WHERE digest = ?")
+        .bind(digest.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let ref_count = row.get::<i64, _>("ref_count");
+    if ref_count > 1 {
+        sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE digest = ?")
+            .bind(digest.as_str())
+            .execute(&mut **tx)
+            .await?;
+        return Ok(false);
+    }
+
+    sqlx::query("UPDATE blobs SET ref_count = 0 WHERE digest = ?")
+        .bind(digest.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(true)
+}
+
+async fn finalize_blob_cleanup(
+    pool: &SqlitePool,
+    cleanup_digests: &[Digest],
+    blob_dir: &Path,
+) -> StoreResult<()> {
+    for digest in cleanup_digests {
+        remove_blob_file_if_present(&blob_path(blob_dir, digest))?;
+        sqlx::query("DELETE FROM blobs WHERE digest = ? AND ref_count = 0")
+            .bind(digest.as_str())
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 const MIGRATION_001: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY)",
@@ -1344,6 +2733,27 @@ const MIGRATION_001: &[&str] = &[
 
 const MIGRATION_002: &[&str] = &["ALTER TABLE leases ADD COLUMN worker_id TEXT"];
 
+const MIGRATION_003: &[&str] = &[
+    "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN dead_lettered INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN dead_letter_reason TEXT",
+];
+
+const MIGRATION_004: &[&str] = &[
+    "DROP TABLE IF EXISTS artifacts",
+    "DROP TABLE IF EXISTS blobs",
+    "CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, digest TEXT NOT NULL, media_type TEXT NOT NULL DEFAULT 'application/octet-stream', byte_len INTEGER NOT NULL, inline INTEGER NOT NULL DEFAULT 0, inline_blob BLOB, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (task_id) REFERENCES tasks(task_id))",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_digest ON artifacts(digest)",
+    "CREATE TABLE blobs (digest TEXT PRIMARY KEY, ref_count INTEGER NOT NULL DEFAULT 0, byte_len INTEGER NOT NULL)",
+    "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (4, 'artifact_storage')",
+];
+
+const MIGRATION_005: &[&str] = &[
+    "ALTER TABLE tasks ADD COLUMN deadline_ms INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline_ms)",
+];
+
 const fn status_to_str(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Pending => "pending",
@@ -1355,9 +2765,10 @@ const fn status_to_str(status: TaskStatus) -> &'static str {
 
 fn str_to_status(value: &str) -> StoreResult<TaskStatus> {
     match value {
-        "created" | "accepted" | "queued" | "awaiting_approval" | "pending" => {
-            Ok(TaskStatus::Pending)
-        }
+        "created" | "accepted" | "queued" | "pending" => Ok(TaskStatus::Pending),
+        "awaiting_approval" => Err(StoreError::Database(
+            "legacy awaiting_approval task status requires explicit approval migration".to_string(),
+        )),
         "leased" | "awaiting_input" | "running" => Ok(TaskStatus::Running),
         "completed" => Ok(TaskStatus::Completed),
         "failed" | "canceled" | "timed_out" | "rejected" | "dead_lettered" => {
@@ -1413,7 +2824,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+    use keryx_core::{
+        AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus, ValidationError,
+    };
 
     use super::{
         append_in_memory_event, InMemoryState, InMemoryStore, LeaseRecord, StoreError, TaskRecord,
@@ -1453,6 +2866,9 @@ mod tests {
                 task.task_id().clone(),
                 lease(task.task_id(), "terminal-lease", "terminal-worker", 500),
             )]),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -1509,6 +2925,9 @@ mod tests {
                 events: HashMap::new(),
                 idempotency: HashMap::new(),
                 leases: HashMap::new(),
+                artifacts: HashMap::new(),
+                inline_artifacts: HashMap::new(),
+                blobs: HashMap::new(),
             }),
         };
 
@@ -1536,6 +2955,9 @@ mod tests {
             events: HashMap::new(),
             idempotency: HashMap::new(),
             leases: HashMap::new(),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -1555,5 +2977,112 @@ mod tests {
         let report = store.recover_stale_leases(0, None).unwrap();
         assert_eq!(report.corruption_count(), 1);
         assert_eq!(report.corrupted_tasks, vec![task.task_id().clone()]);
+    }
+
+    #[test]
+    fn in_memory_replay_rejects_dead_lettered_snapshot_without_retry_count() {
+        let mut task = task(
+            "dead-letter-without-retry-task",
+            TaskStatus::Failed,
+            Some("dead-letter-without-retry-idem"),
+        );
+        task.dead_lettered = true;
+        task.dead_letter_reason = Some("still broken".to_owned());
+        let mut state = InMemoryState {
+            tasks: HashMap::from([(task.task_id().clone(), task.clone())]),
+            events: HashMap::new(),
+            idempotency: HashMap::new(),
+            leases: HashMap::new(),
+            artifacts: HashMap::new(),
+            inline_artifacts: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskAccepted,
+            None,
+            TaskStatus::Pending,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskStarted,
+            Some(TaskStatus::Pending),
+            TaskStatus::Running,
+        );
+        append_in_memory_event(
+            &mut state,
+            task.task_id(),
+            KeryxEventType::TaskDeadLettered,
+            Some(TaskStatus::Running),
+            TaskStatus::Failed,
+        );
+        let store = InMemoryStore {
+            inner: Mutex::new(state),
+        };
+
+        assert_eq!(
+            store.replay_task(task.task_id()).unwrap_err(),
+            StoreError::CorruptEventStream(task.task_id().clone())
+        );
+    }
+
+    fn accepted_task(id: &str) -> TaskRecord {
+        task(id, TaskStatus::Pending, Some("legacy-idem"))
+    }
+
+    #[test]
+    fn accept_legacy_event_normalizes_task_leased_to_running_with_task_started_event() {
+        let accepted = accepted_task("legacy-lease-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let updated = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskLeased)
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Running);
+
+        let events = store.events_for_task(accepted.task_id()).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, KeryxEventType::TaskStarted);
+        assert_eq!(last.from_status, Some(TaskStatus::Pending));
+        assert_eq!(last.to_status, TaskStatus::Running);
+        assert!(store.replay_task(accepted.task_id()).is_ok());
+    }
+
+    #[test]
+    fn accept_legacy_event_appends_operational_task_queued_without_status_change() {
+        let accepted = accepted_task("legacy-queued-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let updated = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskQueued)
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Pending);
+
+        let events = store.events_for_task(accepted.task_id()).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, KeryxEventType::TaskQueued);
+        assert!(store.replay_task(accepted.task_id()).is_ok());
+    }
+
+    #[test]
+    fn accept_legacy_event_rejects_unknown_status_combination() {
+        let accepted = accepted_task("legacy-invalid-task");
+        let store = InMemoryStore::default();
+        store.accept_task(accepted.clone()).unwrap();
+
+        let err = store
+            .accept_legacy_event(accepted.task_id(), KeryxEventType::TaskTimedOut)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StoreError::Validation(ValidationError::InvalidTaskTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            })
+        );
     }
 }

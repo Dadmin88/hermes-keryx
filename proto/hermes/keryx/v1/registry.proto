@@ -1,0 +1,55 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+import "hermes/keryx/v1/common.proto";
+
+message SkillInfo {
+  string skill_id = 1;
+  string description = 2;
+  repeated string tags = 3;
+}
+
+message Registration {
+  string peer_id = 1;
+  repeated SkillInfo skills = 2;
+  string name = 3;
+  string description = 4;
+  Timestamp expires_at = 5;
+}
+
+message RegisterSkillsRequest {
+  string peer_id = 1;
+  repeated SkillInfo skills = 2;
+  string name = 3;
+  string description = 4;
+  uint64 ttl_seconds = 5;
+}
+
+message RegisterSkillsResponse {
+  bool accepted = 1;
+}
+
+message UnregisterSkillsRequest {
+  string peer_id = 1;
+  repeated string skill_ids = 2;
+}
+
+message UnregisterSkillsResponse {
+  bool accepted = 1;
+}
+
+message DiscoverBySkillRequest {
+  string skill_id = 1;
+  repeated string tags = 2;
+  uint32 limit = 3;
+}
+
+message DiscoverBySkillResponse {
+  repeated Registration registrations = 1;
+}
+
+service RegistryService {
+  rpc RegisterSkills(RegisterSkillsRequest) returns (RegisterSkillsResponse);
+  rpc UnregisterSkills(UnregisterSkillsRequest) returns (UnregisterSkillsResponse);
+  rpc DiscoverBySkill(DiscoverBySkillRequest) returns (DiscoverBySkillResponse);
+}

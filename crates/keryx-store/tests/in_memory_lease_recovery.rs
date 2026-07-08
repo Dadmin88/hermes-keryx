@@ -1,4 +1,6 @@
-use keryx_core::{AgentId, IdempotencyKey, KeryxEventType, LeaseId, TaskId, TaskStatus};
+use keryx_core::{
+    AgentId, IdempotencyKey, KeryxEventType, LeaseId, RetryPolicy, TaskId, TaskStatus,
+};
 use keryx_store::{InMemoryStore, LeaseRecord, TaskRecord, TaskStore};
 
 fn task(id: &str, status: TaskStatus, idem: Option<&str>) -> TaskRecord {
@@ -247,6 +249,8 @@ fn in_memory_stale_tokens_are_rejected_after_recovery_and_reissue() {
                 record.task_id(),
                 &first_lease.lease_id,
                 first_lease.worker_id.as_ref().unwrap(),
+                "",
+                &RetryPolicy::no_retries(),
             )
             .unwrap_err(),
         keryx_store::StoreError::LeaseNotFound(record.task_id().clone())
@@ -291,6 +295,8 @@ fn in_memory_stale_tokens_are_rejected_after_recovery_and_reissue() {
                 record.task_id(),
                 &first_lease.lease_id,
                 first_lease.worker_id.as_ref().unwrap(),
+                "",
+                &RetryPolicy::no_retries(),
             )
             .unwrap_err(),
         keryx_store::StoreError::LeaseMismatch {

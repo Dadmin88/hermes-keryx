@@ -72,6 +72,23 @@ pub enum KeryxEventType {
     RecoveryAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCancellationEventType {
+    CancelRequested,
+    Canceled,
+}
+
+impl TaskCancellationEventType {
+    #[must_use]
+    pub const fn lifecycle_event_type(self) -> Option<KeryxEventType> {
+        match self {
+            Self::CancelRequested => None,
+            Self::Canceled => Some(KeryxEventType::TaskCanceled),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTransition {
     pub from: TaskStatus,
@@ -84,6 +101,10 @@ pub struct Task {
     id: TaskId,
     status: TaskStatus,
     assignee: Option<PeerId>,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    dead_lettered: bool,
 }
 
 impl Task {
@@ -92,6 +113,8 @@ impl Task {
             id,
             status: TaskStatus::Pending,
             assignee: None,
+            retry_count: 0,
+            dead_lettered: false,
         }
     }
 
@@ -100,6 +123,8 @@ impl Task {
             id,
             status: TaskStatus::Pending,
             assignee: Some(assignee),
+            retry_count: 0,
+            dead_lettered: false,
         }
     }
 
@@ -116,6 +141,24 @@ impl Task {
     #[must_use]
     pub fn assignee(&self) -> Option<&PeerId> {
         self.assignee.as_ref()
+    }
+
+    #[must_use]
+    pub const fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    #[must_use]
+    pub const fn dead_lettered(&self) -> bool {
+        self.dead_lettered
+    }
+
+    pub fn set_retry_count(&mut self, retry_count: u32) {
+        self.retry_count = retry_count;
+    }
+
+    pub fn set_dead_lettered(&mut self, dead_lettered: bool) {
+        self.dead_lettered = dead_lettered;
     }
 
     pub fn transition_to(&mut self, next: TaskStatus) -> Result<TaskTransition, KeryxCoreError> {
@@ -135,6 +178,37 @@ impl Task {
     pub fn mark_failed(&mut self) -> Result<TaskTransition, KeryxCoreError> {
         self.transition_to(TaskStatus::Failed)
     }
+
+    pub fn mark_canceled(&mut self) -> Result<TaskTransition, KeryxCoreError> {
+        let transition = validate_cancel_transition(self.status)?;
+        self.status = transition.to;
+        Ok(transition)
+    }
+}
+
+#[must_use]
+pub const fn is_cancel_applicable(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Pending | TaskStatus::Running)
+}
+
+pub fn event_for_cancel_transition(from: TaskStatus) -> Result<KeryxEventType, KeryxCoreError> {
+    if is_cancel_applicable(from) {
+        Ok(KeryxEventType::TaskCanceled)
+    } else {
+        Err(KeryxCoreError::Validation(
+            ValidationError::CancelNotApplicable { status: from },
+        ))
+    }
+}
+
+pub fn validate_cancel_transition(from: TaskStatus) -> Result<TaskTransition, KeryxCoreError> {
+    let event_type = event_for_cancel_transition(from)?;
+
+    Ok(TaskTransition {
+        from,
+        to: TaskStatus::Failed,
+        event_type,
+    })
 }
 
 #[must_use]

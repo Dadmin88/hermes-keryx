@@ -9,6 +9,18 @@ service KeryxRelay {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc PublishTask(PublishTaskRequest) returns (PublishTaskResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool healthy = 1;
+  uint64 connected_peers = 2;
+  uint64 registry_size = 3;
+  uint64 uptime_seconds = 4;
+  string transport_status = 5;
+  uint64 tasks_routed = 6;
+  string local_peer_id = 7;
 }
 
 message NodeFrame { string frame_id = 1; TaskEnvelope task = 2; }

@@ -1,9 +1,28 @@
 syntax = "proto3";
 package hermes.keryx.v1;
 
+import "hermes/keryx/v1/common.proto";
+import "hermes/keryx/v1/task.proto";
+import "hermes/keryx/v1/registry.proto";
+
 service KeryxDaemon {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Doctor(DoctorRequest) returns (DoctorResponse);
+  rpc Liveness(LivenessRequest) returns (LivenessResponse);
+  rpc Readiness(ReadinessRequest) returns (ReadinessResponse);
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc ClaimTask(ClaimTaskRequest) returns (ClaimTaskResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc PutArtifact(PutArtifactRequest) returns (PutArtifactResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+  rpc SendTask(SendTaskRequest) returns (SendTaskResponse);
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  rpc DiscoverSkills(DiscoverSkillsRequest) returns (DiscoverSkillsResponse);
 }
 
 message StatusRequest {}
@@ -12,12 +31,241 @@ message StatusResponse {
   string data_dir = 2;
   string db_path = 3;
   int64 schema_version = 4;
+  int64 supported_schema_version = 11;
   uint64 recovered_tasks = 5;
   uint64 cleaned_terminal_leases = 6;
   uint64 corruption_count = 7;
+  uint64 startup_recovery_duration_ms = 12;
   string store_kind = 8;
   bool store_ready = 9;
   string store_path = 10;
+  uint64 tasks_submitted = 13;
+  uint64 tasks_claimed = 14;
+  uint64 tasks_completed = 15;
+  uint64 tasks_failed = 16;
+  uint64 heartbeats = 17;
+  uint64 leases_recovered = 18;
+  uint64 recovery_ticks = 19;
+  int64 active_leases = 20;
+  uint64 dead_letters = 21;
+  uint64 max_pending_tasks = 22;
+  uint64 max_envelope_bytes = 23;
+  optional uint64 current_pending_tasks = 24;
+  repeated string warnings = 25;
+  uint64 cancel_requests = 26;
+  uint64 tasks_canceled = 27;
+  uint64 deadline_ticks = 28;
+  uint64 deadline_failures = 29;
+  int64 last_deadline_scan_ms = 30;
+  uint64 last_deadline_failures = 31;
+  uint64 deadline_enforcement_interval_ms = 32;
 }
 message DoctorRequest {}
 message DoctorResponse { string status = 1; repeated string messages = 2; }
+
+message LivenessRequest {}
+message LivenessResponse { bool alive = 1; }
+
+message ReadinessRequest {}
+message ReadinessResponse {
+  bool ready = 1;
+  repeated string not_ready_reasons = 2;
+}
+
+message SubmitTaskRequest { TaskEnvelope envelope = 1; }
+message SubmitTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+}
+
+message ClaimTaskRequest {
+  TaskId task_id = 1;
+  AgentId worker_id = 2;
+  // When zero, the daemon applies a default lease TTL.
+  int64 lease_duration_ms = 3;
+}
+
+message ClaimTaskResponse {
+  TaskId task_id = 1;
+  LeaseId lease_id = 2;
+  AgentId worker_id = 3;
+  int64 leased_at_ms = 4;
+  int64 expires_at_ms = 5;
+  string status = 6;
+  uint32 retry_count = 7;
+  bool dead_lettered = 8;
+}
+
+message HeartbeatRequest {
+  TaskId task_id = 1;
+  LeaseId lease_id = 2;
+  AgentId worker_id = 3;
+  // Extends the lease so it expires at now + lease_duration_ms.
+  int64 lease_duration_ms = 4;
+}
+
+message HeartbeatResponse {
+  LeaseId lease_id = 1;
+  int64 expires_at_ms = 2;
+}
+
+message TaskArtifact {
+  string path = 1;
+  string media_type = 2;
+  map<string, string> metadata = 3;
+}
+
+message CompleteTaskRequest {
+  TaskId task_id = 1;
+  LeaseId lease_id = 2;
+  AgentId worker_id = 3;
+  int64 duration_ms = 4;
+  map<string, string> result_metadata = 5;
+  repeated TaskArtifact output_artifacts = 6;
+}
+
+message CompleteTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+  int64 duration_ms = 3;
+  map<string, string> result_metadata = 4;
+  repeated TaskArtifact output_artifacts = 5;
+}
+
+message FailTaskRequest {
+  TaskId task_id = 1;
+  LeaseId lease_id = 2;
+  AgentId worker_id = 3;
+  int64 duration_ms = 4;
+  string error_reason = 5;
+  map<string, string> failure_metadata = 6;
+}
+
+message FailTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+  int64 duration_ms = 3;
+  string error_reason = 4;
+  map<string, string> failure_metadata = 5;
+  uint32 retry_count = 6;
+  bool dead_lettered = 7;
+}
+
+message CancelTaskRequest {
+  TaskId task_id = 1;
+  string reason = 2;
+  map<string, string> metadata = 3;
+}
+
+message CancelTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+  string reason = 3;
+  bool canceled = 4;
+}
+
+message SendTaskRequest {
+  // Destination peer (local node id or remote relay peer).
+  string target_peer_id = 1;
+  TaskEnvelope envelope = 2;
+  // When zero, the daemon applies a default delivery timeout.
+  int64 timeout_ms = 3;
+}
+
+message SendTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+  string routed_to = 3;
+  string delivery_route = 4;
+}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated PeerDescriptor peers = 1;
+}
+
+message PeerDescriptor {
+  string peer_id = 1;
+  bool connected = 2;
+  bool local = 3;
+}
+
+message DiscoverSkillsRequest {
+  string skill_id = 1;
+  repeated string tags = 2;
+  uint32 limit = 3;
+}
+
+message DiscoverSkillsResponse {
+  repeated Registration registrations = 1;
+}
+
+// --- Artifact RPCs ---
+
+message PutArtifactRequest {
+  TaskId task_id = 1;
+  // Caller-provided artifact id. If empty, daemon generates a UUID.
+  ArtifactId artifact_id = 2;
+  // IANA media type (e.g. "application/json").
+  string media_type = 3;
+  // Raw artifact bytes. Max 256 MiB.
+  bytes content = 4;
+}
+
+message PutArtifactResponse {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  // SHA-256 hex digest computed by the daemon/store.
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+}
+
+message GetArtifactRequest {
+  ArtifactId artifact_id = 1;
+  // If true, return only metadata (no bytes). Default false.
+  bool metadata_only = 2;
+}
+
+message GetArtifactResponse {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+  // Empty when metadata_only=true or artifact is zero-length.
+  bytes content = 8;
+}
+
+message ListArtifactsRequest {
+  // List all artifacts for this task.
+  TaskId task_id = 1;
+}
+
+message ListArtifactsResponse {
+  repeated ArtifactSummary artifacts = 1;
+}
+
+message ArtifactSummary {
+  ArtifactId artifact_id = 1;
+  TaskId task_id = 2;
+  string digest = 3;
+  string media_type = 4;
+  uint64 byte_len = 5;
+  bool inline = 6;
+  string created_at = 7;
+}
+
+message DeleteArtifactRequest {
+  ArtifactId artifact_id = 1;
+}
+
+message DeleteArtifactResponse {
+  // True if the artifact existed and was deleted. False if not found (idempotent).
+  bool deleted = 1;
+}
