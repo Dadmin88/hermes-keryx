@@ -3,9 +3,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
-use keryx_proto::v1::{HealthRequest, HealthResponse};
+use keryx_proto::v1::{
+    AckTaskRequest, AckTaskResponse, HealthRequest, HealthResponse, NodeFrame, PublishTaskRequest,
+    PublishTaskResponse, RegisterNodeRequest, RegisterNodeResponse, RelayFrame, TaskEnvelope,
+};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
@@ -13,6 +18,21 @@ use tonic::{Request, Response, Status};
 use crate::health::RelayHealthReport;
 use crate::registry::SkillRegistry;
 use crate::runtime::RelayRuntime;
+
+/// gRPC metadata key used by `ConnectNode` to identify the streaming node.
+pub const NODE_ID_METADATA_KEY: &str = "x-keryx-node-id";
+
+const RELAY_STREAM_BUFFER: usize = 128;
+const TARGET_NODE_METADATA_KEYS: &[&str] = &[
+    "target_node_id",
+    "target_node",
+    "recipient_node_id",
+    "recipient_node",
+    "destination_node_id",
+    "destination_node",
+    "node_id",
+    "keryx.target_node_id",
+];
 
 pub struct RelayHealthService {
     runtime: Arc<RelayRuntime>,
@@ -51,36 +71,104 @@ impl KeryxRelay for RelayHealthService {
 
     async fn connect_node(
         &self,
-        _request: Request<tonic::Streaming<keryx_proto::v1::NodeFrame>>,
+        request: Request<tonic::Streaming<NodeFrame>>,
     ) -> Result<Response<Self::ConnectNodeStream>, Status> {
-        Err(Status::unimplemented(
-            "ConnectNode arrives in a later phase",
-        ))
+        let node_id = node_id_from_metadata(&request)?;
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
+
+        let pending = self.runtime.connect_node(node_id.clone(), tx.clone());
+        for frame in pending {
+            if tx.try_send(Ok(frame.clone())).is_err() {
+                self.runtime.route_frame(node_id.clone(), frame);
+            }
+        }
+
+        let runtime = Arc::clone(&self.runtime);
+        let source_node_id = node_id.clone();
+        tokio::spawn(async move {
+            while let Some(next) = inbound.next().await {
+                match next {
+                    Ok(frame) => {
+                        if let Err(err) = route_node_frame(&runtime, frame) {
+                            tracing::warn!(
+                                source_node_id = %source_node_id,
+                                error = %err,
+                                "dropping malformed node relay frame"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            source_node_id = %source_node_id,
+                            error = %err,
+                            "node relay stream ended with error"
+                        );
+                        break;
+                    }
+                }
+            }
+            runtime.disconnect_node(&source_node_id);
+        });
+
+        tracing::debug!(%node_id, "node connected to relay stream");
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn register_node(
         &self,
-        _request: Request<keryx_proto::v1::RegisterNodeRequest>,
-    ) -> Result<Response<keryx_proto::v1::RegisterNodeResponse>, Status> {
-        Err(Status::unimplemented(
-            "RegisterNode arrives in a later phase",
-        ))
+        request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        let request = request.into_inner();
+        let node_id = request
+            .node_id
+            .as_ref()
+            .map(|node_id| node_id.value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::invalid_argument("RegisterNode requires node_id"))?;
+        self.runtime.register_node(node_id.to_string());
+        Ok(Response::new(RegisterNodeResponse { accepted: true }))
     }
 
     async fn publish_task(
         &self,
-        _request: Request<keryx_proto::v1::PublishTaskRequest>,
-    ) -> Result<Response<keryx_proto::v1::PublishTaskResponse>, Status> {
-        Err(Status::unimplemented(
-            "PublishTask arrives in a later phase",
-        ))
+        request: Request<PublishTaskRequest>,
+    ) -> Result<Response<PublishTaskResponse>, Status> {
+        let task = request
+            .into_inner()
+            .task
+            .ok_or_else(|| Status::invalid_argument("PublishTask requires task"))?;
+        let target_node_id = target_node_id_from_task(&task)?;
+        let task_id = task
+            .task_id
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("PublishTask requires task.task_id"))?;
+        if task_id.value.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "PublishTask requires non-empty task.task_id",
+            ));
+        }
+
+        let frame = RelayFrame {
+            frame_id: frame_id_for_task(&task),
+            task: Some(task),
+        };
+        self.runtime.route_frame(target_node_id, frame);
+        Ok(Response::new(PublishTaskResponse {
+            task_id: Some(task_id),
+        }))
     }
 
     async fn ack_task(
         &self,
-        _request: Request<keryx_proto::v1::AckTaskRequest>,
-    ) -> Result<Response<keryx_proto::v1::AckTaskResponse>, Status> {
-        Err(Status::unimplemented("AckTask arrives in a later phase"))
+        request: Request<AckTaskRequest>,
+    ) -> Result<Response<AckTaskResponse>, Status> {
+        let task_id = request
+            .into_inner()
+            .task_id
+            .ok_or_else(|| Status::invalid_argument("AckTask requires task_id"))?;
+        let accepted = self.runtime.ack_task(task_id.value.trim());
+        Ok(Response::new(AckTaskResponse { accepted }))
     }
 
     async fn health(
@@ -99,6 +187,74 @@ impl KeryxRelay for RelayHealthService {
             local_peer_id: report.local_peer_id,
         }))
     }
+}
+
+fn node_id_from_metadata<T>(request: &Request<T>) -> Result<String, Status> {
+    request
+        .metadata()
+        .get(NODE_ID_METADATA_KEY)
+        .ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "ConnectNode requires {NODE_ID_METADATA_KEY} metadata"
+            ))
+        })?
+        .to_str()
+        .map(str::trim)
+        .map(str::to_string)
+        .map_err(|_| Status::invalid_argument("ConnectNode node metadata must be ASCII"))
+        .and_then(|value| {
+            if value.is_empty() {
+                Err(Status::invalid_argument(
+                    "ConnectNode node id cannot be empty",
+                ))
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn route_node_frame(runtime: &RelayRuntime, frame: NodeFrame) -> Result<(), Status> {
+    let task = frame
+        .task
+        .ok_or_else(|| Status::invalid_argument("NodeFrame requires task"))?;
+    let target_node_id = target_node_id_from_task(&task)?;
+    let relay_frame = RelayFrame {
+        frame_id: if frame.frame_id.trim().is_empty() {
+            frame_id_for_task(&task)
+        } else {
+            frame.frame_id
+        },
+        task: Some(task),
+    };
+    runtime.route_frame(target_node_id, relay_frame);
+    Ok(())
+}
+
+fn target_node_id_from_task(task: &TaskEnvelope) -> Result<String, Status> {
+    TARGET_NODE_METADATA_KEYS
+        .iter()
+        .find_map(|key| task.metadata.get(*key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "task metadata must include one of: {}",
+                TARGET_NODE_METADATA_KEYS.join(", ")
+            ))
+        })
+}
+
+fn frame_id_for_task(task: &TaskEnvelope) -> String {
+    task.metadata
+        .get("frame_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            task.task_id
+                .as_ref()
+                .map(|task_id| format!("relay-{}", task_id.value))
+        })
+        .unwrap_or_else(|| "relay-frame".to_string())
 }
 
 /// Bind and serve the relay gRPC surface (health RPC today; other RPCs stubbed).

@@ -10,9 +10,9 @@ use std::{
 
 use keryx_core::{
     is_valid_operational_legacy, normalize_legacy_transition, should_inline,
-    validate_artifact_size, validate_transition, AgentId, ArtifactId, CanonicalTransition, Digest,
-    IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId, LegacyEventType, MediaType,
-    RetryPolicy, TaskId, TaskStatus, ValidationError,
+    validate_artifact_size, validate_cancel_transition, validate_transition, AgentId, ArtifactId,
+    CanonicalTransition, Digest, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId,
+    LegacyEventType, MediaType, RetryPolicy, TaskId, TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
@@ -101,13 +101,14 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     id: TaskId,
     pub status: TaskStatus,
     pub idempotency_key: Option<IdempotencyKey>,
+    pub deadline_ms: Option<i64>,
     pub retry_count: u32,
     pub dead_lettered: bool,
     pub dead_letter_reason: Option<String>,
@@ -124,6 +125,7 @@ impl TaskRecord {
             id,
             status,
             idempotency_key,
+            deadline_ms: None,
             retry_count: 0,
             dead_lettered: false,
             dead_letter_reason: None,
@@ -327,6 +329,22 @@ fn is_replayable_operational_legacy_event(event_type: KeryxEventType) -> bool {
     )
 }
 
+fn validate_deadline_transition(from: TaskStatus) -> StoreResult<()> {
+    match from {
+        TaskStatus::Pending | TaskStatus::Running => Ok(()),
+        TaskStatus::Completed | TaskStatus::Failed => Err(StoreError::Validation(
+            ValidationError::TerminalTaskTransition {
+                from,
+                to: TaskStatus::Failed,
+            },
+        )),
+    }
+}
+
+fn ensure_active_lease_unexpired(active: &LeaseRecord, now_ms: i64) -> StoreResult<()> {
+    ensure_valid_lease_expiry(active, now_ms, active.expires_at_ms.saturating_add(1))
+}
+
 impl InMemoryStore {
     fn lock(&self) -> StoreResult<std::sync::MutexGuard<'_, InMemoryState>> {
         self.inner.lock().map_err(|_| StoreError::LockPoisoned)
@@ -468,6 +486,94 @@ impl InMemoryStore {
             .cloned()
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         self.dead_letter_task_in_state(&mut state, task_id, &active, task, reason)
+    }
+
+    pub fn cancel_task(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+    ) -> StoreResult<TaskRecord> {
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        if task.status.is_terminal() {
+            return Ok(task);
+        }
+        if task.status == TaskStatus::Running {
+            let active = state
+                .leases
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        let mut updated = task;
+        updated.status = transition.to;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            &mut state,
+            task_id,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), updated.clone());
+        Ok(updated)
+    }
+
+    pub fn fail_expired_deadlines(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let mut state = self.lock()?;
+        let mut expired: Vec<(i64, TaskId)> = state
+            .tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+            .filter_map(|task| {
+                task.deadline_ms
+                    .filter(|deadline_ms| *deadline_ms <= now_ms)
+                    .map(|deadline_ms| (deadline_ms, task.task_id().clone()))
+            })
+            .collect();
+        expired.sort_by(|(left_deadline, left_id), (right_deadline, right_id)| {
+            left_deadline
+                .cmp(right_deadline)
+                .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+        });
+        if let Some(limit) = limit {
+            expired.truncate(limit);
+        }
+
+        let mut failed = Vec::with_capacity(expired.len());
+        for (_, expired_task_id) in expired {
+            let task = state
+                .tasks
+                .get(&expired_task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::TaskNotFound(expired_task_id.clone()))?;
+            validate_deadline_transition(task.status)?;
+            let mut updated = task;
+            let from_status = updated.status;
+            updated.status = TaskStatus::Failed;
+            state.leases.remove(&expired_task_id);
+            append_in_memory_event(
+                &mut state,
+                &expired_task_id,
+                KeryxEventType::TaskTimedOut,
+                Some(from_status),
+                TaskStatus::Failed,
+            );
+            state.tasks.insert(expired_task_id, updated.clone());
+            failed.push(updated);
+        }
+        Ok(failed)
     }
 
     fn retry_task_in_state(
@@ -1014,6 +1120,26 @@ impl SqliteStore {
                     .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
             }
         }
+        let deadline_column_exists =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'deadline_ms'")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+                .is_some();
+        if !deadline_column_exists {
+            for statement in MIGRATION_005 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (5, 'task_deadlines')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         let legacy_unowned_rows = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
         )
@@ -1216,7 +1342,7 @@ impl SqliteStore {
         }
 
         sqlx::query(
-            "INSERT INTO tasks (task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
             .bind(task.task_id().as_str())
             .bind(status_to_str(task.status))
@@ -1224,6 +1350,7 @@ impl SqliteStore {
             .bind(i64::from(task.retry_count))
             .bind(i64::from(task.dead_lettered))
             .bind(task.dead_letter_reason.as_deref())
+            .bind(task.deadline_ms)
             .execute(&mut *tx)
             .await?;
         if let Some(key) = &task.idempotency_key {
@@ -1249,7 +1376,7 @@ impl SqliteStore {
     pub async fn get_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord> {
         let row =
             sqlx::query(
-                "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason FROM tasks WHERE task_id = ?",
+                "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE task_id = ?",
             )
                 .bind(task_id.as_str())
                 .fetch_optional(&self.pool)
@@ -1532,6 +1659,91 @@ impl SqliteStore {
         Ok(updated)
     }
 
+    pub async fn cancel_task(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+    ) -> StoreResult<TaskRecord> {
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        if task.status.is_terminal() {
+            tx.commit().await?;
+            return Ok(task);
+        }
+        if task.status == TaskStatus::Running {
+            let active = fetch_active_lease_with_executor(&mut tx, task_id)
+                .await?
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+        deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
+        update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
+        insert_event(
+            &mut tx,
+            task_id,
+            sequence,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_task(task_id).await
+    }
+
+    pub async fn fail_expired_deadlines(
+        &self,
+        now_ms: i64,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = match limit {
+            Some(limit) => {
+                sqlx::query(
+                    "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE deadline_ms IS NOT NULL AND deadline_ms <= ? AND status IN ('pending', 'running') ORDER BY deadline_ms ASC, task_id ASC LIMIT ?",
+                )
+                .bind(now_ms)
+                .bind(limit as i64)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE deadline_ms IS NOT NULL AND deadline_ms <= ? AND status IN ('pending', 'running') ORDER BY deadline_ms ASC, task_id ASC",
+                )
+                .bind(now_ms)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
+
+        let mut failed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task = row_to_task(row)?;
+            validate_deadline_transition(task.status)?;
+            let sequence = next_sequence_with_executor(&mut tx, task.task_id()).await?;
+            deactivate_lease_for_task_with_executor(&mut tx, task.task_id()).await?;
+            update_task_status_with_executor(&mut tx, task.task_id(), TaskStatus::Failed).await?;
+            insert_event(
+                &mut tx,
+                task.task_id(),
+                sequence,
+                KeryxEventType::TaskTimedOut,
+                Some(task.status),
+                TaskStatus::Failed,
+            )
+            .await?;
+            let mut updated = task;
+            updated.status = TaskStatus::Failed;
+            failed.push(updated);
+        }
+        tx.commit().await?;
+        Ok(failed)
+    }
+
     async fn finish_task(
         &self,
         task_id: &TaskId,
@@ -1757,7 +1969,10 @@ fn ensure_valid_lease_expiry(
     now_ms: i64,
     new_expires_at_ms: i64,
 ) -> StoreResult<()> {
-    if new_expires_at_ms > now_ms && new_expires_at_ms > active.expires_at_ms {
+    if active.expires_at_ms > now_ms
+        && new_expires_at_ms > now_ms
+        && new_expires_at_ms > active.expires_at_ms
+    {
         Ok(())
     } else {
         Err(StoreError::InvalidLeaseExpiry {
@@ -1807,7 +2022,7 @@ async fn fetch_task_optional_with_executor(
     task_id: &TaskId,
 ) -> StoreResult<Option<TaskRecord>> {
     let row = sqlx::query(
-        "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason FROM tasks WHERE task_id = ?",
+        "SELECT task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms FROM tasks WHERE task_id = ?",
     )
         .bind(task_id.as_str())
         .fetch_optional(&mut **tx)
@@ -1867,11 +2082,9 @@ async fn recover_sqlite_leases_with_executor(
         .await?;
 
         if should_requeue {
-            recovered.push(TaskRecord::new(
-                lease.task_id,
-                to_status,
-                task.idempotency_key,
-            ));
+            let mut recovered_task = task;
+            recovered_task.status = to_status;
+            recovered.push(recovered_task);
         } else if task.status.is_terminal() {
             cleaned_terminal_leases += 1;
         }
@@ -1993,9 +2206,23 @@ fn replay_task_from_snapshot_and_events(
                 }
                 current_status = transition.to;
             }
+            KeryxEventType::TaskCanceled => {
+                let transition = validate_cancel_transition(current_status)
+                    .map_err(|_| StoreError::CorruptEventStream(task_id.clone()))?;
+                if transition.to != event.to_status {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = transition.to;
+            }
+            KeryxEventType::TaskTimedOut => {
+                validate_deadline_transition(current_status)
+                    .map_err(|_| StoreError::CorruptEventStream(task_id.clone()))?;
+                if event.to_status != TaskStatus::Failed {
+                    return Err(StoreError::CorruptEventStream(task_id));
+                }
+                current_status = event.to_status;
+            }
             KeryxEventType::TaskLeased
-            | KeryxEventType::TaskCanceled
-            | KeryxEventType::TaskTimedOut
             | KeryxEventType::TaskDeadLettered
             | KeryxEventType::TaskApprovalDenied => {
                 let legacy = LegacyEventType::from_keryx_event_type(event.event_type)
@@ -2204,10 +2431,12 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskRecord> {
         .max(0) as u32;
     let dead_lettered = row.try_get::<Option<i64>, _>("dead_lettered")?.unwrap_or(0) != 0;
     let dead_letter_reason = row.try_get::<Option<String>, _>("dead_letter_reason")?;
+    let deadline_ms = row.try_get::<Option<i64>, _>("deadline_ms")?;
     Ok(TaskRecord {
         id: task_id,
         status,
         idempotency_key,
+        deadline_ms,
         retry_count,
         dead_lettered,
         dead_letter_reason,
@@ -2518,6 +2747,11 @@ const MIGRATION_004: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_artifacts_digest ON artifacts(digest)",
     "CREATE TABLE blobs (digest TEXT PRIMARY KEY, ref_count INTEGER NOT NULL DEFAULT 0, byte_len INTEGER NOT NULL)",
     "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (4, 'artifact_storage')",
+];
+
+const MIGRATION_005: &[&str] = &[
+    "ALTER TABLE tasks ADD COLUMN deadline_ms INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline_ms)",
 ];
 
 const fn status_to_str(status: TaskStatus) -> &'static str {

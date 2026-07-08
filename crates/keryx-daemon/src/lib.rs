@@ -1,5 +1,7 @@
 //! Local daemon startup/runtime foundation for Hermes Keryx.
 
+mod cancellation;
+mod deadline_enforcement_loop;
 mod discovery;
 mod health_loop;
 mod incoming;
@@ -12,22 +14,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keryx_core::{
-    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, LeaseId,
-    LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
+    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, KeryxEventType,
+    LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
     ValidationError, MAX_BLOB_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
     keryx_daemon_server::{KeryxDaemon, KeryxDaemonServer},
-    AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, ClaimTaskRequest,
-    ClaimTaskResponse, CompleteTaskRequest, CompleteTaskResponse, DeleteArtifactRequest,
-    DeleteArtifactResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
-    DoctorResponse, FailTaskRequest, FailTaskResponse, GetArtifactRequest, GetArtifactResponse,
-    HeartbeatRequest, HeartbeatResponse, IdempotencyKey as ProtoIdempotencyKey,
-    LeaseId as ProtoLeaseId, ListArtifactsRequest, ListArtifactsResponse, ListPeersRequest,
-    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, PutArtifactRequest,
-    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,
-    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskId as ProtoTaskId,
+    AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, CancelTaskRequest,
+    CancelTaskResponse, ClaimTaskRequest, ClaimTaskResponse, CompleteTaskRequest,
+    CompleteTaskResponse, DeleteArtifactRequest, DeleteArtifactResponse, DiscoverSkillsRequest,
+    DiscoverSkillsResponse, DoctorRequest, DoctorResponse, FailTaskRequest, FailTaskResponse,
+    GetArtifactRequest, GetArtifactResponse, HeartbeatRequest, HeartbeatResponse,
+    IdempotencyKey as ProtoIdempotencyKey, LeaseId as ProtoLeaseId, ListArtifactsRequest,
+    ListArtifactsResponse, ListPeersRequest, ListPeersResponse, LivenessRequest, LivenessResponse,
+    PeerDescriptor, PutArtifactRequest, PutArtifactResponse, ReadinessRequest, ReadinessResponse,
+    SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse, SubmitTaskRequest,
+    SubmitTaskResponse, TaskId as ProtoTaskId,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -41,6 +44,8 @@ use keryx_store::{
     CURRENT_SCHEMA_VERSION,
 };
 
+pub use cancellation::{CancellationSnapshot, CancellationState};
+pub use deadline_enforcement_loop::{DeadlineEnforcementLoop, DeadlineEnforcementLoopHandle};
 pub use discovery::{
     ConfiguredSkill, DiscoveryHandle, DiscoverySettings, RegistrationSettings,
     DEFAULT_REFRESH_LEAD_SECONDS, DEFAULT_REGISTRATION_TTL_SECONDS,
@@ -61,6 +66,9 @@ const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 60_000;
 
 /// Default background stale-lease scan interval.
 const DEFAULT_LEASE_RECOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// Default background task-deadline scan interval.
+const DEFAULT_DEADLINE_ENFORCEMENT_INTERVAL_MS: u64 = 30_000;
 
 /// Default worker lease TTL when callers omit `lease_duration_ms`.
 const DEFAULT_LEASE_DEFAULT_TTL_MS: i64 = 300_000;
@@ -161,6 +169,7 @@ pub struct KeryxDaemonConfig {
     blob_dir: PathBuf,
     startup_recovery_now_ms: i64,
     lease_recovery_interval_ms: u64,
+    deadline_enforcement_interval_ms: u64,
     lease_default_ttl_ms: i64,
     health_check_interval_ms: u64,
     shutdown_timeout_ms: u64,
@@ -180,6 +189,7 @@ impl KeryxDaemonConfig {
             data_dir,
             startup_recovery_now_ms,
             lease_recovery_interval_ms: DEFAULT_LEASE_RECOVERY_INTERVAL_MS,
+            deadline_enforcement_interval_ms: DEFAULT_DEADLINE_ENFORCEMENT_INTERVAL_MS,
             lease_default_ttl_ms: DEFAULT_LEASE_DEFAULT_TTL_MS,
             health_check_interval_ms: DEFAULT_HEALTH_CHECK_INTERVAL_MS,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -226,6 +236,20 @@ impl KeryxDaemonConfig {
     #[must_use]
     pub const fn lease_recovery_interval_ms(&self) -> u64 {
         self.lease_recovery_interval_ms
+    }
+
+    #[must_use]
+    pub fn with_deadline_enforcement_interval_ms(
+        mut self,
+        deadline_enforcement_interval_ms: u64,
+    ) -> Self {
+        self.deadline_enforcement_interval_ms = deadline_enforcement_interval_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn deadline_enforcement_interval_ms(&self) -> u64 {
+        self.deadline_enforcement_interval_ms
     }
 
     #[must_use]
@@ -384,6 +408,8 @@ pub struct KeryxStatusReport {
     pub max_pending_tasks: u64,
     pub max_envelope_bytes: u64,
     pub current_pending_tasks: Option<u64>,
+    pub deadline_enforcement_interval_ms: u64,
+    pub cancellation: CancellationSnapshot,
     pub warnings: Vec<String>,
 }
 
@@ -437,6 +463,7 @@ pub struct KeryxDaemonRuntime {
     router: Arc<TaskRouter>,
     discovery: Arc<RwLock<Option<Arc<DiscoveryHandle>>>>,
     submit_backpressure_lock: Arc<Mutex<()>>,
+    cancellation: Arc<CancellationState>,
 }
 
 impl KeryxDaemonRuntime {
@@ -482,6 +509,7 @@ impl KeryxDaemonRuntime {
             router,
             discovery,
             submit_backpressure_lock: Arc::new(Mutex::new(())),
+            cancellation: Arc::new(CancellationState::new()),
         };
         if let Some(settings) = runtime.config.discovery.clone() {
             runtime
@@ -612,6 +640,8 @@ impl KeryxDaemonRuntime {
             max_pending_tasks: self.config.limits().max_pending_tasks,
             max_envelope_bytes: self.config.limits().max_envelope_bytes,
             current_pending_tasks,
+            deadline_enforcement_interval_ms: self.config.deadline_enforcement_interval_ms(),
+            cancellation: self.cancellation.snapshot(),
             warnings,
         })
     }
@@ -661,6 +691,11 @@ impl KeryxDaemonRuntime {
             ready: limits_ready,
             detail: limits_detail(&status),
         });
+        checks.push(DoctorCheck {
+            name: "cancellation",
+            ready: true,
+            detail: cancellation_detail(&status),
+        });
         let healthy = status.daemon_ready && checks.iter().all(|check| check.ready);
         Ok(KeryxDoctorReport {
             healthy,
@@ -694,10 +729,26 @@ impl KeryxDaemonRuntime {
         self.metrics.snapshot()
     }
 
+    #[must_use]
+    pub fn cancellation(&self) -> &Arc<CancellationState> {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub fn cancellation_snapshot(&self) -> CancellationSnapshot {
+        self.cancellation.snapshot()
+    }
+
     /// Spawn the background stale-lease recovery loop (see [`LeaseRecoveryLoop`]).
     #[must_use]
     pub fn spawn_lease_recovery_loop(self: &Arc<Self>) -> LeaseRecoveryLoopHandle {
         LeaseRecoveryLoop::spawn(Arc::clone(self))
+    }
+
+    /// Spawn the background deadline enforcement loop (see [`DeadlineEnforcementLoop`]).
+    #[must_use]
+    pub fn spawn_deadline_enforcement_loop(self: &Arc<Self>) -> DeadlineEnforcementLoopHandle {
+        DeadlineEnforcementLoop::spawn(Arc::clone(self))
     }
 
     /// Spawn the background store health probe loop (see [`HealthLoop`]).
@@ -804,6 +855,13 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             max_envelope_bytes: report.max_envelope_bytes,
             current_pending_tasks: report.current_pending_tasks,
             warnings: report.warnings,
+            cancel_requests: report.cancellation.cancel_requests,
+            tasks_canceled: report.cancellation.tasks_canceled,
+            deadline_ticks: report.cancellation.deadline_ticks,
+            deadline_failures: report.cancellation.deadline_failures,
+            last_deadline_scan_ms: report.cancellation.last_deadline_scan_ms,
+            last_deadline_failures: report.cancellation.last_deadline_failures,
+            deadline_enforcement_interval_ms: report.deadline_enforcement_interval_ms,
         }))
     }
 
@@ -1072,6 +1130,38 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     }
 
     #[instrument(
+        name = "keryx::rpc::cancel_task",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty, reason = tracing::field::Empty)
+    )]
+    async fn cancel_task(
+        &self,
+        request: Request<CancelTaskRequest>,
+    ) -> Result<Response<CancelTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let reason = normalized_cancel_reason(&inner.reason);
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("reason", tracing::field::display(&reason));
+        self.runtime.cancellation().increment_cancel_requests();
+        let task = self
+            .runtime
+            .store()
+            .accept_legacy_event(&task_id, KeryxEventType::TaskCanceled)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.cancellation().increment_tasks_canceled();
+        self.runtime.metrics().increment_tasks_failed();
+        Ok(Response::new(CancelTaskResponse {
+            task_id: Some(proto_task_id(task.task_id())),
+            status: task_status_label(task.status).to_string(),
+            reason,
+            canceled: true,
+        }))
+    }
+
+    #[instrument(
         name = "keryx::rpc::put_artifact",
         skip(self, request),
         fields(task_id = tracing::field::Empty, artifact_id = tracing::field::Empty)
@@ -1302,6 +1392,15 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     }
 }
 
+fn normalized_cancel_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        "canceled by request".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn limit_label(limit: u64) -> String {
     if limit == 0 {
         "unlimited".to_string()
@@ -1326,6 +1425,20 @@ fn limits_detail(status: &KeryxStatusReport) -> String {
         detail.push_str(&status.warnings.join("; "));
     }
     detail
+}
+
+fn cancellation_detail(status: &KeryxStatusReport) -> String {
+    let cancellation = status.cancellation;
+    format!(
+        "cancel_requests={} tasks_canceled={} deadline_ticks={} deadline_failures={} last_deadline_scan_ms={} last_deadline_failures={} deadline_interval_ms={}",
+        cancellation.cancel_requests,
+        cancellation.tasks_canceled,
+        cancellation.deadline_ticks,
+        cancellation.deadline_failures,
+        cancellation.last_deadline_scan_ms,
+        cancellation.last_deadline_failures,
+        status.deadline_enforcement_interval_ms
+    )
 }
 
 fn parse_required_task_id(id: Option<&ProtoTaskId>) -> Result<TaskId, Status> {

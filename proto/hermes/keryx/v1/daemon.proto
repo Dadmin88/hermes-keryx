@@ -15,6 +15,7 @@ service KeryxDaemon {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
   rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
   rpc PutArtifact(PutArtifactRequest) returns (PutArtifactResponse);
   rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
   rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
@@ -51,6 +52,13 @@ message StatusResponse {
   uint64 max_envelope_bytes = 23;
   optional uint64 current_pending_tasks = 24;
   repeated string warnings = 25;
+  uint64 cancel_requests = 26;
+  uint64 tasks_canceled = 27;
+  uint64 deadline_ticks = 28;
+  uint64 deadline_failures = 29;
+  int64 last_deadline_scan_ms = 30;
+  uint64 last_deadline_failures = 31;
+  uint64 deadline_enforcement_interval_ms = 32;
 }
 message DoctorRequest {}
 message DoctorResponse { string status = 1; repeated string messages = 2; }
@@ -141,6 +149,19 @@ message FailTaskResponse {
   map<string, string> failure_metadata = 5;
   uint32 retry_count = 6;
   bool dead_lettered = 7;
+}
+
+message CancelTaskRequest {
+  TaskId task_id = 1;
+  string reason = 2;
+  map<string, string> metadata = 3;
+}
+
+message CancelTaskResponse {
+  TaskId task_id = 1;
+  string status = 2;
+  string reason = 3;
+  bool canceled = 4;
 }
 
 message SendTaskRequest {

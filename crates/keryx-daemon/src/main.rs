@@ -26,11 +26,13 @@ async fn main() -> Result<()> {
     );
 
     if let Some(addr) = daemon_addr()? {
-        let recovery = runtime.spawn_lease_recovery_loop();
-        let health = runtime.spawn_health_loop();
+        let lease_recovery_loop = runtime.spawn_lease_recovery_loop();
+        let deadline_enforcement_loop = runtime.spawn_deadline_enforcement_loop();
+        let health_loop = runtime.spawn_health_loop();
         tracing::info!(
             component = "keryxd",
             lease_recovery_interval_ms = runtime.config().lease_recovery_interval_ms(),
+            deadline_enforcement_interval_ms = runtime.config().deadline_enforcement_interval_ms(),
             health_check_interval_ms = runtime.config().health_check_interval_ms(),
             "Hermes Keryx background loops started"
         );
@@ -52,8 +54,9 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await?;
         tracing::info!(component = "keryxd", "shutdown signal received");
 
-        recovery.shutdown().await;
-        health.shutdown().await;
+        lease_recovery_loop.shutdown().await;
+        deadline_enforcement_loop.shutdown().await;
+        health_loop.shutdown().await;
         Arc::clone(&runtime).shutdown().await?;
         serve_handle.await??;
     }

@@ -229,11 +229,12 @@ fn handle_swarm_event(
             tracing::debug!(?error, "incoming connection rejected");
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            runtime.note_connection_established();
+            runtime.note_peer_connected(peer_id.to_string());
             tracing::debug!(%peer_id, "peer connected");
         }
-        SwarmEvent::ConnectionClosed { .. } => {
-            runtime.note_connection_closed();
+        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            runtime.note_peer_disconnected(&peer_id.to_string());
+            tracing::debug!(%peer_id, "peer disconnected");
         }
         SwarmEvent::Behaviour(RelayServerBehaviourEvent::Autonat(
             libp2p::autonat::Event::StatusChanged { new, .. },

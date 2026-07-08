@@ -1,6 +1,6 @@
 //! Task routing between local store and relay-connected peers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use keryx_store::{SqliteStore, StoreError, StoreResult, TaskRecord};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tonic::Status;
-use tracing::instrument;
+use tracing::{info, instrument, warn};
 
 /// Default outbound delivery timeout when callers omit `timeout_ms`.
 pub const DEFAULT_SEND_TASK_TIMEOUT_MS: u64 = 30_000;
@@ -21,6 +21,7 @@ pub const DEFAULT_SEND_TASK_TIMEOUT_MS: u64 = 30_000;
 pub enum DeliveryRoute {
     Local,
     Relay,
+    AwaitingApproval,
 }
 
 impl DeliveryRoute {
@@ -29,6 +30,7 @@ impl DeliveryRoute {
         match self {
             Self::Local => "local",
             Self::Relay => "relay",
+            Self::AwaitingApproval => "awaiting_approval",
         }
     }
 }
@@ -60,6 +62,8 @@ pub enum RoutingError {
     RelayUnavailable,
     #[error("relay delivery failed for peer {peer_id}: {reason}")]
     RelayFailed { peer_id: String, reason: String },
+    #[error("routing policy denied task: {reason}")]
+    PolicyDenied { reason: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -152,10 +156,159 @@ impl PeerDirectory {
     }
 }
 
+/// Permission assigned by routing policy for a requested capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPolicyPermission {
+    Allow,
+    Deny,
+    ApprovalRequired,
+}
+
+impl RoutingPolicyPermission {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::ApprovalRequired => "approval_required",
+        }
+    }
+}
+
+/// Policy decision returned before the router touches the store or relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingPolicyDecision {
+    pub permission: RoutingPolicyPermission,
+    pub capability_id: Option<String>,
+    pub reason: String,
+}
+
+impl RoutingPolicyDecision {
+    #[must_use]
+    pub fn allow(capability_id: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            permission: RoutingPolicyPermission::Allow,
+            capability_id,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn deny(capability_id: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            permission: RoutingPolicyPermission::Deny,
+            capability_id,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn awaiting_approval(capability_id: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            permission: RoutingPolicyPermission::ApprovalRequired,
+            capability_id,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Minimal capability policy used by the daemon routing gate.
+#[derive(Debug, Clone)]
+pub struct RoutingPolicy {
+    default_permission: RoutingPolicyPermission,
+    capability_permissions: HashMap<String, RoutingPolicyPermission>,
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        Self {
+            default_permission: RoutingPolicyPermission::Allow,
+            capability_permissions: HashMap::new(),
+        }
+    }
+}
+
+impl RoutingPolicy {
+    #[must_use]
+    pub fn new(default_permission: RoutingPolicyPermission) -> Self {
+        Self {
+            default_permission,
+            capability_permissions: HashMap::new(),
+        }
+    }
+
+    pub fn set_permission(
+        &mut self,
+        capability_id: impl Into<String>,
+        permission: RoutingPolicyPermission,
+    ) -> Option<RoutingPolicyPermission> {
+        self.capability_permissions
+            .insert(capability_id.into(), permission)
+    }
+
+    #[must_use]
+    pub fn evaluate(&self, envelope: &TaskEnvelope) -> RoutingPolicyDecision {
+        let capability_id = envelope_capability_id(envelope);
+        let permission = capability_id
+            .as_ref()
+            .and_then(|capability_id| self.capability_permissions.get(capability_id))
+            .copied()
+            .unwrap_or(self.default_permission);
+
+        match permission {
+            RoutingPolicyPermission::Allow => {
+                RoutingPolicyDecision::allow(capability_id, "capability allowed by routing policy")
+            }
+            RoutingPolicyPermission::Deny => RoutingPolicyDecision::deny(
+                capability_id.clone(),
+                format!(
+                    "capability {} denied by routing policy",
+                    capability_id.as_deref().unwrap_or("<unspecified>")
+                ),
+            ),
+            RoutingPolicyPermission::ApprovalRequired => RoutingPolicyDecision::awaiting_approval(
+                capability_id.clone(),
+                format!(
+                    "capability {} requires approval",
+                    capability_id.as_deref().unwrap_or("<unspecified>")
+                ),
+            ),
+        }
+    }
+}
+
+/// Security audit event emitted by routing policy decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingAuditEvent {
+    pub task_id: TaskId,
+    pub target_peer_id: PeerId,
+    pub capability_id: Option<String>,
+    pub decision: RoutingPolicyPermission,
+    pub reason: String,
+}
+
+impl RoutingAuditEvent {
+    #[must_use]
+    pub fn new(task_id: TaskId, target_peer_id: PeerId, decision: &RoutingPolicyDecision) -> Self {
+        Self {
+            task_id,
+            target_peer_id,
+            capability_id: decision
+                .capability_id
+                .as_ref()
+                .map(|value| redact_secrets(value)),
+            decision: decision.permission,
+            reason: redact_secrets(&decision.reason),
+        }
+    }
+}
+
 /// Routes task envelopes to the local store or relay publisher.
 pub struct TaskRouter {
     peers: Arc<PeerDirectory>,
     publisher: Arc<RwLock<Arc<dyn RelayTaskPublisher>>>,
+    policy: Arc<RwLock<RoutingPolicy>>,
+    audit_events: Arc<RwLock<Vec<RoutingAuditEvent>>>,
     default_timeout_ms: u64,
 }
 
@@ -177,12 +330,44 @@ impl TaskRouter {
         Self {
             peers,
             publisher: Arc::new(RwLock::new(publisher)),
+            policy: Arc::new(RwLock::new(RoutingPolicy::default())),
+            audit_events: Arc::new(RwLock::new(Vec::new())),
             default_timeout_ms,
         }
     }
 
     pub async fn set_publisher(&self, publisher: Arc<dyn RelayTaskPublisher>) {
         *self.publisher.write().await = publisher;
+    }
+
+    pub async fn set_policy(&self, policy: RoutingPolicy) {
+        *self.policy.write().await = policy;
+    }
+
+    pub async fn audit_events(&self) -> Vec<RoutingAuditEvent> {
+        self.audit_events.read().await.clone()
+    }
+
+    async fn record_audit_event(&self, event: RoutingAuditEvent) {
+        self.audit_events.write().await.push(event);
+    }
+
+    #[instrument(
+        name = "keryx::routing::route_task",
+        skip(self, store, envelope),
+        fields(
+            target_peer_id = %target_peer_id.as_str()
+        )
+    )]
+    pub async fn route_task(
+        &self,
+        store: &SqliteStore,
+        target_peer_id: PeerId,
+        envelope: TaskEnvelope,
+        timeout_ms: i64,
+    ) -> Result<SendTaskOutcome, RoutingError> {
+        self.send_task(store, target_peer_id, envelope, timeout_ms)
+            .await
     }
 
     #[instrument(
@@ -202,6 +387,59 @@ impl TaskRouter {
     ) -> Result<SendTaskOutcome, RoutingError> {
         let task_id = parse_envelope_task_id(&envelope)?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+
+        let policy_decision = self.policy.read().await.evaluate(&envelope);
+        let audit_event =
+            RoutingAuditEvent::new(task_id.clone(), target_peer_id.clone(), &policy_decision);
+        match policy_decision.permission {
+            RoutingPolicyPermission::Allow => {
+                info!(
+                    target: "keryx.security",
+                    audit_event = "routing_policy",
+                    decision = policy_decision.permission.as_str(),
+                    capability_id = audit_event.capability_id.as_deref().unwrap_or("<unspecified>"),
+                    task_id = %task_id,
+                    target_peer_id = %target_peer_id,
+                    "routing policy allowed task"
+                );
+                self.record_audit_event(audit_event).await;
+            }
+            RoutingPolicyPermission::Deny => {
+                let reason = audit_event.reason.clone();
+                warn!(
+                    target: "keryx.security",
+                    audit_event = "routing_policy",
+                    decision = policy_decision.permission.as_str(),
+                    capability_id = audit_event.capability_id.as_deref().unwrap_or("<unspecified>"),
+                    task_id = %task_id,
+                    target_peer_id = %target_peer_id,
+                    reason = %reason,
+                    "routing policy denied task"
+                );
+                self.record_audit_event(audit_event).await;
+                return Err(RoutingError::PolicyDenied { reason });
+            }
+            RoutingPolicyPermission::ApprovalRequired => {
+                let reason = audit_event.reason.clone();
+                info!(
+                    target: "keryx.security",
+                    audit_event = "routing_policy",
+                    decision = policy_decision.permission.as_str(),
+                    capability_id = audit_event.capability_id.as_deref().unwrap_or("<unspecified>"),
+                    task_id = %task_id,
+                    target_peer_id = %target_peer_id,
+                    reason = %reason,
+                    "routing policy placed task in AwaitingApproval"
+                );
+                self.record_audit_event(audit_event).await;
+                return Ok(SendTaskOutcome {
+                    task_id,
+                    status: "awaiting_approval".to_string(),
+                    routed_to: target_peer_id,
+                    route: DeliveryRoute::AwaitingApproval,
+                });
+            }
+        }
 
         if target_peer_id == *self.peers.local_peer_id() {
             let outcome = accept_local_task(store, envelope).await?;
@@ -274,6 +512,21 @@ async fn accept_local_task(
     })
 }
 
+fn envelope_capability_id(envelope: &TaskEnvelope) -> Option<String> {
+    [
+        "keryx.capability_id",
+        "capability_id",
+        "capability",
+        "skill_id",
+        "skill",
+    ]
+    .iter()
+    .filter_map(|key| envelope.metadata.get(*key))
+    .map(|value| value.trim())
+    .find(|value| !value.is_empty())
+    .map(ToOwned::to_owned)
+}
+
 fn parse_envelope_task_id(envelope: &TaskEnvelope) -> Result<TaskId, RoutingError> {
     let value = envelope
         .task_id
@@ -319,6 +572,30 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     }
 }
 
+fn redact_secrets(input: &str) -> String {
+    let mut output = Vec::new();
+    for segment in input.split_whitespace() {
+        let lower = segment.to_ascii_lowercase();
+        if lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("authorization")
+            || lower.contains("bearer")
+        {
+            if let Some((key, _value)) = segment.split_once('=') {
+                output.push(format!("{key}=<redacted>"));
+            } else if let Some((key, _value)) = segment.split_once(':') {
+                output.push(format!("{key}:<redacted>"));
+            } else {
+                output.push("<redacted>".to_string());
+            }
+        } else {
+            output.push(segment.to_string());
+        }
+    }
+    output.join(" ")
+}
+
 pub fn routing_error_to_status(error: RoutingError) -> Status {
     match error {
         RoutingError::UnknownPeer { peer_id } => {
@@ -329,16 +606,47 @@ pub fn routing_error_to_status(error: RoutingError) -> Status {
         }
         RoutingError::RelayUnavailable => Status::unavailable("relay is not connected"),
         RoutingError::RelayFailed { peer_id, reason } => {
+            let reason = redact_secrets(&reason);
             if peer_id.is_empty() {
                 Status::invalid_argument(reason)
             } else {
                 Status::unavailable(format!("relay delivery failed for {peer_id}: {reason}"))
             }
         }
+        RoutingError::PolicyDenied { reason } => Status::permission_denied(redact_secrets(&reason)),
         RoutingError::Store(store_error) => super::store_error_to_status(store_error),
         RoutingError::Validation(validation_error) => {
             Status::invalid_argument(validation_error.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_proto::v1::TaskId as ProtoTaskId;
+
+    #[test]
+    fn routing_policy_requires_approval_for_matching_capability() {
+        let mut envelope = TaskEnvelope {
+            task_id: Some(ProtoTaskId {
+                value: "task:deploy".to_string(),
+            }),
+            ..TaskEnvelope::default()
+        };
+        envelope
+            .metadata
+            .insert("capability_id".to_string(), "cap:deploy".to_string());
+
+        let mut policy = RoutingPolicy::default();
+        policy.set_permission("cap:deploy", RoutingPolicyPermission::ApprovalRequired);
+        let decision = policy.evaluate(&envelope);
+
+        assert_eq!(
+            decision.permission,
+            RoutingPolicyPermission::ApprovalRequired
+        );
+        assert_eq!(decision.capability_id.as_deref(), Some("cap:deploy"));
     }
 }
 

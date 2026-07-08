@@ -8,3 +8,10 @@ repository.workspace = true
 
 [dependencies]
 keryx-core = { path = "../keryx-core" }
+rand = "0.8"
+serde.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
