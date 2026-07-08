@@ -286,7 +286,7 @@ async fn run_status() -> Result<()> {
         print_daemon_status(&endpoint, &status);
     } else {
         let runtime = KeryxDaemonRuntime::startup(default_config()).await?;
-        print_status(&runtime.status_report());
+        print_status(&runtime.status_report().await?);
     }
     Ok(())
 }
@@ -297,7 +297,7 @@ async fn run_doctor() -> Result<()> {
         print_daemon_doctor(&endpoint, &doctor);
     } else {
         let runtime = KeryxDaemonRuntime::startup(default_config()).await?;
-        print_doctor(&runtime.doctor_report());
+        print_doctor(&runtime.doctor_report().await?);
     }
     Ok(())
 }
@@ -355,6 +355,15 @@ fn print_daemon_status(endpoint: &str, status: &StatusResponse) {
         status.corruption_count,
         status.startup_recovery_duration_ms
     );
+    println!(
+        "limits: pending_tasks={}/{} envelope_bytes_limit={}",
+        pending_tasks_label(status.current_pending_tasks),
+        limit_label(status.max_pending_tasks),
+        limit_label(status.max_envelope_bytes)
+    );
+    for warning in &status.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn print_daemon_doctor(endpoint: &str, doctor: &DoctorResponse) {
@@ -391,6 +400,15 @@ fn print_status(status: &KeryxStatusReport) {
         status.corruption_count,
         status.startup_recovery_duration_ms
     );
+    println!(
+        "limits: pending_tasks={}/{} envelope_bytes_limit={}",
+        pending_tasks_label(status.current_pending_tasks),
+        limit_label(status.max_pending_tasks),
+        limit_label(status.max_envelope_bytes)
+    );
+    for warning in &status.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn print_doctor(doctor: &KeryxDoctorReport) {
@@ -409,4 +427,16 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+fn limit_label(limit: u64) -> String {
+    if limit == 0 {
+        "unlimited".to_string()
+    } else {
+        limit.to_string()
+    }
+}
+
+fn pending_tasks_label(count: Option<u64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }

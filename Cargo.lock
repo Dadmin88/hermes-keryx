@@ -1613,6 +1613,7 @@ dependencies = [
  "keryx-proto",
  "keryx-relay",
  "keryx-store",
+ "prost",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

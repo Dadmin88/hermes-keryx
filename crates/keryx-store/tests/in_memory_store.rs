@@ -41,6 +41,60 @@ fn accepted_task_is_persisted_with_task_created_event_before_ack() {
 }
 
 #[test]
+fn count_tasks_by_status_returns_pending_running_and_terminal_counts() {
+    let store = InMemoryStore::default();
+    let pending = task(
+        "task-count-pending",
+        TaskStatus::Pending,
+        Some("idem-count-pending"),
+    );
+    let running = task(
+        "task-count-running",
+        TaskStatus::Pending,
+        Some("idem-count-running"),
+    );
+    let completed = task(
+        "task-count-completed",
+        TaskStatus::Pending,
+        Some("idem-count-completed"),
+    );
+    store.accept_task(pending).unwrap();
+    store.accept_task(running.clone()).unwrap();
+    store.accept_task(completed.clone()).unwrap();
+    let running_lease = lease(
+        running.task_id(),
+        "lease-count-running",
+        "worker-count",
+        1_000,
+    );
+    store.lease_task(running.task_id(), running_lease).unwrap();
+    let completed_lease = lease(
+        completed.task_id(),
+        "lease-count-completed",
+        "worker-count",
+        1_000,
+    );
+    store
+        .lease_task(completed.task_id(), completed_lease.clone())
+        .unwrap();
+    store
+        .complete_task(
+            completed.task_id(),
+            &completed_lease.lease_id,
+            completed_lease.worker_id.as_ref().unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(store.count_tasks_by_status(TaskStatus::Pending).unwrap(), 1);
+    assert_eq!(store.count_tasks_by_status(TaskStatus::Running).unwrap(), 1);
+    assert_eq!(
+        store.count_tasks_by_status(TaskStatus::Completed).unwrap(),
+        1
+    );
+    assert_eq!(store.count_tasks_by_status(TaskStatus::Failed).unwrap(), 0);
+}
+
+#[test]
 fn pending_running_completed_succeeds_via_lease_and_complete() {
     let store = InMemoryStore::default();
     let record = task("task-2", TaskStatus::Pending, Some("idem-2"));

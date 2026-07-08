@@ -7,6 +7,7 @@ pub mod agent_card;
 pub mod artifact;
 pub mod error;
 pub mod legacy;
+pub mod limits;
 pub mod peer_id;
 pub mod retry_policy;
 pub mod task;
@@ -20,6 +21,9 @@ pub use artifact::{
 pub use error::{CoreResult, KeryxCoreError, ValidationError};
 pub use legacy::{
     is_valid_operational_legacy, normalize_legacy_transition, CanonicalTransition, LegacyEventType,
+};
+pub use limits::{
+    LimitExceeded, LimitKind, LimitsConfig, DEFAULT_MAX_ENVELOPE_BYTES, DEFAULT_MAX_PENDING_TASKS,
 };
 pub use peer_id::{NodeId, PeerId};
 pub use retry_policy::RetryPolicy;

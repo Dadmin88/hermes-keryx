@@ -104,7 +104,7 @@ async fn runtime_status_report_reflects_ready_sqlite_store() {
     let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir.clone(), 1234))
         .await
         .unwrap();
-    let status = runtime.status_report();
+    let status = runtime.status_report().await.unwrap();
 
     assert!(status.daemon_ready);
     assert_eq!(status.data_dir, data_dir);
@@ -175,8 +175,8 @@ async fn runtime_status_report_counts_terminal_stale_lease_cleanup() {
     let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir, 501))
         .await
         .unwrap();
-    let status = runtime.status_report();
-    let doctor = runtime.doctor_report();
+    let status = runtime.status_report().await.unwrap();
+    let doctor = runtime.doctor_report().await.unwrap();
 
     assert_eq!(runtime.report().recovery.recovered_task_count(), 0);
     assert_eq!(runtime.report().recovery.cleaned_terminal_leases, 1);
@@ -201,7 +201,7 @@ async fn runtime_doctor_report_marks_runtime_healthy_when_store_ready() {
     let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir.clone(), 1234))
         .await
         .unwrap();
-    let doctor = runtime.doctor_report();
+    let doctor = runtime.doctor_report().await.unwrap();
 
     assert!(doctor.healthy);
     assert!(doctor.status.daemon_ready);

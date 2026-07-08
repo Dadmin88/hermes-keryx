@@ -254,6 +254,7 @@ pub trait TaskStore {
     fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord>;
     fn get_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord>;
     fn transition_task(&self, task_id: &TaskId, to: TaskStatus) -> StoreResult<TaskRecord>;
+    fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64>;
     fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>>;
     fn replay_task(&self, task_id: &TaskId) -> StoreResult<TaskRecord>;
 }
@@ -878,6 +879,15 @@ impl TaskStore for InMemoryStore {
         Ok(updated)
     }
 
+    fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64> {
+        let state = self.lock()?;
+        Ok(state
+            .tasks
+            .values()
+            .filter(|task| task.status == status)
+            .count() as u64)
+    }
+
     fn events_for_task(&self, task_id: &TaskId) -> StoreResult<Vec<TaskEventRecord>> {
         let state = self.lock()?;
         match state.events.get(task_id) {
@@ -1272,6 +1282,14 @@ impl SqliteStore {
         .await?;
         tx.commit().await?;
         self.get_task(task_id).await
+    }
+
+    pub async fn count_tasks_by_status(&self, status: TaskStatus) -> StoreResult<u64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM tasks WHERE status = ?")
+            .bind(status_to_str(status))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("count") as u64)
     }
 
     pub async fn accept_legacy_event(

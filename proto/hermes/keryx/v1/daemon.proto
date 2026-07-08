@@ -47,6 +47,10 @@ message StatusResponse {
   uint64 recovery_ticks = 19;
   int64 active_leases = 20;
   uint64 dead_letters = 21;
+  uint64 max_pending_tasks = 22;
+  uint64 max_envelope_bytes = 23;
+  optional uint64 current_pending_tasks = 24;
+  repeated string warnings = 25;
 }
 message DoctorRequest {}
 message DoctorResponse { string status = 1; repeated string messages = 2; }

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::task::TaskStatus;
@@ -31,7 +32,7 @@ const fn is_allowed_id_char(ch: char) -> bool {
 
 pub type CoreResult<T> = Result<T, ValidationError>;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationError {
     #[error("missing {kind} value")]
     MissingIdValue { kind: &'static str },
@@ -43,13 +44,19 @@ pub enum ValidationError {
     InvalidDigest(String),
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),
+    #[error("limit exceeded: {kind} current={current} max={max}")]
+    LimitExceeded {
+        kind: String,
+        current: u64,
+        max: u64,
+    },
     #[error("invalid task state transition: {from:?} -> {to:?}")]
     InvalidTaskTransition { from: TaskStatus, to: TaskStatus },
     #[error("terminal task state cannot transition: {from:?} -> {to:?}")]
     TerminalTaskTransition { from: TaskStatus, to: TaskStatus },
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize)]
 pub enum KeryxCoreError {
     #[error(transparent)]
     Validation(#[from] ValidationError),

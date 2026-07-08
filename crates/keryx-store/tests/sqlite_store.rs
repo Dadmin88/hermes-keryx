@@ -165,6 +165,88 @@ async fn sqlite_pending_running_completed_succeeds_via_lease_and_complete() {
 }
 
 #[tokio::test]
+async fn sqlite_count_tasks_by_status_returns_current_counts() {
+    let store = temp_store().await;
+    let pending = task(
+        "sqlite-count-pending",
+        TaskStatus::Pending,
+        Some("sqlite-count-idem-pending"),
+    );
+    let running = task(
+        "sqlite-count-running",
+        TaskStatus::Pending,
+        Some("sqlite-count-idem-running"),
+    );
+    let failed = task(
+        "sqlite-count-failed",
+        TaskStatus::Pending,
+        Some("sqlite-count-idem-failed"),
+    );
+    store.accept_task(pending).await.unwrap();
+    store.accept_task(running.clone()).await.unwrap();
+    store.accept_task(failed.clone()).await.unwrap();
+    let running_lease = lease(
+        running.task_id(),
+        "sqlite-count-lease-running",
+        "sqlite-count-worker",
+        1_000,
+    );
+    store
+        .lease_task(running.task_id(), running_lease)
+        .await
+        .unwrap();
+    let failed_lease = lease(
+        failed.task_id(),
+        "sqlite-count-lease-failed",
+        "sqlite-count-worker",
+        1_000,
+    );
+    store
+        .lease_task(failed.task_id(), failed_lease.clone())
+        .await
+        .unwrap();
+    store
+        .fail_task(
+            failed.task_id(),
+            &failed_lease.lease_id,
+            failed_lease.worker_id.as_ref().unwrap(),
+            "boom",
+            &RetryPolicy::no_retries(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_tasks_by_status(TaskStatus::Running)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_tasks_by_status(TaskStatus::Failed)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_tasks_by_status(TaskStatus::Completed)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn sqlite_pending_running_failed_succeeds_via_lease_and_fail() {
     let store = temp_store().await;
     let record = task("sqlite-task-2", TaskStatus::Pending, Some("sqlite-idem-2"));
