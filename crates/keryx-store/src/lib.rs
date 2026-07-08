@@ -2765,9 +2765,10 @@ const fn status_to_str(status: TaskStatus) -> &'static str {
 
 fn str_to_status(value: &str) -> StoreResult<TaskStatus> {
     match value {
-        "created" | "accepted" | "queued" | "awaiting_approval" | "pending" => {
-            Ok(TaskStatus::Pending)
-        }
+        "created" | "accepted" | "queued" | "pending" => Ok(TaskStatus::Pending),
+        "awaiting_approval" => Err(StoreError::Database(
+            "legacy awaiting_approval task status requires explicit approval migration".to_string(),
+        )),
         "leased" | "awaiting_input" | "running" => Ok(TaskStatus::Running),
         "completed" => Ok(TaskStatus::Completed),
         "failed" | "canceled" | "timed_out" | "rejected" | "dead_lettered" => {

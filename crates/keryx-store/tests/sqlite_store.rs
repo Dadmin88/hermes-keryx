@@ -125,6 +125,75 @@ async fn seed_schema_v1_database_with_active_lease(
     .unwrap();
 }
 
+async fn seed_schema_v1_database_with_awaiting_approval_task(
+    db_path: &std::path::Path,
+    task_id: &TaskId,
+) {
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO schema_migrations (version, name) VALUES (1, 'initial')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, idempotency_key TEXT UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE task_events (task_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_type TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (task_id, sequence), FOREIGN KEY(task_id) REFERENCES tasks(task_id))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE leases (lease_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, leased_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(task_id) REFERENCES tasks(task_id))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE idempotency_keys (key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, FOREIGN KEY(task_id) REFERENCES tasks(task_id))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO tasks (task_id, status, idempotency_key) VALUES (?, 'awaiting_approval', 'legacy-approval-idem')",
+    )
+    .bind(task_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO idempotency_keys (key, task_id) VALUES ('legacy-approval-idem', ?)")
+        .bind(task_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO task_events (task_id, sequence, event_type, from_status, to_status) VALUES (?, 1, 'task_approval_requested', 'pending', 'awaiting_approval')",
+    )
+    .bind(task_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn sqlite_migration_from_empty_database_creates_schema_version() {
     let store = temp_store().await;
@@ -458,6 +527,39 @@ async fn sqlite_idempotency_duplicate_and_conflict_behave_like_memory_store() {
         .await
         .unwrap_err();
     assert!(matches!(conflict, StoreError::IdempotencyConflict { .. }));
+}
+
+#[tokio::test]
+async fn sqlite_legacy_awaiting_approval_task_is_not_downgraded_to_pending() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("legacy-approval-keryx.db");
+    let task_id = TaskId::new("legacy-awaiting-approval-task").unwrap();
+    seed_schema_v1_database_with_awaiting_approval_task(&db_path, &task_id).await;
+
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let err = store.get_task(&task_id).await.unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::Database(
+            "legacy awaiting_approval task status requires explicit approval migration".to_string()
+        )
+    );
+
+    let lease = lease(
+        &task_id,
+        "legacy-approval-lease",
+        "legacy-approval-worker",
+        1_500,
+    );
+    let err = store.lease_task(&task_id, lease).await.unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::Database(
+            "legacy awaiting_approval task status requires explicit approval migration".to_string()
+        )
+    );
 }
 
 #[tokio::test]
