@@ -9,7 +9,9 @@ use keryx_proto::v1::{
     AckTaskRequest, NodeFrame, NodeId, PublishTaskRequest, RegisterNodeRequest, TaskEnvelope,
     TaskId, TaskStatus,
 };
+use keryx_core::PeerId;
 use keryx_relay::health_server::{serve_grpc_health, NODE_ID_METADATA_KEY};
+use keryx_relay::registry::SkillRegistry;
 use keryx_relay::runtime::RelayRuntime;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -140,12 +142,83 @@ async fn ack_task_removes_pending_offline_mailbox_entry() {
     assert_eq!(runtime.mailbox_depth("node-pending"), 0);
 }
 
+#[tokio::test]
+async fn register_node_appears_in_skill_registry() {
+    let runtime = RelayRuntime::new("relay-grpc-registry-node-test");
+    runtime.mark_transport_listening();
+    let registry = Arc::new(SkillRegistry::new());
+    let addr = spawn_relay_with_registry(Arc::clone(&runtime), Arc::clone(&registry)).await;
+    let channel = connect_grpc(addr).await;
+
+    let mut client = KeryxRelayClient::new(channel);
+    register(&mut client, "node-registry").await;
+
+    let registration = registry
+        .get(&PeerId::new("node-registry").unwrap())
+        .await
+        .expect("registered node should appear in registry");
+    assert_eq!(registration.peer_id.as_str(), "node-registry");
+    assert!(registration.skills.is_empty());
+}
+
+#[tokio::test]
+async fn publish_task_skill_metadata_is_discoverable_for_target_node() {
+    let runtime = RelayRuntime::new("relay-grpc-registry-skill-test");
+    runtime.mark_transport_listening();
+    let registry = Arc::new(SkillRegistry::new());
+    let addr = spawn_relay_with_registry(Arc::clone(&runtime), Arc::clone(&registry)).await;
+    let channel = connect_grpc(addr).await;
+
+    let mut client = KeryxRelayClient::new(channel);
+    register(&mut client, "node-python").await;
+    client
+        .publish_task(PublishTaskRequest {
+            task: Some(task_with_skill("task-python", "node-python", "python")),
+        })
+        .await
+        .expect("publish task with skill metadata");
+
+    let found = registry.discover(Some("python"), &[], 10).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].peer_id.as_str(), "node-python");
+    assert_eq!(found[0].skills[0].skill_id, "python");
+}
+
+#[tokio::test]
+async fn offline_registered_nodes_are_pruned_after_registry_timeout() {
+    let runtime = RelayRuntime::new("relay-grpc-registry-timeout-test");
+    runtime.mark_transport_listening();
+    let registry = Arc::new(SkillRegistry::with_default_ttl(Duration::from_millis(50)));
+    let addr = spawn_relay_with_registry(Arc::clone(&runtime), Arc::clone(&registry)).await;
+    let channel = connect_grpc(addr).await;
+
+    let mut client = KeryxRelayClient::new(channel);
+    register(&mut client, "node-timeout").await;
+    assert_eq!(registry.registration_count().await, 1);
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    assert_eq!(registry.registration_count().await, 0);
+}
+
 async fn spawn_relay(runtime: Arc<RelayRuntime>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     tokio::spawn(async move {
         let _ = serve_grpc_health(runtime, None, addr).await;
+    });
+    addr
+}
+
+async fn spawn_relay_with_registry(
+    runtime: Arc<RelayRuntime>,
+    registry: Arc<SkillRegistry>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(async move {
+        let _ = serve_grpc_health(runtime, Some(registry), addr).await;
     });
     addr
 }
@@ -199,6 +272,13 @@ fn task(task_id: &str, target_node_id: &str) -> TaskEnvelope {
         messages: vec![],
         metadata,
     }
+}
+
+fn task_with_skill(task_id: &str, target_node_id: &str, skill_id: &str) -> TaskEnvelope {
+    let mut t = task(task_id, target_node_id);
+    t.metadata
+        .insert("skill_id".to_string(), skill_id.to_string());
+    t
 }
 
 fn task_id(task: &TaskEnvelope) -> &str {

@@ -687,7 +687,7 @@ mod tests {
 
             [[security.node_tokens]]
             node_id = "node:worker"
-            token = "node-token"
+            token = "node-token-secure-1234567890"
         "#;
         let config: RelayTomlConfig = toml::from_str(raw).unwrap();
         let auth = config
@@ -695,6 +695,6 @@ mod tests {
             .unwrap();
         let node_id: NodeId = "node:worker".parse().unwrap();
         assert!(auth.is_configured());
-        assert!(auth.authenticate(&node_id, "node-token").is_ok());
+        assert!(auth.authenticate(&node_id, "node-token-secure-1234567890").is_ok());
     }
 }

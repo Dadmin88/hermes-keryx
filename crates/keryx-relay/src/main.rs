@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use libp2p::swarm::SwarmEvent;
+use libp2p::{gossipsub, swarm::SwarmEvent};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -15,7 +15,7 @@ use keryx_relay::{
     bootstrap::dial_bootstrap_peers,
     config::RelayConfig,
     health_server::{serve_grpc_health, serve_http_health},
-    registry::{SkillRegistry, DEFAULT_CLEANUP_INTERVAL},
+    registry::{SkillRegistry, DEFAULT_CLEANUP_INTERVAL, REGISTRY_GOSSIP_TOPIC},
     registry_server::{serve_registry_rpc, RegistryRpcService},
     runtime::RelayRuntime,
     security::{new_shared_allowlist, sync_allowlist_to_swarm, RelayTomlConfig, SharedAllowlist},
@@ -137,6 +137,8 @@ async fn main() -> Result<()> {
     run_relay_loop_unix(
         &mut swarm,
         &runtime,
+        &registry,
+        registry.subscribe_gossip(),
         &process,
         &config_path,
         &shared_allowlist,
@@ -145,7 +147,14 @@ async fn main() -> Result<()> {
     .await?;
 
     #[cfg(not(unix))]
-    run_relay_loop(&mut swarm, &runtime, health_shutdown_tx).await?;
+    run_relay_loop(
+        &mut swarm,
+        &runtime,
+        &registry,
+        registry.subscribe_gossip(),
+        health_shutdown_tx,
+    )
+    .await?;
 
     Ok(())
 }
@@ -154,6 +163,8 @@ async fn main() -> Result<()> {
 async fn run_relay_loop(
     swarm: &mut libp2p::Swarm<keryx_relay::RelayServerBehaviour>,
     runtime: &RelayRuntime,
+    registry: &Arc<SkillRegistry>,
+    mut registry_gossip_rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
     health_shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
     loop {
@@ -163,8 +174,13 @@ async fn run_relay_loop(
                 let _ = health_shutdown_tx.send(());
                 break;
             }
+            gossip = registry_gossip_rx.recv() => {
+                if let Ok(payload) = gossip {
+                    publish_registry_gossip(swarm, payload);
+                }
+            }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, runtime, event);
+                handle_swarm_event(swarm, runtime, registry, event).await;
             }
         }
     }
@@ -172,9 +188,12 @@ async fn run_relay_loop(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_loop_unix(
     swarm: &mut libp2p::Swarm<keryx_relay::RelayServerBehaviour>,
     runtime: &RelayRuntime,
+    registry: &Arc<SkillRegistry>,
+    mut registry_gossip_rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
     process: &ProcessConfig,
     config_path: &Path,
     shared_allowlist: &Option<SharedAllowlist>,
@@ -189,6 +208,11 @@ async fn run_relay_loop_unix(
                 info!(component = "keryx-relay", "shutdown signal received");
                 let _ = health_shutdown_tx.send(());
                 break;
+            }
+            gossip = registry_gossip_rx.recv() => {
+                if let Ok(payload) = gossip {
+                    publish_registry_gossip(swarm, payload);
+                }
             }
             _ = sighup.recv() => {
                 if let (Some(toml), Some(shared)) = (&process.toml, shared_allowlist) {
@@ -212,16 +236,17 @@ async fn run_relay_loop_unix(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, runtime, event);
+                handle_swarm_event(swarm, runtime, registry, event).await;
             }
         }
     }
     Ok(())
 }
 
-fn handle_swarm_event(
+async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<keryx_relay::RelayServerBehaviour>,
     runtime: &RelayRuntime,
+    registry: &Arc<SkillRegistry>,
     event: SwarmEvent<RelayServerBehaviourEvent>,
 ) {
     match event {
@@ -230,6 +255,8 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             runtime.note_peer_connected(peer_id.to_string());
+            let snapshot = registry.gossip_snapshot_bytes().await;
+            publish_registry_gossip(swarm, snapshot);
             tracing::debug!(%peer_id, "peer connected");
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -250,6 +277,17 @@ fn handle_swarm_event(
             runtime.mark_transport_listening();
             info!(%address, "relay ready on address");
         }
+        SwarmEvent::Behaviour(RelayServerBehaviourEvent::RegistryGossip(
+            gossipsub::Event::Message { message, .. },
+        )) => {
+            if let Err(err) = registry.apply_gossip_bytes(&message.data).await {
+                tracing::debug!(error = %err, "ignored invalid registry gossip payload");
+            } else {
+                runtime
+                    .metrics()
+                    .set_registry_size(registry.registration_count().await as u64);
+            }
+        }
         SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
             runtime.metrics().increment_tasks_routed();
             info!(?event, "relay reservation/circuit activity");
@@ -260,5 +298,18 @@ fn handle_swarm_event(
         other => {
             info!(?other, "relay swarm event");
         }
+    }
+}
+
+fn publish_registry_gossip(
+    swarm: &mut libp2p::Swarm<keryx_relay::RelayServerBehaviour>,
+    payload: Vec<u8>,
+) {
+    if payload.is_empty() {
+        return;
+    }
+    let topic = gossipsub::IdentTopic::new(REGISTRY_GOSSIP_TOPIC);
+    if let Err(err) = swarm.behaviour_mut().registry_gossip.publish(topic, payload) {
+        tracing::debug!(error = %err, "registry gossip publish skipped");
     }
 }

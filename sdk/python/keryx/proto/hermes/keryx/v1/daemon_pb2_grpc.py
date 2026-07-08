@@ -5,7 +5,7 @@ import warnings
 
 from hermes.keryx.v1 import daemon_pb2 as hermes_dot_keryx_dot_v1_dot_daemon__pb2
 
-GRPC_GENERATED_VERSION = '1.81.1'
+GRPC_GENERATED_VERSION = '1.82.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -78,6 +78,31 @@ class KeryxDaemonStub:
                 '/hermes.keryx.v1.KeryxDaemon/FailTask',
                 request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskResponse.FromString,
+                _registered_method=True)
+        self.CancelTask = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/CancelTask',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskResponse.FromString,
+                _registered_method=True)
+        self.PutArtifact = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/PutArtifact',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactResponse.FromString,
+                _registered_method=True)
+        self.GetArtifact = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/GetArtifact',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactResponse.FromString,
+                _registered_method=True)
+        self.ListArtifacts = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/ListArtifacts',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsResponse.FromString,
+                _registered_method=True)
+        self.DeleteArtifact = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/DeleteArtifact',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactResponse.FromString,
                 _registered_method=True)
         self.SendTask = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxDaemon/SendTask',
@@ -153,6 +178,36 @@ class KeryxDaemonServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelTask(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PutArtifact(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetArtifact(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListArtifacts(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteArtifact(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SendTask(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -218,6 +273,31 @@ def add_KeryxDaemonServicer_to_server(servicer, server):
                     servicer.FailTask,
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskResponse.SerializeToString,
+            ),
+            'CancelTask': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelTask,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskResponse.SerializeToString,
+            ),
+            'PutArtifact': grpc.unary_unary_rpc_method_handler(
+                    servicer.PutArtifact,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactResponse.SerializeToString,
+            ),
+            'GetArtifact': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetArtifact,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactResponse.SerializeToString,
+            ),
+            'ListArtifacts': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListArtifacts,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsResponse.SerializeToString,
+            ),
+            'DeleteArtifact': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteArtifact,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactResponse.SerializeToString,
             ),
             'SendTask': grpc.unary_unary_rpc_method_handler(
                     servicer.SendTask,
@@ -478,6 +558,141 @@ class KeryxDaemon:
             '/hermes.keryx.v1.KeryxDaemon/FailTask',
             hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskRequest.SerializeToString,
             hermes_dot_keryx_dot_v1_dot_daemon__pb2.FailTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelTask(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/CancelTask',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.CancelTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PutArtifact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/PutArtifact',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.PutArtifactResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetArtifact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/GetArtifact',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.GetArtifactResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListArtifacts(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/ListArtifacts',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.ListArtifactsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteArtifact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/DeleteArtifact',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.DeleteArtifactResponse.FromString,
             options,
             channel_credentials,
             insecure,

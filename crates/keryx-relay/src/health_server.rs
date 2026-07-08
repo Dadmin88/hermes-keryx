@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
@@ -16,8 +17,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use crate::health::RelayHealthReport;
-use crate::registry::SkillRegistry;
+use crate::registry::{SkillRegistry, StoredSkill};
 use crate::runtime::RelayRuntime;
+use keryx_core::PeerId;
 
 /// gRPC metadata key used by `ConnectNode` to identify the streaming node.
 pub const NODE_ID_METADATA_KEY: &str = "x-keryx-node-id";
@@ -32,6 +34,13 @@ const TARGET_NODE_METADATA_KEYS: &[&str] = &[
     "destination_node",
     "node_id",
     "keryx.target_node_id",
+];
+const SKILL_METADATA_KEYS: &[&str] = &[
+    "keryx.capability_id",
+    "capability_id",
+    "capability",
+    "skill_id",
+    "skill",
 ];
 
 pub struct RelayHealthService {
@@ -127,6 +136,13 @@ impl KeryxRelay for RelayHealthService {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Status::invalid_argument("RegisterNode requires node_id"))?;
         self.runtime.register_node(node_id.to_string());
+        if let Some(registry) = &self.registry {
+            let peer_id = parse_registry_peer_id(node_id)?;
+            registry
+                .upsert_node(peer_id, node_id.to_string(), String::new(), None)
+                .await;
+            self.refresh_registry_metric().await;
+        }
         Ok(Response::new(RegisterNodeResponse { accepted: true }))
     }
 
@@ -139,6 +155,25 @@ impl KeryxRelay for RelayHealthService {
             .task
             .ok_or_else(|| Status::invalid_argument("PublishTask requires task"))?;
         let target_node_id = target_node_id_from_task(&task)?;
+        if let Some(registry) = &self.registry {
+            let peer_id = parse_registry_peer_id(&target_node_id)?;
+            if let Some(skill) = skill_from_task(&task) {
+                registry
+                    .add_skills(
+                        peer_id,
+                        vec![skill],
+                        target_node_id.clone(),
+                        String::new(),
+                        Some(Duration::from_secs(300)),
+                    )
+                    .await;
+            } else {
+                registry
+                    .touch_node(peer_id, Some(Duration::from_secs(300)))
+                    .await;
+            }
+            self.refresh_registry_metric().await;
+        }
         let task_id = task
             .task_id
             .clone()
@@ -213,6 +248,12 @@ fn node_id_from_metadata<T>(request: &Request<T>) -> Result<String, Status> {
         })
 }
 
+fn parse_registry_peer_id(value: &str) -> Result<PeerId, Status> {
+    PeerId::new(value.trim()).map_err(|error| {
+        Status::invalid_argument(format!("node id is not a valid registry peer id: {error}"))
+    })
+}
+
 fn route_node_frame(runtime: &RelayRuntime, frame: NodeFrame) -> Result<(), Status> {
     let task = frame
         .task
@@ -241,6 +282,30 @@ fn target_node_id_from_task(task: &TaskEnvelope) -> Result<String, Status> {
                 "task metadata must include one of: {}",
                 TARGET_NODE_METADATA_KEYS.join(", ")
             ))
+        })
+}
+
+fn skill_from_task(task: &TaskEnvelope) -> Option<StoredSkill> {
+    SKILL_METADATA_KEYS
+        .iter()
+        .find_map(|key| task.metadata.get(*key))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|skill_id| StoredSkill {
+            skill_id: skill_id.to_string(),
+            description: String::new(),
+            tags: task
+                .metadata
+                .get("skill_tags")
+                .or_else(|| task.metadata.get("keryx.skill_tags"))
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|tag| !tag.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
 }
 

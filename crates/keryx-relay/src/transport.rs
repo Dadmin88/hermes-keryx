@@ -7,7 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    autonat, identify, identity, mdns, noise, ping, relay, tcp, yamux, Multiaddr, PeerId, Swarm,
+    autonat, gossipsub, identify, identity, mdns, noise, ping, relay, tcp, yamux, Multiaddr,
+    PeerId, Swarm,
 };
 
 use crate::config::{RelayConfig, KERYX_IDENTIFY_PROTOCOL};
@@ -41,6 +42,7 @@ pub struct RelayServerBehaviour {
     pub relay: relay::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
+    pub registry_gossip: gossipsub::Behaviour,
     pub autonat: autonat::Behaviour,
     pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     pub allowed_peers: libp2p::swarm::behaviour::toggle::Toggle<
@@ -105,6 +107,19 @@ pub fn build_relay_server_swarm(
 ) -> Result<Swarm<RelayServerBehaviour>> {
     let limits = RelayLimits::from_config(&options.config);
     let local_peer_id = keypair.public().to_peer_id();
+    let mut registry_gossip = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        gossipsub::ConfigBuilder::default()
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()
+            .map_err(|err| anyhow::anyhow!("build registry gossipsub config: {err}"))?,
+    )
+    .map_err(|err| anyhow::anyhow!("build registry gossipsub behaviour: {err}"))?;
+    registry_gossip
+        .subscribe(&gossipsub::IdentTopic::new(
+            crate::registry::REGISTRY_GOSSIP_TOPIC,
+        ))
+        .context("subscribe registry gossip topic")?;
 
     let behaviour = RelayServerBehaviour {
         relay: new_relay_behaviour(local_peer_id, limits),
@@ -113,6 +128,7 @@ pub fn build_relay_server_swarm(
             keypair.public(),
         )),
         ping: ping::Behaviour::new(ping::Config::new()),
+        registry_gossip,
         autonat: crate::autonat::new_autonat_server_behaviour(keypair.public()),
         mdns: mdns_toggle(options.config.enable_mdns, local_peer_id)?,
         allowed_peers: options
