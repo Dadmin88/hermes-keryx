@@ -221,3 +221,27 @@ cargo test -p keryx-daemon --test tracing_instrumentation
 cargo test -p keryx-daemon --test graceful_shutdown
 cargo test -p keryx-observe
 ```
+## Dual-run and migration helpers
+
+For operator migration alongside a legacy AgentAnycast install:
+
+```bash
+./scripts/migrate-to-keryx.sh --dry-run
+./scripts/migrate-to-keryx.sh
+./scripts/keryx-dual-run.sh --start
+./scripts/keryx-dual-run.sh --status
+./scripts/keryx-dual-run.sh --stop
+```
+
+Dual-run defaults intentionally avoid AgentAnycast ports `4001` / `50052`:
+
+| Component | Default |
+|-----------|---------|
+| `keryxd` | `127.0.0.1:50051` |
+| relay health gRPC | `127.0.0.1:51052` |
+| registry gRPC | `127.0.0.1:51053` |
+| libp2p | `127.0.0.1:4101` |
+
+State/logs: `~/.hermes/.keryx/{data,logs,run}`.
+
+See [migration-from-agentanycast.md](migration-from-agentanycast.md).
