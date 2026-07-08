@@ -52,6 +52,8 @@ pub enum ValidationError {
     },
     #[error("invalid task state transition: {from:?} -> {to:?}")]
     InvalidTaskTransition { from: TaskStatus, to: TaskStatus },
+    #[error("task cancellation is not applicable for status: {status:?}")]
+    CancelNotApplicable { status: TaskStatus },
     #[error("terminal task state cannot transition: {from:?} -> {to:?}")]
     TerminalTaskTransition { from: TaskStatus, to: TaskStatus },
 }

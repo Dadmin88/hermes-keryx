@@ -28,7 +28,8 @@ pub use limits::{
 pub use peer_id::{NodeId, PeerId};
 pub use retry_policy::RetryPolicy;
 pub use task::{
-    event_for_transition, is_legal_transition, validate_transition, KeryxEventType, Task, TaskId,
-    TaskStatus, TaskTransition,
+    event_for_cancel_transition, event_for_transition, is_cancel_applicable, is_legal_transition,
+    validate_cancel_transition, validate_transition, KeryxEventType, Task,
+    TaskCancellationEventType, TaskId, TaskStatus, TaskTransition,
 };
 pub use task_handle::{AttemptId, CorrelationId, IdempotencyKey, LeaseId, RouteId, TaskHandle};

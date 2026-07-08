@@ -72,6 +72,23 @@ pub enum KeryxEventType {
     RecoveryAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCancellationEventType {
+    CancelRequested,
+    Canceled,
+}
+
+impl TaskCancellationEventType {
+    #[must_use]
+    pub const fn lifecycle_event_type(self) -> Option<KeryxEventType> {
+        match self {
+            Self::CancelRequested => None,
+            Self::Canceled => Some(KeryxEventType::TaskCanceled),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTransition {
     pub from: TaskStatus,
@@ -161,6 +178,37 @@ impl Task {
     pub fn mark_failed(&mut self) -> Result<TaskTransition, KeryxCoreError> {
         self.transition_to(TaskStatus::Failed)
     }
+
+    pub fn mark_canceled(&mut self) -> Result<TaskTransition, KeryxCoreError> {
+        let transition = validate_cancel_transition(self.status)?;
+        self.status = transition.to;
+        Ok(transition)
+    }
+}
+
+#[must_use]
+pub const fn is_cancel_applicable(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Pending | TaskStatus::Running)
+}
+
+pub fn event_for_cancel_transition(from: TaskStatus) -> Result<KeryxEventType, KeryxCoreError> {
+    if is_cancel_applicable(from) {
+        Ok(KeryxEventType::TaskCanceled)
+    } else {
+        Err(KeryxCoreError::Validation(
+            ValidationError::CancelNotApplicable { status: from },
+        ))
+    }
+}
+
+pub fn validate_cancel_transition(from: TaskStatus) -> Result<TaskTransition, KeryxCoreError> {
+    let event_type = event_for_cancel_transition(from)?;
+
+    Ok(TaskTransition {
+        from,
+        to: TaskStatus::Failed,
+        event_type,
+    })
 }
 
 #[must_use]
