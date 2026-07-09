@@ -57,8 +57,9 @@ pub use incoming::{
 };
 pub use lease_recovery_loop::{LeaseRecoveryLoop, LeaseRecoveryLoopHandle};
 pub use routing::{
-    routing_error_to_status, DeliveryRoute, NoopRelayPublisher, PeerDirectory, PeerInfo,
-    RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter, DEFAULT_SEND_TASK_TIMEOUT_MS,
+    routing_error_to_status, DeliveryRoute, GrpcRelayTaskPublisher, NoopRelayPublisher,
+    PeerDirectory, PeerInfo, RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter,
+    DEFAULT_SEND_TASK_TIMEOUT_MS,
 };
 
 /// Default background health probe interval.
@@ -178,6 +179,7 @@ pub struct KeryxDaemonConfig {
     local_peer_id: PeerId,
     send_task_timeout_ms: u64,
     discovery: Option<DiscoverySettings>,
+    relay_endpoint: Option<String>,
 }
 
 impl KeryxDaemonConfig {
@@ -198,6 +200,7 @@ impl KeryxDaemonConfig {
             local_peer_id: PeerId::new(DEFAULT_LOCAL_PEER_ID).expect("static local peer id"),
             send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
             discovery: None,
+            relay_endpoint: None,
         }
     }
 
@@ -333,13 +336,38 @@ impl KeryxDaemonConfig {
     pub fn discovery(&self) -> Option<&DiscoverySettings> {
         self.discovery.as_ref()
     }
+
+    #[must_use]
+    pub fn with_relay_endpoint(mut self, relay_endpoint: Option<String>) -> Self {
+        self.relay_endpoint = relay_endpoint
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn relay_endpoint(&self) -> Option<&str> {
+        self.relay_endpoint.as_deref()
+    }
 }
 
+const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
+const RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const RELAY_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
 const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
 const DAEMON_REGISTRATION_TTL_ENV: &str = "HERMES_KERYX_DAEMON_REGISTRATION_TTL_SECONDS";
+
+/// Build relay task publishing endpoint from environment when configured.
+#[must_use]
+pub fn relay_endpoint_from_env() -> Option<String> {
+    std::env::var(RELAY_ENDPOINT_ENV)
+        .or_else(|_| std::env::var(RELAY_HEALTH_ENDPOINT_ENV))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 /// Build discovery settings from environment when a relay registry endpoint is configured.
 #[must_use]
@@ -493,9 +521,15 @@ impl KeryxDaemonRuntime {
             startup_recovery_duration_ms: startup_recovery_started_at.elapsed().as_millis(),
         };
         let peer_directory = Arc::new(PeerDirectory::new(config.local_peer_id().clone()));
+        let publisher: Arc<dyn RelayTaskPublisher> = config.relay_endpoint().map_or_else(
+            || Arc::new(NoopRelayPublisher) as Arc<dyn RelayTaskPublisher>,
+            |endpoint| {
+                Arc::new(GrpcRelayTaskPublisher::new(endpoint)) as Arc<dyn RelayTaskPublisher>
+            },
+        );
         let router = Arc::new(TaskRouter::new(
             peer_directory,
-            Arc::new(NoopRelayPublisher),
+            publisher,
             config.send_task_timeout_ms(),
         ));
         let discovery = Arc::new(RwLock::new(None));
@@ -539,7 +573,15 @@ impl KeryxDaemonRuntime {
                 "relay skill registry is not configured",
             ));
         };
-        handle.discover(request).await
+        let response = handle.discover(request).await?;
+        if self.config.relay_endpoint().is_some() {
+            for registration in &response.registrations {
+                if let Ok(peer_id) = PeerId::new(registration.peer_id.trim()) {
+                    self.router.set_peer_routable(&peer_id, true).await;
+                }
+            }
+        }
+        Ok(response)
     }
 
     /// Reject new RPC handlers while keeping the listener up (used by integration tests).

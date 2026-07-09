@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use keryx_core::{IdempotencyKey, PeerId, TaskId, TaskStatus};
-use keryx_proto::v1::TaskEnvelope;
+use keryx_proto::v1::{keryx_relay_client::KeryxRelayClient, PublishTaskRequest, TaskEnvelope};
 use keryx_store::{SqliteStore, StoreError, StoreResult, TaskRecord};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tonic::transport::Channel;
 use tonic::Status;
 use tracing::{info, instrument, warn};
 
@@ -73,6 +74,10 @@ pub enum RoutingError {
 /// Publishes a task envelope to a remote peer via the relay control plane.
 #[async_trait]
 pub trait RelayTaskPublisher: Send + Sync {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     async fn deliver_task(
         &self,
         target_peer_id: &PeerId,
@@ -87,6 +92,10 @@ pub struct NoopRelayPublisher;
 
 #[async_trait]
 impl RelayTaskPublisher for NoopRelayPublisher {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn deliver_task(
         &self,
         _target_peer_id: &PeerId,
@@ -97,11 +106,69 @@ impl RelayTaskPublisher for NoopRelayPublisher {
     }
 }
 
+/// gRPC relay publisher used when the daemon has a relay control-plane endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcRelayTaskPublisher {
+    endpoint: String,
+}
+
+impl GrpcRelayTaskPublisher {
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+
+    async fn connect(
+        &self,
+        target_peer_id: &PeerId,
+    ) -> Result<KeryxRelayClient<Channel>, RoutingError> {
+        KeryxRelayClient::connect(self.endpoint.clone())
+            .await
+            .map_err(|error| RoutingError::RelayFailed {
+                peer_id: target_peer_id.to_string(),
+                reason: format!("failed to connect to relay at {}: {error}", self.endpoint),
+            })
+    }
+}
+
+#[async_trait]
+impl RelayTaskPublisher for GrpcRelayTaskPublisher {
+    async fn deliver_task(
+        &self,
+        target_peer_id: &PeerId,
+        mut envelope: TaskEnvelope,
+        _timeout: Duration,
+    ) -> Result<(), RoutingError> {
+        envelope
+            .metadata
+            .entry("keryx.target_node_id".to_string())
+            .or_insert_with(|| target_peer_id.as_str().to_string());
+        let mut client = self.connect(target_peer_id).await?;
+        client
+            .publish_task(PublishTaskRequest {
+                task: Some(envelope),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| RoutingError::RelayFailed {
+                peer_id: target_peer_id.to_string(),
+                reason: format!(
+                    "relay PublishTask returned {}: {}",
+                    status.code(),
+                    status.message()
+                ),
+            })
+    }
+}
+
 /// Tracks the local peer id and relay-connected remote peers.
 #[derive(Debug)]
 pub struct PeerDirectory {
     local_peer_id: PeerId,
     connected_peers: RwLock<HashSet<String>>,
+    relay_routable_peers: RwLock<HashSet<String>>,
 }
 
 impl PeerDirectory {
@@ -110,6 +177,7 @@ impl PeerDirectory {
         Self {
             local_peer_id,
             connected_peers: RwLock::new(HashSet::new()),
+            relay_routable_peers: RwLock::new(HashSet::new()),
         }
     }
 
@@ -127,6 +195,15 @@ impl PeerDirectory {
         }
     }
 
+    pub async fn set_routable_peer(&self, peer_id: &PeerId, routable: bool) {
+        let mut peers = self.relay_routable_peers.write().await;
+        if routable {
+            peers.insert(peer_id.as_str().to_string());
+        } else {
+            peers.remove(peer_id.as_str());
+        }
+    }
+
     pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
         if peer_id == &self.local_peer_id {
             return true;
@@ -134,18 +211,46 @@ impl PeerDirectory {
         self.connected_peers.read().await.contains(peer_id.as_str())
     }
 
+    pub async fn is_routable(&self, peer_id: &PeerId) -> bool {
+        if self.is_connected(peer_id).await {
+            return true;
+        }
+        self.relay_routable_peers
+            .read()
+            .await
+            .contains(peer_id.as_str())
+    }
+
     pub async fn list_peers(&self) -> Vec<PeerInfo> {
         let connected = self.connected_peers.read().await.clone();
-        let mut peers: Vec<PeerInfo> = connected
-            .into_iter()
-            .filter_map(|value| {
-                PeerId::new(value).ok().map(|peer_id| PeerInfo {
+        let routable = self.relay_routable_peers.read().await.clone();
+        let mut seen = HashSet::new();
+        let mut peers: Vec<PeerInfo> = Vec::new();
+
+        for value in connected {
+            if let Ok(peer_id) = PeerId::new(value.clone()) {
+                seen.insert(value);
+                peers.push(PeerInfo {
                     peer_id,
                     connected: true,
                     local: false,
-                })
-            })
-            .collect();
+                });
+            }
+        }
+
+        for value in routable {
+            if seen.contains(&value) {
+                continue;
+            }
+            if let Ok(peer_id) = PeerId::new(value) {
+                peers.push(PeerInfo {
+                    peer_id,
+                    connected: false,
+                    local: false,
+                });
+            }
+        }
+
         peers.push(PeerInfo {
             peer_id: self.local_peer_id.clone(),
             connected: true,
@@ -451,14 +556,14 @@ impl TaskRouter {
             });
         }
 
-        if !self.peers.is_connected(&target_peer_id).await {
+        let publisher = Arc::clone(&*self.publisher.read().await);
+        if !self.peers.is_routable(&target_peer_id).await && !publisher.is_configured() {
             return Err(RoutingError::UnknownPeer {
                 peer_id: target_peer_id.to_string(),
             });
         }
 
         let timeout = normalize_timeout(timeout_ms, self.default_timeout_ms);
-        let publisher = Arc::clone(&*self.publisher.read().await);
         let delivery = tokio::time::timeout(
             timeout,
             publisher.deliver_task(&target_peer_id, envelope, timeout),
@@ -481,6 +586,10 @@ impl TaskRouter {
 
     pub async fn set_peer_connected(&self, peer_id: &PeerId, connected: bool) {
         self.peers.set_connected_peer(peer_id, connected).await;
+    }
+
+    pub async fn set_peer_routable(&self, peer_id: &PeerId, routable: bool) {
+        self.peers.set_routable_peer(peer_id, routable).await;
     }
 
     pub async fn list_peers(&self) -> Vec<PeerInfo> {

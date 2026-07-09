@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,7 +90,9 @@ impl Drop for RpcTestHarness {
 #[allow(dead_code)]
 pub struct MockRelayPublisher {
     delay: Duration,
+    fail: bool,
     deliveries: Mutex<Vec<(String, String)>>,
+    call_count: AtomicUsize,
 }
 
 #[allow(dead_code)]
@@ -97,7 +100,9 @@ impl MockRelayPublisher {
     pub fn new() -> Self {
         Self {
             delay: Duration::ZERO,
+            fail: false,
             deliveries: Mutex::new(Vec::new()),
+            call_count: AtomicUsize::new(0),
         }
     }
 
@@ -106,8 +111,17 @@ impl MockRelayPublisher {
         self
     }
 
+    pub fn failing(mut self) -> Self {
+        self.fail = true;
+        self
+    }
+
     pub async fn deliveries(&self) -> Vec<(String, String)> {
         self.deliveries.lock().await.clone()
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
     }
 }
 
@@ -119,8 +133,15 @@ impl RelayTaskPublisher for MockRelayPublisher {
         envelope: TaskEnvelope,
         _timeout: Duration,
     ) -> Result<(), RoutingError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
         if self.delay > Duration::ZERO {
             tokio::time::sleep(self.delay).await;
+        }
+        if self.fail {
+            return Err(RoutingError::RelayFailed {
+                peer_id: target_peer_id.as_str().to_string(),
+                reason: "mock relay failure".to_string(),
+            });
         }
         let task_id = envelope
             .task_id

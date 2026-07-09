@@ -1,6 +1,7 @@
 use anyhow::Result;
 use keryx_daemon::{
-    discovery_settings_from_env, serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime,
+    discovery_settings_from_env, relay_endpoint_from_env, serve_daemon_rpc, KeryxDaemonConfig,
+    KeryxDaemonRuntime,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +14,9 @@ async fn main() -> Result<()> {
     let mut config = KeryxDaemonConfig::new(data_dir(), now_ms());
     if let Some(discovery) = discovery_settings_from_env() {
         config = config.with_discovery(Some(discovery));
+    }
+    if let Some(relay_endpoint) = relay_endpoint_from_env() {
+        config = config.with_relay_endpoint(Some(relay_endpoint));
     }
     let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await?);
     tracing::info!(
