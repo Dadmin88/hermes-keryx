@@ -36,6 +36,16 @@ pub enum StoreError {
         key: IdempotencyKey,
         existing_task_id: TaskId,
     },
+    #[error("task envelope not found: {0}")]
+    TaskEnvelopeNotFound(TaskId),
+    #[error("task envelope id {envelope_task_id} does not match task {task_id}")]
+    TaskEnvelopeMismatch {
+        task_id: TaskId,
+        envelope_task_id: TaskId,
+    },
+    #[error("task envelope conflicts with the stored envelope for task {0}")]
+    TaskEnvelopeConflict(TaskId),
+
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationError),
     #[error("event stream for task {0} is corrupt or incomplete")]
@@ -102,7 +112,7 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -136,6 +146,24 @@ impl TaskRecord {
     #[must_use]
     pub const fn task_id(&self) -> &TaskId {
         &self.id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEnvelopeRecord {
+    pub task_id: TaskId,
+    pub encoded_envelope: Vec<u8>,
+    pub received_at_ms: i64,
+}
+
+impl TaskEnvelopeRecord {
+    #[must_use]
+    pub const fn new(task_id: TaskId, encoded_envelope: Vec<u8>, received_at_ms: i64) -> Self {
+        Self {
+            task_id,
+            encoded_envelope,
+            received_at_ms,
+        }
     }
 }
 
@@ -276,6 +304,7 @@ struct InMemoryState {
     artifacts: HashMap<ArtifactId, ArtifactRecord>,
     inline_artifacts: HashMap<ArtifactId, Vec<u8>>,
     blobs: HashMap<Digest, (Vec<u8>, u32)>,
+    envelopes: HashMap<TaskId, TaskEnvelopeRecord>,
 }
 
 fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
@@ -349,6 +378,63 @@ fn ensure_active_lease_unexpired(active: &LeaseRecord, now_ms: i64) -> StoreResu
 impl InMemoryStore {
     fn lock(&self) -> StoreResult<std::sync::MutexGuard<'_, InMemoryState>> {
         self.inner.lock().map_err(|_| StoreError::LockPoisoned)
+    }
+
+    pub fn accept_task_with_envelope(
+        &self,
+        task: TaskRecord,
+        envelope: TaskEnvelopeRecord,
+    ) -> StoreResult<TaskRecord> {
+        validate_accepted_task_status(&task)?;
+        ensure_pending_accept(&task)?;
+        ensure_matching_envelope_task_id(&task, &envelope)?;
+
+        let mut state = self.lock()?;
+        if let Some(key) = &task.idempotency_key {
+            if let Some(existing_task_id) = state.idempotency.get(key) {
+                let existing = state
+                    .tasks
+                    .get(existing_task_id)
+                    .cloned()
+                    .ok_or_else(|| StoreError::CorruptEventStream(existing_task_id.clone()))?;
+                if existing == task {
+                    return match state.envelopes.get(existing_task_id) {
+                        Some(existing_envelope) if existing_envelope == &envelope => Ok(existing),
+                        _ => Err(StoreError::TaskEnvelopeConflict(existing_task_id.clone())),
+                    };
+                }
+                return Err(StoreError::IdempotencyConflict {
+                    key: key.clone(),
+                    existing_task_id: existing_task_id.clone(),
+                });
+            }
+        }
+
+        let task_id = task.task_id().clone();
+        if state.tasks.contains_key(&task_id) {
+            return Err(StoreError::TaskAlreadyExists(task_id));
+        }
+        if let Some(key) = &task.idempotency_key {
+            state.idempotency.insert(key.clone(), task_id.clone());
+        }
+        append_in_memory_event(
+            &mut state,
+            &task_id,
+            KeryxEventType::TaskAccepted,
+            None,
+            task.status,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        state.envelopes.insert(task_id, envelope);
+        Ok(task)
+    }
+
+    pub fn get_task_envelope(&self, task_id: &TaskId) -> StoreResult<TaskEnvelopeRecord> {
+        self.lock()?
+            .envelopes
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskEnvelopeNotFound(task_id.clone()))
     }
 
     pub fn lease_task(&self, task_id: &TaskId, lease: LeaseRecord) -> StoreResult<TaskRecord> {
@@ -1155,6 +1241,27 @@ impl SqliteStore {
         .execute(&mut *tx)
         .await
         .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let task_envelopes_exists = sqlx::query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_envelopes'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+        .is_some();
+        if !task_envelopes_exists {
+            for statement in MIGRATION_006 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (6, 'task_envelopes')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
         let legacy_unowned_rows = sqlx::query(
             "SELECT lease_id, task_id, worker_id, leased_at_ms, expires_at_ms FROM leases WHERE active = 1 AND worker_id IS NULL ORDER BY expires_at_ms ASC, task_id ASC",
         )
@@ -1324,6 +1431,102 @@ impl SqliteStore {
     }
 
     #[instrument(skip(self), fields(task_id = %task.task_id().as_str()))]
+    pub async fn accept_task_with_envelope(
+        &self,
+        task: TaskRecord,
+        envelope: TaskEnvelopeRecord,
+    ) -> StoreResult<TaskRecord> {
+        validate_accepted_task_status(&task)?;
+        ensure_pending_accept(&task)?;
+        ensure_matching_envelope_task_id(&task, &envelope)?;
+
+        let mut tx = self.pool.begin().await?;
+        if let Some(key) = &task.idempotency_key {
+            let existing = sqlx::query("SELECT task_id FROM idempotency_keys WHERE key = ?")
+                .bind(key.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(row) = existing {
+                let existing_task_id = TaskId::new(row.get::<String, _>("task_id"))?;
+                let existing_task = fetch_task_with_executor(&mut tx, &existing_task_id).await?;
+                if existing_task == task {
+                    let existing_envelope =
+                        fetch_task_envelope_optional_with_executor(&mut tx, &existing_task_id)
+                            .await?;
+                    if existing_envelope.as_ref() == Some(&envelope) {
+                        tx.commit().await?;
+                        return Ok(existing_task);
+                    }
+                    return Err(StoreError::TaskEnvelopeConflict(existing_task_id));
+                }
+                return Err(StoreError::IdempotencyConflict {
+                    key: key.clone(),
+                    existing_task_id,
+                });
+            }
+        }
+
+        let task_id = task.task_id().clone();
+        let existing_task = sqlx::query("SELECT task_id FROM tasks WHERE task_id = ?")
+            .bind(task_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if existing_task.is_some() {
+            return Err(StoreError::TaskAlreadyExists(task_id));
+        }
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, status, idempotency_key, retry_count, dead_lettered, dead_letter_reason, deadline_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task.task_id().as_str())
+        .bind(status_to_str(task.status))
+        .bind(task.idempotency_key.as_ref().map(IdempotencyKey::as_str))
+        .bind(i64::from(task.retry_count))
+        .bind(i64::from(task.dead_lettered))
+        .bind(task.dead_letter_reason.as_deref())
+        .bind(task.deadline_ms)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(key) = &task.idempotency_key {
+            sqlx::query("INSERT INTO idempotency_keys (key, task_id) VALUES (?, ?)")
+                .bind(key.as_str())
+                .bind(task.task_id().as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        insert_event(
+            &mut tx,
+            task.task_id(),
+            1,
+            KeryxEventType::TaskAccepted,
+            None,
+            task.status,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO task_envelopes (task_id, encoded_envelope, received_at_ms) VALUES (?, ?, ?)",
+        )
+        .bind(envelope.task_id.as_str())
+        .bind(&envelope.encoded_envelope)
+        .bind(envelope.received_at_ms)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(task)
+    }
+
+    pub async fn get_task_envelope(&self, task_id: &TaskId) -> StoreResult<TaskEnvelopeRecord> {
+        let row = sqlx::query(
+            "SELECT task_id, encoded_envelope, received_at_ms FROM task_envelopes WHERE task_id = ?",
+        )
+        .bind(task_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_task_envelope)
+            .transpose()?
+            .ok_or_else(|| StoreError::TaskEnvelopeNotFound(task_id.clone()))
+    }
+
     pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {
         validate_accepted_task_status(&task)?;
         let mut tx = self.pool.begin().await?;
@@ -1897,6 +2100,20 @@ async fn detect_sqlite_schema_version(pool: &SqlitePool) -> StoreResult<i64> {
     Ok(row.get::<i64, _>("version"))
 }
 
+fn ensure_matching_envelope_task_id(
+    task: &TaskRecord,
+    envelope: &TaskEnvelopeRecord,
+) -> StoreResult<()> {
+    if task.task_id() == &envelope.task_id {
+        Ok(())
+    } else {
+        Err(StoreError::TaskEnvelopeMismatch {
+            task_id: task.task_id().clone(),
+            envelope_task_id: envelope.task_id.clone(),
+        })
+    }
+}
+
 fn ensure_pending_accept(task: &TaskRecord) -> StoreResult<()> {
     if task.status == TaskStatus::Pending {
         Ok(())
@@ -2464,6 +2681,27 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskRecord> {
     })
 }
 
+fn row_to_task_envelope(row: sqlx::sqlite::SqliteRow) -> StoreResult<TaskEnvelopeRecord> {
+    Ok(TaskEnvelopeRecord {
+        task_id: TaskId::new(row.get::<String, _>("task_id"))?,
+        encoded_envelope: row.get::<Vec<u8>, _>("encoded_envelope"),
+        received_at_ms: row.get::<i64, _>("received_at_ms"),
+    })
+}
+
+async fn fetch_task_envelope_optional_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+) -> StoreResult<Option<TaskEnvelopeRecord>> {
+    let row = sqlx::query(
+        "SELECT task_id, encoded_envelope, received_at_ms FROM task_envelopes WHERE task_id = ?",
+    )
+    .bind(task_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(row_to_task_envelope).transpose()
+}
+
 fn row_to_lease(row: sqlx::sqlite::SqliteRow) -> StoreResult<LeaseRecord> {
     Ok(LeaseRecord::from_parts(
         LeaseId::new(row.get::<String, _>("lease_id"))?,
@@ -2852,6 +3090,10 @@ const MIGRATION_005: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline_ms)",
 ];
 
+const MIGRATION_006: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS task_envelopes (task_id TEXT PRIMARY KEY, encoded_envelope BLOB NOT NULL, received_at_ms INTEGER NOT NULL, FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE)",
+];
+
 const fn status_to_str(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Pending => "pending",
@@ -2967,6 +3209,7 @@ mod tests {
             artifacts: HashMap::new(),
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
+            envelopes: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -3026,6 +3269,7 @@ mod tests {
                 artifacts: HashMap::new(),
                 inline_artifacts: HashMap::new(),
                 blobs: HashMap::new(),
+                envelopes: HashMap::new(),
             }),
         };
 
@@ -3056,6 +3300,7 @@ mod tests {
             artifacts: HashMap::new(),
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
+            envelopes: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -3094,6 +3339,7 @@ mod tests {
             artifacts: HashMap::new(),
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
+            envelopes: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,

@@ -79,7 +79,10 @@ async fn sqlite_envelope_survives_reopen_and_schema_is_v6() {
 
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     store
         .accept_task_with_envelope(task.clone(), stored_envelope.clone())
@@ -145,10 +148,7 @@ async fn sqlite_mismatch_rolls_back_lifecycle_acceptance() {
         StoreError::TaskNotFound(task.task_id().clone())
     );
     assert_eq!(
-        store
-            .get_task_envelope(task.task_id())
-            .await
-            .unwrap_err(),
+        store.get_task_envelope(task.task_id()).await.unwrap_err(),
         StoreError::TaskEnvelopeNotFound(task.task_id().clone())
     );
 }
@@ -163,10 +163,7 @@ async fn legacy_lifecycle_only_acceptance_still_works() {
 
     assert_eq!(store.accept_task(task.clone()).await.unwrap(), task);
     assert_eq!(
-        store
-            .get_task_envelope(task.task_id())
-            .await
-            .unwrap_err(),
+        store.get_task_envelope(task.task_id()).await.unwrap_err(),
         StoreError::TaskEnvelopeNotFound(task.task_id().clone())
     );
 }

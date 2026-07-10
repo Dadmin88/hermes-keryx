@@ -40,8 +40,8 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
 
 use keryx_store::{
-    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskRecord,
-    CURRENT_SCHEMA_VERSION,
+    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,
+    TaskRecord, CURRENT_SCHEMA_VERSION,
 };
 
 pub use cancellation::{CancellationSnapshot, CancellationState};
@@ -993,13 +993,16 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task_id = parse_required_task_id(envelope.task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
-        let envelope_bytes = envelope.encoded_len() as u64;
+        let encoded_envelope = envelope.encode_to_vec();
+        let envelope_bytes = encoded_envelope.len() as u64;
         self.runtime
             .config()
             .limits()
             .check_envelope_bytes(envelope_bytes)
             .map_err(limit_exceeded_to_status)?;
         let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let envelope_record =
+            TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
         let _submit_backpressure_guard = self.runtime.submit_backpressure_lock.lock().await;
         let pending_count = self
             .runtime
@@ -1015,7 +1018,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let accepted = self
             .runtime
             .store()
-            .accept_task(record)
+            .accept_task_with_envelope(record, envelope_record)
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_submitted();
@@ -1651,6 +1654,21 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         StoreError::TaskAlreadyExists(task_id) => {
             Status::already_exists(format!("task already exists: {task_id}"))
         }
+        StoreError::TaskEnvelopeNotFound(task_id) => {
+            Status::not_found(format!("task envelope not found: {task_id}"))
+        }
+        StoreError::TaskEnvelopeMismatch {
+            task_id,
+            envelope_task_id,
+        } => Status::failed_precondition(format!(
+            "task envelope id {} does not match task {}",
+            envelope_task_id.as_str(),
+            task_id.as_str()
+        )),
+        StoreError::TaskEnvelopeConflict(task_id) => Status::already_exists(format!(
+            "task envelope conflicts with the stored envelope for task {}",
+            task_id.as_str()
+        )),
         StoreError::ArtifactNotFound(artifact_id) => {
             Status::not_found(format!("artifact not found: {artifact_id}"))
         }
