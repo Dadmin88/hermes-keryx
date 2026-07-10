@@ -29,72 +29,89 @@ jobs:
       - name: Update final schema-aware tests and lint contract
         run: |
           python - <<'PY'
+          import re
           from pathlib import Path
 
           relay = Path('crates/keryx-relay/tests/relay_grpc.rs')
           text = relay.read_text()
-          text = text.replace(
-              '''    a_tx.send(NodeFrame {
-                  frame_id: "frame-a-to-b".to_string(),
-                  task: Some(task("task-a-to-b", "node-b")),
-              })''',
-              '''    a_tx.send(NodeFrame {
+
+          text, node_count = re.subn(
+              r'''NodeFrame\s*\{\s*frame_id:\s*"frame-a-to-b"\.to_string\(\),\s*task:\s*Some\(task\("task-a-to-b",\s*"node-b"\)\),\s*\}''',
+              '''NodeFrame {
                   frame_id: "frame-a-to-b".to_string(),
                   target_node_id: "node-b".to_string(),
                   task: Some(task("task-a-to-b", "node-b")),
                   result: None,
-              })''',
+              }''',
+              text,
+              count=1,
           )
-          text = text.replace(
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task("task-offline", "node-offline")),
-                  })''',
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task("task-offline", "node-offline")),
-                      target_node_id: "node-offline".to_string(),
+          if node_count != 1 and 'target_node_id: "node-b".to_string()' not in text:
+              raise SystemExit('NodeFrame test initializer was not updated')
+
+          cases = (
+              ('task-offline', 'node-offline', None),
+              ('task-pending', 'node-pending', None),
+              ('task-python', 'node-python', 'python'),
+          )
+          for task_id, target, skill in cases:
+              if skill is None:
+                  task_expr = rf'task\("{task_id}",\s*"{target}"\)'
+                  rendered = f'task("{task_id}", "{target}")'
+              else:
+                  task_expr = rf'task_with_skill\("{task_id}",\s*"{target}",\s*"{skill}"\)'
+                  rendered = f'task_with_skill("{task_id}", "{target}", "{skill}")'
+              pattern = rf'''PublishTaskRequest\s*\{{\s*task:\s*Some\({task_expr}\),\s*\}}'''
+              replacement = f'''PublishTaskRequest {{
+                      task: Some({rendered}),
+                      target_node_id: "{target}".to_string(),
                       source_node_id: "node-publisher".to_string(),
-                  })''',
-          )
-          text = text.replace(
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task("task-pending", "node-pending")),
-                  })''',
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task("task-pending", "node-pending")),
-                      target_node_id: "node-pending".to_string(),
-                      source_node_id: "node-publisher".to_string(),
-                  })''',
-          )
-          text = text.replace(
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task_with_skill("task-python", "node-python", "python")),
-                  })''',
-              '''        .publish_task(PublishTaskRequest {
-                      task: Some(task_with_skill("task-python", "node-python", "python")),
-                      target_node_id: "node-python".to_string(),
-                      source_node_id: "node-publisher".to_string(),
-                  })''',
-          )
+                  }}'''
+              text, count = re.subn(pattern, replacement, text, count=1)
+              marker = f'target_node_id: "{target}".to_string()'
+              if count != 1 and marker not in text:
+                  raise SystemExit(f'PublishTaskRequest initializer was not updated for {task_id}')
+
           relay.write_text(text)
 
           daemon = Path('crates/keryx-daemon/src/lib.rs')
           text = daemon.read_text()
-          anchor = 'async fn build_terminal_result('
-          if '#[allow(clippy::too_many_arguments)]\n' + anchor not in text:
-              if anchor not in text:
-                  raise SystemExit('build_terminal_result anchor missing')
-              text = text.replace(anchor, '#[allow(clippy::too_many_arguments)]\n' + anchor, 1)
+          text, count = re.subn(
+              r'(?m)^async fn build_terminal_result\(',
+              '#[allow(clippy::too_many_arguments)]\nasync fn build_terminal_result(',
+              text,
+              count=1,
+          )
+          if count != 1 and '#[allow(clippy::too_many_arguments)]\nasync fn build_terminal_result(' not in text:
+              raise SystemExit('build_terminal_result lint annotation was not added')
           daemon.write_text(text)
           PY
       - name: Verify Rust and Python SDK
+        id: verify
+        shell: bash
         run: |
-          cargo fmt --all
-          cargo fmt --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
-          python -m pip install -e 'sdk/python[dev]'
-          python -m pytest sdk/python/tests -q
+          set +e
+          set -o pipefail
+          {
+            cargo fmt --all
+            cargo fmt --check
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
+            python -m pip install -e 'sdk/python[dev]'
+            python -m pytest sdk/python/tests -q
+          } 2>&1 | tee phase17-final-fix.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-final-fix-log
+          path: phase17-final-fix.log
+          if-no-files-found: error
       - name: Commit verified fixes
+        if: steps.verify.outputs.status == '0'
         run: |
           if git diff --quiet; then
             echo 'No final source fixes required'
@@ -105,3 +122,6 @@ jobs:
           git add crates/keryx-relay/tests/relay_grpc.rs crates/keryx-daemon/src/lib.rs
           git commit -m 'fix(phase17): finalize relay schema test coverage'
           git push origin HEAD:${{ github.head_ref }}
+      - name: Fail unsuccessful verification
+        if: steps.verify.outputs.status != '0'
+        run: exit 1
