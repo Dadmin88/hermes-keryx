@@ -141,10 +141,10 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         mut envelope: TaskEnvelope,
         _timeout: Duration,
     ) -> Result<(), RoutingError> {
-        envelope
-            .metadata
-            .entry("keryx.target_node_id".to_string())
-            .or_insert_with(|| target_peer_id.as_str().to_string());
+        envelope.metadata.insert(
+            "target_node_id".to_string(),
+            target_peer_id.as_str().to_string(),
+        );
         let mut client = self.connect(target_peer_id).await?;
         client
             .publish_task(PublishTaskRequest {

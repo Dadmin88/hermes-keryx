@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import grpc
 import pytest
 
 from hermes.keryx.v1 import common_pb2, daemon_pb2
@@ -40,4 +41,33 @@ async def test_send_task_to_mock_daemon(started_node: tuple[KeryxNode, AsyncMock
     kwargs = client.send_task.await_args.kwargs
     assert kwargs["target_peer_id"] == "peer-remote"
     assert kwargs["message_text"] == "hi"
+    await node.stop()
+
+class _UnknownPeerRpcError(Exception):
+    def code(self):
+        return grpc.StatusCode.NOT_FOUND
+
+    def details(self):
+        return "unknown peer: peer-discovered"
+
+
+@pytest.mark.asyncio
+async def test_skill_send_reports_keryx_cross_node_capability_gap(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    client.discover = AsyncMock(
+        return_value=[
+            {
+                "peer_id": "peer-discovered",
+                "agent_name": "remote",
+                "skills": ["remote-skill"],
+            }
+        ]
+    )
+    client.send_task = AsyncMock(side_effect=_UnknownPeerRpcError())
+
+    await node.start()
+    with pytest.raises(NotImplementedError, match="registry-discovered peers"):
+        await node.send_task({"role": "user", "parts": [{"text": "hi"}]}, skill="remote-skill")
     await node.stop()

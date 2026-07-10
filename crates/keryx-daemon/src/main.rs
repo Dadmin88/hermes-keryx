@@ -1,4 +1,5 @@
 use anyhow::Result;
+use keryx_core::PeerId;
 use keryx_daemon::{
     discovery_settings_from_env, relay_endpoint_from_env, serve_daemon_rpc, KeryxDaemonConfig,
     KeryxDaemonRuntime,
@@ -12,6 +13,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let mut config = KeryxDaemonConfig::new(data_dir(), now_ms());
+    if let Some(peer_id) = local_peer_id()? {
+        config = config.with_local_peer_id(peer_id);
+    }
     if let Some(discovery) = discovery_settings_from_env() {
         config = config.with_discovery(Some(discovery));
     }
@@ -66,6 +70,19 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn local_peer_id() -> Result<Option<PeerId>> {
+    for key in ["HERMES_KERYX_DAEMON_PEER_ID", "HERMES_KERYX_NODE_PEER_ID"] {
+        if let Some(value) = std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(value.parse()?));
+        }
+    }
+    Ok(None)
 }
 
 fn data_dir() -> std::path::PathBuf {
