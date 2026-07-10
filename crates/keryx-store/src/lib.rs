@@ -1,5 +1,8 @@
 //! Storage traits plus in-memory and SQLite implementations for Hermes Keryx.
 
+mod results;
+pub use results::*;
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -45,6 +48,36 @@ pub enum StoreError {
     },
     #[error("task envelope conflicts with the stored envelope for task {0}")]
     TaskEnvelopeConflict(TaskId),
+    #[error("transport context not found for task {0}")]
+    TransportContextNotFound(TaskId),
+    #[error("transport context conflicts for task {0}")]
+    TransportContextConflict(TaskId),
+    #[error("transport context task {context_task_id} does not match task {task_id}")]
+    TransportContextTaskMismatch {
+        task_id: TaskId,
+        context_task_id: TaskId,
+    },
+    #[error("terminal result not found for task {0}")]
+    TerminalResultNotFound(TaskId),
+    #[error("terminal result conflicts for task {0}")]
+    TerminalResultConflict(TaskId),
+    #[error("terminal result task {result_task_id} does not match task {task_id}")]
+    TerminalResultTaskMismatch {
+        task_id: TaskId,
+        result_task_id: TaskId,
+    },
+    #[error("terminal result for task {0} is not terminal")]
+    TerminalResultNotTerminal(TaskId),
+    #[error("result delivery lease mismatch: {0}")]
+    ResultDeliveryLeaseMismatch(String),
+    #[error(
+        "remote result executor mismatch for task {task_id}: expected {expected}, got {actual}"
+    )]
+    RemoteResultExecutorMismatch {
+        task_id: TaskId,
+        expected: keryx_core::PeerId,
+        actual: keryx_core::PeerId,
+    },
 
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationError),
@@ -112,7 +145,7 @@ impl From<KeryxCoreError> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -311,6 +344,9 @@ struct InMemoryState {
     inline_artifacts: HashMap<ArtifactId, Vec<u8>>,
     blobs: HashMap<Digest, (Vec<u8>, u32)>,
     envelopes: HashMap<TaskId, TaskEnvelopeRecord>,
+    transport_contexts: HashMap<TaskId, TaskTransportContextRecord>,
+    terminal_results: HashMap<TaskId, TerminalResultRecord>,
+    result_outbox: HashMap<String, ResultOutboxRecord>,
 }
 
 fn validate_accepted_task_status(task: &TaskRecord) -> StoreResult<()> {
@@ -1298,6 +1334,27 @@ impl SqliteStore {
         }
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (6, 'task_envelopes')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+        let phase17_results_exist = sqlx::query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_terminal_results'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| StoreError::MigrationFailed(error.to_string()))?
+        .is_some();
+        if !phase17_results_exist {
+            for statement in results::MIGRATION_007 {
+                sqlx::query(statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| StoreError::MigrationFailed(error.to_string()))?;
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (7, 'phase17_terminal_results')",
         )
         .execute(&mut *tx)
         .await
@@ -3295,6 +3352,9 @@ mod tests {
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
             envelopes: HashMap::new(),
+            transport_contexts: HashMap::new(),
+            terminal_results: HashMap::new(),
+            result_outbox: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -3355,6 +3415,9 @@ mod tests {
                 inline_artifacts: HashMap::new(),
                 blobs: HashMap::new(),
                 envelopes: HashMap::new(),
+                transport_contexts: HashMap::new(),
+                terminal_results: HashMap::new(),
+                result_outbox: HashMap::new(),
             }),
         };
 
@@ -3386,6 +3449,9 @@ mod tests {
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
             envelopes: HashMap::new(),
+            transport_contexts: HashMap::new(),
+            terminal_results: HashMap::new(),
+            result_outbox: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,
@@ -3425,6 +3491,9 @@ mod tests {
             inline_artifacts: HashMap::new(),
             blobs: HashMap::new(),
             envelopes: HashMap::new(),
+            transport_contexts: HashMap::new(),
+            terminal_results: HashMap::new(),
+            result_outbox: HashMap::new(),
         };
         append_in_memory_event(
             &mut state,

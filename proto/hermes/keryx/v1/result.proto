@@ -1,0 +1,32 @@
+syntax = "proto3";
+package hermes.keryx.v1;
+
+import "hermes/keryx/v1/common.proto";
+
+enum TerminalOutcome {
+  TERMINAL_OUTCOME_UNSPECIFIED = 0;
+  TERMINAL_OUTCOME_COMPLETED = 1;
+  TERMINAL_OUTCOME_FAILED = 2;
+  TERMINAL_OUTCOME_CANCELED = 3;
+  TERMINAL_OUTCOME_TIMED_OUT = 4;
+  TERMINAL_OUTCOME_REJECTED = 5;
+}
+
+message ResultArtifact {
+  string path = 1;
+  string media_type = 2;
+  map<string, string> metadata = 3;
+}
+
+message TaskResultEnvelope {
+  uint32 protocol_version = 1;
+  TaskId task_id = 2;
+  CorrelationId correlation_id = 3;
+  TerminalOutcome outcome = 4;
+  string executor_peer_id = 5;
+  int64 duration_ms = 6;
+  int64 completed_at_ms = 7;
+  string error_reason = 8;
+  map<string, string> result_metadata = 9;
+  repeated ResultArtifact output_artifacts = 10;
+}

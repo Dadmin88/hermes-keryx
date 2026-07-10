@@ -7,10 +7,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use keryx_core::{IdempotencyKey, PeerId, TaskId, TaskStatus};
 use keryx_proto::v1::{keryx_relay_client::KeryxRelayClient, PublishTaskRequest, TaskEnvelope};
-use keryx_store::{SqliteStore, StoreError, StoreResult, TaskRecord};
+use keryx_store::{
+    SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord,
+    TaskTransportContextRecord,
+};
+use prost::Message;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
+use tonic::Request;
 use tonic::Status;
 use tracing::{info, instrument, warn};
 
@@ -110,13 +115,20 @@ impl RelayTaskPublisher for NoopRelayPublisher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcRelayTaskPublisher {
     endpoint: String,
+    source_peer_id: PeerId,
+    node_token: Option<String>,
 }
 
 impl GrpcRelayTaskPublisher {
     #[must_use]
-    pub fn new(endpoint: impl Into<String>) -> Self {
+    pub fn new(endpoint: impl Into<String>, source_peer_id: PeerId) -> Self {
         Self {
             endpoint: endpoint.into(),
+            source_peer_id,
+            node_token: std::env::var("HERMES_KERYX_NODE_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
     }
 
@@ -146,10 +158,32 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
             target_peer_id.as_str().to_string(),
         );
         let mut client = self.connect(target_peer_id).await?;
+        let mut request = Request::new(PublishTaskRequest {
+            task: Some(envelope),
+            target_node_id: target_peer_id.as_str().to_string(),
+            source_node_id: self.source_peer_id.as_str().to_string(),
+        });
+        request.metadata_mut().insert(
+            "x-keryx-node-id",
+            self.source_peer_id
+                .as_str()
+                .parse()
+                .map_err(|error| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: format!("invalid source peer metadata: {error}"),
+                })?,
+        );
+        if let Some(token) = &self.node_token {
+            request.metadata_mut().insert(
+                "x-keryx-node-token",
+                token.parse().map_err(|error| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: format!("invalid node token metadata: {error}"),
+                })?,
+            );
+        }
         client
-            .publish_task(PublishTaskRequest {
-                task: Some(envelope),
-            })
+            .publish_task(request)
             .await
             .map(|_| ())
             .map_err(|status| RoutingError::RelayFailed {
@@ -563,6 +597,23 @@ impl TaskRouter {
             });
         }
 
+        let encoded_envelope = envelope.encode_to_vec();
+        let idempotency_key = parse_envelope_idempotency_key(&envelope)?;
+        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let now_ms = unix_ms_now();
+        let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, now_ms);
+        let context = TaskTransportContextRecord {
+            task_id: task_id.clone(),
+            authenticated_sender_peer_id: None,
+            expected_executor_peer_id: Some(target_peer_id.clone()),
+            destination_peer_id: self.peers.local_peer_id().clone(),
+            relay_frame_id: Some(format!("relay-{}", task_id.as_str())),
+            received_at_ms: now_ms,
+        };
+        store
+            .accept_task_with_envelope_and_context(record, envelope_record, context)
+            .await?;
+
         let timeout = normalize_timeout(timeout_ms, self.default_timeout_ms);
         let delivery = tokio::time::timeout(
             timeout,
@@ -832,4 +883,11 @@ pub mod test_support {
             Ok(())
         }
     }
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }

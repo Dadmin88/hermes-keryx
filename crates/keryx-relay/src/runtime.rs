@@ -36,7 +36,7 @@ struct PeerState {
     connected_nodes: HashMap<String, RelayFrameSender>,
     libp2p_connected_peers: HashSet<String>,
     mailboxes: HashMap<String, VecDeque<RelayFrame>>,
-    acked_task_ids: HashSet<String>,
+    acked_frame_ids: HashSet<String>,
 }
 
 /// Live operational state surfaced by health checks and metrics.
@@ -122,7 +122,7 @@ impl RelayRuntime {
             .remove(&node_id)
             .unwrap_or_default()
             .into_iter()
-            .filter(|frame| !is_acked(frame, &guard.acked_task_ids))
+            .filter(|frame| !is_acked(frame, &guard.acked_frame_ids))
             .collect();
         self.sync_connected_peer_metric(&guard);
         pending
@@ -145,7 +145,7 @@ impl RelayRuntime {
         let mut guard = self.lock_peers();
         guard.registered.insert(target_node_id.clone());
 
-        if is_acked(&frame, &guard.acked_task_ids) {
+        if is_acked(&frame, &guard.acked_frame_ids) {
             return FrameDelivery::Delivered;
         }
 
@@ -185,17 +185,36 @@ impl RelayRuntime {
         FrameDelivery::Mailboxed
     }
 
-    /// Acknowledge a task and remove any undelivered mailbox copies.
-    pub fn ack_task(&self, task_id: &str) -> bool {
-        if task_id.trim().is_empty() {
+    /// Acknowledge a frame and remove any undelivered mailbox copies.
+    pub fn ack_frame(&self, frame_id: &str) -> bool {
+        let frame_id = frame_id.trim();
+        if frame_id.is_empty() {
             return false;
         }
         let mut guard = self.lock_peers();
-        guard.acked_task_ids.insert(task_id.to_string());
+        guard.acked_frame_ids.insert(frame_id.to_string());
         for mailbox in guard.mailboxes.values_mut() {
-            mailbox.retain(|frame| frame_task_id(frame).as_deref() != Some(task_id));
+            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
         }
         true
+    }
+
+    /// Compatibility acknowledgement for older task-id callers.
+    pub fn ack_task(&self, task_id: &str) -> bool {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return false;
+        }
+        let mut guard = self.lock_peers();
+        let mut matched = false;
+        for mailbox in guard.mailboxes.values_mut() {
+            mailbox.retain(|frame| {
+                let remove = frame_task_id(frame).as_deref() == Some(task_id);
+                matched |= remove;
+                !remove
+            });
+        }
+        matched || true
     }
 
     #[must_use]
@@ -251,7 +270,7 @@ impl RelayRuntime {
 }
 
 fn is_acked(frame: &RelayFrame, acked: &HashSet<String>) -> bool {
-    frame_task_id(frame).is_some_and(|task_id| acked.contains(&task_id))
+    !frame.frame_id.trim().is_empty() && acked.contains(frame.frame_id.trim())
 }
 
 fn frame_task_id(frame: &RelayFrame) -> Option<String> {

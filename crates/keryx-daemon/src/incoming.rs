@@ -367,6 +367,9 @@ mod tests {
             RelayFrame {
                 frame_id: "frame-1".to_string(),
                 task: Some(envelope("task-1")),
+                result: None,
+                authenticated_source_node_id: "node-remote".to_string(),
+                destination_node_id: "node-local".to_string(),
             },
         );
         assert_eq!(task.frame_id, "frame-1");

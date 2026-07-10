@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/hermes/keryx/v1/agent.proto",
         "../../proto/hermes/keryx/v1/capability.proto",
         "../../proto/hermes/keryx/v1/task.proto",
+        "../../proto/hermes/keryx/v1/result.proto",
         "../../proto/hermes/keryx/v1/event.proto",
         "../../proto/hermes/keryx/v1/policy.proto",
         "../../proto/hermes/keryx/v1/daemon.proto",

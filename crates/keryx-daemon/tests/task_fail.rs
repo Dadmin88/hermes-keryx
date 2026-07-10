@@ -88,5 +88,7 @@ async fn fail_task_via_rpc_clears_lease_and_returns_failure_metadata() {
         .await
         .unwrap_err();
 
-    assert_eq!(second_fail.code(), Code::NotFound);
+    // Durable terminal results make failure replay explicit and idempotent.
+    // The task still exists, but a second terminal write is rejected.
+    assert_eq!(second_fail.code(), Code::AlreadyExists);
 }

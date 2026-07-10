@@ -408,6 +408,12 @@ pub struct RelayTomlRelaySection {
     pub connection_timeout_ms: u64,
     #[serde(default)]
     pub use_ipv6: bool,
+    #[serde(default = "crate::config::default_health_grpc_bind")]
+    pub health_grpc_bind: String,
+    #[serde(default = "crate::config::default_health_http_bind")]
+    pub health_http_bind: String,
+    #[serde(default = "crate::config::default_registry_grpc_bind")]
+    pub registry_grpc_bind: String,
 }
 
 impl Default for RelayTomlRelaySection {
@@ -423,6 +429,9 @@ impl Default for RelayTomlRelaySection {
             max_reservations_per_peer: crate::config::default_max_reservations_per_peer(),
             connection_timeout_ms: crate::config::default_connection_timeout_ms(),
             use_ipv6: false,
+            health_grpc_bind: crate::config::default_health_grpc_bind(),
+            health_http_bind: crate::config::default_health_http_bind(),
+            registry_grpc_bind: crate::config::default_registry_grpc_bind(),
         }
     }
 }
@@ -449,9 +458,9 @@ impl RelayTomlConfig {
             max_reservations_per_peer: self.relay.max_reservations_per_peer,
             connection_timeout_ms: self.relay.connection_timeout_ms,
             use_ipv6: self.relay.use_ipv6,
-            health_grpc_bind: crate::config::default_health_grpc_bind(),
-            health_http_bind: crate::config::default_health_http_bind(),
-            registry_grpc_bind: crate::config::default_registry_grpc_bind(),
+            health_grpc_bind: self.relay.health_grpc_bind.clone(),
+            health_http_bind: self.relay.health_http_bind.clone(),
+            registry_grpc_bind: self.relay.registry_grpc_bind.clone(),
         }
     }
 
