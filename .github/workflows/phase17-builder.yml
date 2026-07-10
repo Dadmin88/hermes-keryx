@@ -55,13 +55,8 @@ jobs:
           else
             echo 'Phase 17 TaskHandle polling is already committed'
           fi
-      - name: Apply deterministic topology seeds once
-        run: |
-          if grep -q '"keypair_path": str(work_dir / "relay.key")' scripts/e2e_two_node.py; then
-            python scripts/apply_phase17_e2e_fix.py
-          else
-            echo 'Two-node harness already creates deterministic identities'
-          fi
+      - name: Apply idempotent topology harness fixes
+        run: python scripts/apply_phase17_e2e_fix.py
       - name: Format
         run: cargo fmt --all
       - name: Check workspace
