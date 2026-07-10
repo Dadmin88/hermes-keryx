@@ -53,7 +53,11 @@ jobs:
           fi
 
       - name: Build runtime binaries
-        run: cargo build --workspace --bins
+        shell: bash
+        run: |
+          mkdir -p .tmp/phase17-e2e
+          set -o pipefail
+          cargo build --workspace --bins 2>&1 | tee .tmp/phase17-e2e/cargo-build.log
 
       - name: Install Python SDK
         run: python -m pip install -e 'sdk/python[dev]'
