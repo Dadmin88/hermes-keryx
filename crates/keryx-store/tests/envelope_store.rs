@@ -1,6 +1,6 @@
 use keryx_core::{IdempotencyKey, TaskId, TaskStatus};
 use keryx_store::{
-    InMemoryStore, SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord,
+    InMemoryStore, SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord, TaskStore,
     CURRENT_SCHEMA_VERSION,
 };
 use tempfile::tempdir;
@@ -21,17 +21,20 @@ fn envelope(id: &str, bytes: &[u8]) -> TaskEnvelopeRecord {
 fn in_memory_accepts_task_and_envelope_atomically() {
     let store = InMemoryStore::default();
     let task = task("memory-envelope", "memory-envelope-idem");
-    let envelope = envelope("memory-envelope", b"complete-envelope");
+    let stored_envelope = envelope("memory-envelope", b"complete-envelope");
 
     let accepted = store
-        .accept_task_with_envelope(task.clone(), envelope.clone())
+        .accept_task_with_envelope(task.clone(), stored_envelope.clone())
         .unwrap();
 
     assert_eq!(accepted, task);
-    assert_eq!(store.get_task_envelope(task.task_id()).unwrap(), envelope);
+    assert_eq!(
+        store.get_task_envelope(task.task_id()).unwrap(),
+        stored_envelope
+    );
     assert_eq!(
         store
-            .accept_task_with_envelope(task.clone(), envelope.clone())
+            .accept_task_with_envelope(task.clone(), stored_envelope.clone())
             .unwrap(),
         task
     );
@@ -72,14 +75,14 @@ async fn sqlite_envelope_survives_reopen_and_schema_is_v6() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("keryx.sqlite3");
     let task = task("sqlite-envelope", "sqlite-envelope-idem");
-    let envelope = envelope("sqlite-envelope", b"nested protobuf envelope bytes");
+    let stored_envelope = envelope("sqlite-envelope", b"nested protobuf envelope bytes");
 
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
     assert_eq!(store.schema_version().await.unwrap(), CURRENT_SCHEMA_VERSION);
     assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     store
-        .accept_task_with_envelope(task.clone(), envelope.clone())
+        .accept_task_with_envelope(task.clone(), stored_envelope.clone())
         .await
         .unwrap();
     store.close().await;
@@ -88,7 +91,7 @@ async fn sqlite_envelope_survives_reopen_and_schema_is_v6() {
     reopened.migrate().await.unwrap();
     assert_eq!(
         reopened.get_task_envelope(task.task_id()).await.unwrap(),
-        envelope
+        stored_envelope
     );
     assert_eq!(reopened.get_task(task.task_id()).await.unwrap(), task);
 }
@@ -100,15 +103,15 @@ async fn sqlite_idempotent_retry_requires_identical_envelope() {
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
     let task = task("sqlite-idempotent", "sqlite-idempotent-key");
-    let envelope = envelope("sqlite-idempotent", b"original");
+    let stored_envelope = envelope("sqlite-idempotent", b"original");
 
     store
-        .accept_task_with_envelope(task.clone(), envelope.clone())
+        .accept_task_with_envelope(task.clone(), stored_envelope.clone())
         .await
         .unwrap();
     assert_eq!(
         store
-            .accept_task_with_envelope(task.clone(), envelope.clone())
+            .accept_task_with_envelope(task.clone(), stored_envelope.clone())
             .await
             .unwrap(),
         task
