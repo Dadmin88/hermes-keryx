@@ -158,4 +158,15 @@ new_daemon_import_generator = '''replace_once(
 '''
 text = text[:first_daemon_replace] + new_daemon_import_generator + text[second_daemon_replace:]
 
+in_memory_fail_anchor = '''    pub fn fail_task_with_result(
+        &self,
+'''
+in_memory_fail_replacement = '''    #[allow(clippy::too_many_arguments)]
+    pub fn fail_task_with_result(
+        &self,
+'''
+if text.count(in_memory_fail_anchor) != 1:
+    raise SystemExit("expected one in-memory fail_task_with_result generator")
+text = text.replace(in_memory_fail_anchor, in_memory_fail_replacement, 1)
+
 path.write_text(text, encoding="utf-8")
