@@ -11,6 +11,7 @@ on:
       - "scripts/apply_phase17_e2e_fix.py"
       - "scripts/apply_phase17_relay_auth.py"
       - "scripts/fix_phase17_auth_builder.py"
+      - "scripts/fix_phase17_relay_config.py"
       - ".github/workflows/phase17-e2e.yml"
   push:
     branches: [main]
@@ -22,6 +23,7 @@ on:
       - "scripts/apply_phase17_e2e_fix.py"
       - "scripts/apply_phase17_relay_auth.py"
       - "scripts/fix_phase17_auth_builder.py"
+      - "scripts/fix_phase17_relay_config.py"
       - ".github/workflows/phase17-e2e.yml"
 
 permissions:
@@ -51,6 +53,7 @@ jobs:
             python scripts/fix_phase17_auth_builder.py
             python scripts/apply_phase17_relay_auth.py
           fi
+          python scripts/fix_phase17_relay_config.py
 
       - name: Build runtime binaries
         shell: bash
