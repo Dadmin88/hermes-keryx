@@ -275,7 +275,10 @@ async fn grpc_relay_task_publisher_publishes_to_relay_mailbox() {
     let runtime = RelayRuntime::new("relay-publisher-test");
     runtime.mark_transport_listening();
     let addr = spawn_relay(Arc::clone(&runtime)).await;
-    let publisher = GrpcRelayTaskPublisher::new(format!("http://{addr}"));
+    let publisher = GrpcRelayTaskPublisher::new(
+        format!("http://{addr}"),
+        PeerId::new("node-grpc-source").unwrap(),
+    );
     let remote = PeerId::new("node-grpc-mailbox").unwrap();
 
     publisher
@@ -295,7 +298,10 @@ async fn grpc_relay_task_publisher_maps_publish_failure() {
     let runtime = RelayRuntime::new("relay-publisher-failure-test");
     runtime.mark_transport_listening();
     let addr = spawn_relay(Arc::clone(&runtime)).await;
-    let publisher = GrpcRelayTaskPublisher::new(format!("http://{addr}"));
+    let publisher = GrpcRelayTaskPublisher::new(
+        format!("http://{addr}"),
+        PeerId::new("node-grpc-source").unwrap(),
+    );
     let remote = PeerId::new("node-grpc-failure").unwrap();
     let mut bad_envelope = envelope("route-grpc-failure");
     bad_envelope.task_id = None;
