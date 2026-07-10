@@ -53,11 +53,14 @@ def replace_once(path: str, old: str, new: str) -> None:
     text = file.read_text(encoding="utf-8")
     count = text.count(old)
     if count == 0:
-        indented_old = _indent_block(old)
-        if text.count(indented_old) == 1:
-            old = indented_old
-            new = _indent_block(new)
-            count = 1
+        for depth in range(1, 6):
+            prefix = "    " * depth
+            indented_old = _indent_block(old, prefix)
+            if text.count(indented_old) == 1:
+                old = indented_old
+                new = _indent_block(new, prefix)
+                count = 1
+                break
     if count != 1:
         raise SystemExit(f"{path}: expected one match, found {count}: {old[:160]!r}")
     file.write_text(text.replace(old, new, 1), encoding="utf-8")
