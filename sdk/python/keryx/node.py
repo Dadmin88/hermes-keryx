@@ -15,7 +15,7 @@ from typing import Any
 import grpc
 
 from keryx.card import AgentCard
-from keryx.client import DaemonClient
+from keryx.client import DaemonClient, default_daemon_endpoint
 from keryx.config import KeryxConfig, grpc_target, load_config
 from keryx.models import TaskArtifact, TaskResult, TaskState
 from keryx.task import (
