@@ -8,7 +8,11 @@ use futures::StreamExt;
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
-use keryx_proto::v1::{AckTaskRequest, NodeFrame, SubmitTaskRequest};
+use keryx_proto::v1::{
+    AckFrameRequest, AckResultDeliveryRequest, ClaimNextResultDeliveryRequest,
+    FailResultDeliveryRequest, IngestRemoteResultRequest, NodeFrame, PublishResultRequest,
+    SubmitRemoteTaskRequest,
+};
 use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
 use libp2p::swarm::SwarmEvent;
 use libp2p::Multiaddr;
@@ -165,35 +169,88 @@ async fn run_relay_stream(
         .into_inner();
     info!(registry_peer_id = %registry_peer_id, relay_endpoint = %relay_endpoint, "relay stream connected");
 
-    while let Some(frame) = stream.next().await {
-        let frame = frame.context("keryx node stream: relay frame failed")?;
-        let Some(task) = frame.task else {
-            tracing::warn!(frame_id = %frame.frame_id, "dropping relay frame without task");
-            continue;
-        };
-        let task_id = task.task_id.clone();
-        let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
-            .await
-            .with_context(|| {
-                format!("keryx node stream: daemon unavailable at {daemon_endpoint}")
-            })?;
-        daemon
-            .submit_task(SubmitTaskRequest {
-                envelope: Some(task),
-            })
-            .await
-            .context("keryx node stream: daemon SubmitTask failed")?;
-        if let Some(task_id) = task_id {
-            let mut ack_client = KeryxRelayClient::connect(relay_endpoint.clone())
-                .await
-                .with_context(|| {
-                    format!("keryx node stream: relay unavailable at {relay_endpoint}")
-                })?;
-            let _ = ack_client
-                .ack_task(AckTaskRequest {
-                    task_id: Some(task_id),
-                })
-                .await;
+    let delivery_worker = format!("edge-{registry_peer_id}");
+    let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            next = stream.next() => {
+                let Some(frame) = next else { break; };
+                let frame = frame.context("keryx node stream: relay frame failed")?;
+                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
+                    .await
+                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?;
+                if let Some(task) = frame.task {
+                    daemon
+                        .submit_remote_task(SubmitRemoteTaskRequest {
+                            envelope: Some(task),
+                            authenticated_sender_peer_id: frame.authenticated_source_node_id.clone(),
+                            destination_peer_id: frame.destination_node_id.clone(),
+                            relay_frame_id: frame.frame_id.clone(),
+                        })
+                        .await
+                        .context("keryx node stream: daemon SubmitRemoteTask failed")?;
+                } else if let Some(result) = frame.result {
+                    daemon
+                        .ingest_remote_result(IngestRemoteResultRequest {
+                            result: Some(result),
+                            authenticated_executor_peer_id: frame.authenticated_source_node_id.clone(),
+                            destination_peer_id: frame.destination_node_id.clone(),
+                            relay_frame_id: frame.frame_id.clone(),
+                        })
+                        .await
+                        .context("keryx node stream: daemon IngestRemoteResult failed")?;
+                } else {
+                    tracing::warn!(frame_id = %frame.frame_id, "dropping empty relay frame");
+                    continue;
+                }
+                let mut ack_client = KeryxRelayClient::connect(relay_endpoint.clone()).await?;
+                ack_client
+                    .ack_frame(AckFrameRequest { frame_id: frame.frame_id })
+                    .await
+                    .context("keryx node stream: relay AckFrame failed")?;
+            }
+            _ = delivery_tick.tick() => {
+                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone()).await?;
+                let delivery = daemon
+                    .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+                        worker_id: delivery_worker.clone(),
+                        lease_duration_ms: 30_000,
+                    })
+                    .await?
+                    .into_inner();
+                if !delivery.has_delivery {
+                    continue;
+                }
+                let publish = relay
+                    .publish_result(PublishResultRequest {
+                        result: delivery.result,
+                        target_node_id: delivery.target_peer_id,
+                        source_node_id: registry_peer_id.clone(),
+                        frame_id: delivery.delivery_id.clone(),
+                    })
+                    .await;
+                match publish {
+                    Ok(_) => {
+                        daemon
+                            .ack_result_delivery(AckResultDeliveryRequest {
+                                delivery_id: delivery.delivery_id,
+                                worker_id: delivery_worker.clone(),
+                            })
+                            .await?;
+                    }
+                    Err(error) => {
+                        daemon
+                            .fail_result_delivery(FailResultDeliveryRequest {
+                                delivery_id: delivery.delivery_id,
+                                worker_id: delivery_worker.clone(),
+                                error_reason: error.message().to_string(),
+                                retry_delay_ms: 1_000,
+                                dead_letter: false,
+                            })
+                            .await?;
+                    }
+                }
+            }
         }
     }
     Ok(())

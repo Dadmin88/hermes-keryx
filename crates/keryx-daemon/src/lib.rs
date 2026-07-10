@@ -34,6 +34,13 @@ use keryx_proto::v1::{
     StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskEnvelope,
     TaskId as ProtoTaskId,
 };
+use keryx_proto::v1::{
+    AckResultDeliveryRequest, AckResultDeliveryResponse, ClaimNextResultDeliveryRequest,
+    ClaimNextResultDeliveryResponse, FailResultDeliveryRequest, FailResultDeliveryResponse,
+    GetTaskResultRequest, GetTaskResultResponse, IngestRemoteResultRequest,
+    IngestRemoteResultResponse, ResultArtifact, SubmitRemoteTaskRequest, TaskResultEnvelope,
+    TerminalOutcome,
+};
 use prost::Message;
 use tokio::sync::watch;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -43,7 +50,7 @@ use tracing::{error, instrument, warn};
 
 use keryx_store::{
     LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,
-    TaskRecord, CURRENT_SCHEMA_VERSION,
+    TaskRecord, TaskTransportContextRecord, TerminalResultRecord, CURRENT_SCHEMA_VERSION,
 };
 
 pub use cancellation::{CancellationSnapshot, CancellationState};
@@ -530,7 +537,10 @@ impl KeryxDaemonRuntime {
         let publisher: Arc<dyn RelayTaskPublisher> = config.relay_endpoint().map_or_else(
             || Arc::new(NoopRelayPublisher) as Arc<dyn RelayTaskPublisher>,
             |endpoint| {
-                Arc::new(GrpcRelayTaskPublisher::new(endpoint)) as Arc<dyn RelayTaskPublisher>
+                Arc::new(GrpcRelayTaskPublisher::new(
+                    endpoint,
+                    config.local_peer_id().clone(),
+                )) as Arc<dyn RelayTaskPublisher>
             },
         );
         let router = Arc::new(TaskRouter::new(
@@ -812,6 +822,33 @@ impl KeryxDaemonRuntime {
         Ok(accepted)
     }
 
+    pub async fn accept_pending_remote_task_with_backpressure(
+        &self,
+        record: TaskRecord,
+        envelope: TaskEnvelopeRecord,
+        context: TaskTransportContextRecord,
+    ) -> StoreResult<TaskRecord> {
+        self.config
+            .limits()
+            .check_envelope_bytes(envelope.encoded_envelope.len() as u64)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let _guard = self.submit_backpressure_lock.lock().await;
+        let pending_count = self
+            .store
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await?;
+        self.config
+            .limits()
+            .check_pending_tasks(pending_count)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let accepted = self
+            .store
+            .accept_task_with_envelope_and_context(record, envelope, context)
+            .await?;
+        self.task_available.notify_waiters();
+        Ok(accepted)
+    }
+
     #[must_use]
     pub const fn report(&self) -> &StartupReport {
         &self.report
@@ -937,6 +974,15 @@ impl KeryxDaemonRpcService {
             {
                 Ok(task) => {
                     self.runtime.metrics().increment_tasks_claimed();
+                    let sender_peer_id = self
+                        .runtime
+                        .store()
+                        .get_transport_context(task.task_id())
+                        .await
+                        .ok()
+                        .and_then(|context| context.authenticated_sender_peer_id)
+                        .map(|peer| peer.as_str().to_string())
+                        .unwrap_or_default();
                     return Ok(Some(ClaimNextTaskResponse {
                         has_task: true,
                         envelope: Some(envelope),
@@ -948,7 +994,7 @@ impl KeryxDaemonRpcService {
                         status: task_status_label(task.status).to_string(),
                         retry_count: task.retry_count,
                         dead_lettered: task.dead_lettered,
-                        sender_peer_id: String::new(),
+                        sender_peer_id,
                     }));
                 }
                 Err(StoreError::LeaseConflict { .. } | StoreError::TaskNotFound(_)) => {
@@ -1123,6 +1169,53 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         }))
     }
 
+    #[instrument(name = "keryx::rpc::submit_remote_task", skip(self, request))]
+    async fn submit_remote_task(
+        &self,
+        request: Request<SubmitRemoteTaskRequest>,
+    ) -> Result<Response<SubmitTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let envelope = inner
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("envelope is required"))?;
+        let task_id = parse_required_task_id(envelope.task_id.as_ref())?;
+        let sender = PeerId::new(inner.authenticated_sender_peer_id.trim())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let destination = PeerId::new(inner.destination_peer_id.trim())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if destination != *self.runtime.config().local_peer_id() {
+            return Err(Status::permission_denied(
+                "remote task destination does not match local peer",
+            ));
+        }
+        let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
+        let encoded = envelope.encode_to_vec();
+        let now_ms = unix_ms_now();
+        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let accepted = self
+            .runtime
+            .accept_pending_remote_task_with_backpressure(
+                record,
+                TaskEnvelopeRecord::new(task_id.clone(), encoded, now_ms),
+                TaskTransportContextRecord {
+                    task_id: task_id.clone(),
+                    authenticated_sender_peer_id: Some(sender),
+                    expected_executor_peer_id: None,
+                    destination_peer_id: destination,
+                    relay_frame_id: Some(inner.relay_frame_id),
+                    received_at_ms: now_ms,
+                },
+            )
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.metrics().increment_tasks_submitted();
+        Ok(Response::new(SubmitTaskResponse {
+            task_id: Some(proto_task_id(accepted.task_id())),
+            status: task_status_label(accepted.status).to_string(),
+        }))
+    }
+
     #[instrument(
         name = "keryx::rpc::claim_task",
         skip(self, request),
@@ -1276,10 +1369,29 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let result = build_terminal_result(
+            self.runtime.store(),
+            self.runtime.config().local_peer_id(),
+            &task_id,
+            TerminalOutcome::Completed,
+            inner.duration_ms,
+            String::new(),
+            inner.result_metadata.clone(),
+            inner.output_artifacts.clone(),
+        )
+        .await?;
+        let stored = TerminalResultRecord {
+            task_id: task_id.clone(),
+            encoded_result: result.encode_to_vec(),
+            terminal_status: TaskStatus::Completed,
+            return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+            executor_peer_id: self.runtime.config().local_peer_id().clone(),
+            created_at_ms: result.completed_at_ms,
+        };
         let task = self
             .runtime
             .store()
-            .complete_task(&task_id, &lease_id, &worker_id)
+            .complete_task_with_result(&task_id, &lease_id, &worker_id, stored)
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_completed();
@@ -1317,10 +1429,36 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
         tracing::Span::current().record("error_reason", tracing::field::display(&error_reason));
         let policy = self.runtime.config().fail_retry_policy();
+        let result = build_terminal_result(
+            self.runtime.store(),
+            self.runtime.config().local_peer_id(),
+            &task_id,
+            TerminalOutcome::Failed,
+            inner.duration_ms,
+            error_reason.clone(),
+            inner.failure_metadata.clone(),
+            Vec::new(),
+        )
+        .await?;
+        let stored = TerminalResultRecord {
+            task_id: task_id.clone(),
+            encoded_result: result.encode_to_vec(),
+            terminal_status: TaskStatus::Failed,
+            return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+            executor_peer_id: self.runtime.config().local_peer_id().clone(),
+            created_at_ms: result.completed_at_ms,
+        };
         let task = self
             .runtime
             .store()
-            .fail_task(&task_id, &lease_id, &worker_id, &error_reason, &policy)
+            .fail_task_with_result(
+                &task_id,
+                &lease_id,
+                &worker_id,
+                &error_reason,
+                &policy,
+                stored,
+            )
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_failed();
@@ -1502,6 +1640,162 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         }
     }
 
+    async fn get_task_result(
+        &self,
+        request: Request<GetTaskResultRequest>,
+    ) -> Result<Response<GetTaskResultResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let task_id = parse_required_task_id(request.into_inner().task_id.as_ref())?;
+        let task = self
+            .runtime
+            .store()
+            .get_task(&task_id)
+            .await
+            .map_err(store_error_to_status)?;
+        let events = self
+            .runtime
+            .store()
+            .events_for_task(&task_id)
+            .await
+            .map_err(store_error_to_status)?;
+        match self.runtime.store().get_terminal_result(&task_id).await {
+            Ok(record) => {
+                let result = TaskResultEnvelope::decode(record.encoded_result.as_slice()).map_err(
+                    |error| Status::data_loss(format!("invalid stored terminal result: {error}")),
+                )?;
+                Ok(Response::new(GetTaskResultResponse {
+                    found: true,
+                    status: task_status_label(task.status).to_string(),
+                    result: Some(result),
+                    update_sequence: events.len() as u64,
+                }))
+            }
+            Err(StoreError::TerminalResultNotFound(_)) => {
+                Ok(Response::new(GetTaskResultResponse {
+                    found: false,
+                    status: task_status_label(task.status).to_string(),
+                    result: None,
+                    update_sequence: events.len() as u64,
+                }))
+            }
+            Err(error) => Err(store_error_to_status(error)),
+        }
+    }
+
+    async fn claim_next_result_delivery(
+        &self,
+        request: Request<ClaimNextResultDeliveryRequest>,
+    ) -> Result<Response<ClaimNextResultDeliveryResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let worker_id = inner.worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(Status::invalid_argument("worker_id is required"));
+        }
+        let lease_ms = inner.lease_duration_ms.max(1_000);
+        let now_ms = unix_ms_now();
+        match self
+            .runtime
+            .store()
+            .claim_next_result_delivery(worker_id, now_ms, lease_ms)
+            .await
+            .map_err(store_error_to_status)?
+        {
+            Some((outbox, record)) => {
+                let result = TaskResultEnvelope::decode(record.encoded_result.as_slice()).map_err(
+                    |error| Status::data_loss(format!("invalid stored result: {error}")),
+                )?;
+                Ok(Response::new(ClaimNextResultDeliveryResponse {
+                    has_delivery: true,
+                    delivery_id: outbox.delivery_id,
+                    target_peer_id: outbox.target_peer_id.as_str().to_string(),
+                    result: Some(result),
+                    attempt_count: outbox.attempt_count,
+                    lease_expires_at_ms: outbox.lease_expires_at_ms.unwrap_or_default(),
+                }))
+            }
+            None => Ok(Response::new(ClaimNextResultDeliveryResponse {
+                has_delivery: false,
+                delivery_id: String::new(),
+                target_peer_id: String::new(),
+                result: None,
+                attempt_count: 0,
+                lease_expires_at_ms: 0,
+            })),
+        }
+    }
+
+    async fn ack_result_delivery(
+        &self,
+        request: Request<AckResultDeliveryRequest>,
+    ) -> Result<Response<AckResultDeliveryResponse>, Status> {
+        let inner = request.into_inner();
+        self.runtime
+            .store()
+            .ack_result_delivery(&inner.delivery_id, &inner.worker_id, unix_ms_now())
+            .await
+            .map_err(store_error_to_status)?;
+        Ok(Response::new(AckResultDeliveryResponse { accepted: true }))
+    }
+
+    async fn fail_result_delivery(
+        &self,
+        request: Request<FailResultDeliveryRequest>,
+    ) -> Result<Response<FailResultDeliveryResponse>, Status> {
+        let inner = request.into_inner();
+        let now_ms = unix_ms_now();
+        self.runtime
+            .store()
+            .fail_result_delivery(
+                &inner.delivery_id,
+                &inner.worker_id,
+                now_ms,
+                now_ms.saturating_add(inner.retry_delay_ms.max(1_000)),
+                &inner.error_reason,
+                inner.dead_letter,
+            )
+            .await
+            .map_err(store_error_to_status)?;
+        Ok(Response::new(FailResultDeliveryResponse { accepted: true }))
+    }
+
+    async fn ingest_remote_result(
+        &self,
+        request: Request<IngestRemoteResultRequest>,
+    ) -> Result<Response<IngestRemoteResultResponse>, Status> {
+        let inner = request.into_inner();
+        let result = inner
+            .result
+            .ok_or_else(|| Status::invalid_argument("result is required"))?;
+        let task_id = parse_required_task_id(result.task_id.as_ref())?;
+        let executor = PeerId::new(inner.authenticated_executor_peer_id.trim())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if inner.destination_peer_id.trim() != self.runtime.config().local_peer_id().as_str() {
+            return Err(Status::permission_denied(
+                "result destination does not match local peer",
+            ));
+        }
+        let terminal_status = terminal_outcome_status(result.outcome)?;
+        let record = TerminalResultRecord {
+            task_id: task_id.clone(),
+            encoded_result: result.encode_to_vec(),
+            terminal_status,
+            return_peer_id: None,
+            executor_peer_id: executor.clone(),
+            created_at_ms: result.completed_at_ms,
+        };
+        let task = self
+            .runtime
+            .store()
+            .apply_remote_result(record, &executor)
+            .await
+            .map_err(store_error_to_status)?;
+        Ok(Response::new(IngestRemoteResultResponse {
+            task_id: Some(proto_task_id(&task_id)),
+            status: task_status_label(task.status).to_string(),
+        }))
+    }
+
     #[instrument(name = "keryx::rpc::send_task", skip(self, request))]
     async fn send_task(
         &self,
@@ -1592,6 +1886,64 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         test_rpc_delay().await;
         let response = self.runtime.discover_skills(request.into_inner()).await?;
         Ok(Response::new(response))
+    }
+}
+
+async fn return_peer_for_task(store: &SqliteStore, task_id: &TaskId) -> Option<PeerId> {
+    store
+        .get_transport_context(task_id)
+        .await
+        .ok()
+        .and_then(|context| context.authenticated_sender_peer_id)
+}
+
+async fn build_terminal_result(
+    store: &SqliteStore,
+    executor: &PeerId,
+    task_id: &TaskId,
+    outcome: TerminalOutcome,
+    duration_ms: i64,
+    error_reason: String,
+    result_metadata: std::collections::HashMap<String, String>,
+    artifacts: Vec<keryx_proto::v1::TaskArtifact>,
+) -> Result<TaskResultEnvelope, Status> {
+    let correlation_id = store
+        .get_task_envelope(task_id)
+        .await
+        .ok()
+        .and_then(|record| TaskEnvelope::decode(record.encoded_envelope.as_slice()).ok())
+        .and_then(|envelope| envelope.correlation_id);
+    Ok(TaskResultEnvelope {
+        protocol_version: 1,
+        task_id: Some(proto_task_id(task_id)),
+        correlation_id,
+        outcome: outcome as i32,
+        executor_peer_id: executor.as_str().to_string(),
+        duration_ms,
+        completed_at_ms: unix_ms_now(),
+        error_reason,
+        result_metadata,
+        output_artifacts: artifacts
+            .into_iter()
+            .map(|artifact| ResultArtifact {
+                path: artifact.path,
+                media_type: artifact.media_type,
+                metadata: artifact.metadata,
+            })
+            .collect(),
+    })
+}
+
+fn terminal_outcome_status(outcome: i32) -> Result<TaskStatus, Status> {
+    match TerminalOutcome::try_from(outcome).unwrap_or(TerminalOutcome::Unspecified) {
+        TerminalOutcome::Completed => Ok(TaskStatus::Completed),
+        TerminalOutcome::Failed
+        | TerminalOutcome::Canceled
+        | TerminalOutcome::TimedOut
+        | TerminalOutcome::Rejected => Ok(TaskStatus::Failed),
+        TerminalOutcome::Unspecified => {
+            Err(Status::invalid_argument("terminal outcome is required"))
+        }
     }
 }
 

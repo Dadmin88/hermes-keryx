@@ -4,6 +4,7 @@ package hermes.keryx.v1;
 import "hermes/keryx/v1/common.proto";
 import "hermes/keryx/v1/task.proto";
 import "hermes/keryx/v1/registry.proto";
+import "hermes/keryx/v1/result.proto";
 
 service KeryxDaemon {
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -11,6 +12,12 @@ service KeryxDaemon {
   rpc Liveness(LivenessRequest) returns (LivenessResponse);
   rpc Readiness(ReadinessRequest) returns (ReadinessResponse);
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc SubmitRemoteTask(SubmitRemoteTaskRequest) returns (SubmitTaskResponse);
+  rpc GetTaskResult(GetTaskResultRequest) returns (GetTaskResultResponse);
+  rpc ClaimNextResultDelivery(ClaimNextResultDeliveryRequest) returns (ClaimNextResultDeliveryResponse);
+  rpc AckResultDelivery(AckResultDeliveryRequest) returns (AckResultDeliveryResponse);
+  rpc FailResultDelivery(FailResultDeliveryRequest) returns (FailResultDeliveryResponse);
+  rpc IngestRemoteResult(IngestRemoteResultRequest) returns (IngestRemoteResultResponse);
   rpc ClaimTask(ClaimTaskRequest) returns (ClaimTaskResponse);
   rpc ClaimNextTask(ClaimNextTaskRequest) returns (ClaimNextTaskResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -74,6 +81,54 @@ message ReadinessResponse {
 }
 
 message SubmitTaskRequest { TaskEnvelope envelope = 1; }
+message SubmitRemoteTaskRequest {
+  TaskEnvelope envelope = 1;
+  string authenticated_sender_peer_id = 2;
+  string destination_peer_id = 3;
+  string relay_frame_id = 4;
+}
+message GetTaskResultRequest { TaskId task_id = 1; }
+message GetTaskResultResponse {
+  bool found = 1;
+  string status = 2;
+  TaskResultEnvelope result = 3;
+  uint64 update_sequence = 4;
+}
+message ClaimNextResultDeliveryRequest {
+  string worker_id = 1;
+  int64 lease_duration_ms = 2;
+}
+message ClaimNextResultDeliveryResponse {
+  bool has_delivery = 1;
+  string delivery_id = 2;
+  string target_peer_id = 3;
+  TaskResultEnvelope result = 4;
+  uint32 attempt_count = 5;
+  int64 lease_expires_at_ms = 6;
+}
+message AckResultDeliveryRequest {
+  string delivery_id = 1;
+  string worker_id = 2;
+}
+message AckResultDeliveryResponse { bool accepted = 1; }
+message FailResultDeliveryRequest {
+  string delivery_id = 1;
+  string worker_id = 2;
+  string error_reason = 3;
+  int64 retry_delay_ms = 4;
+  bool dead_letter = 5;
+}
+message FailResultDeliveryResponse { bool accepted = 1; }
+message IngestRemoteResultRequest {
+  TaskResultEnvelope result = 1;
+  string authenticated_executor_peer_id = 2;
+  string destination_peer_id = 3;
+  string relay_frame_id = 4;
+}
+message IngestRemoteResultResponse {
+  TaskId task_id = 1;
+  string status = 2;
+}
 message SubmitTaskResponse {
   TaskId task_id = 1;
   string status = 2;

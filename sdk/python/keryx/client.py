@@ -191,6 +191,21 @@ class DaemonClient:
         )
         return await self._daemon.SendTask(request)
 
+    async def get_task_result(self, task_id: str) -> daemon_pb2.GetTaskResultResponse:
+        assert self._daemon is not None
+        return await self._daemon.GetTaskResult(
+            daemon_pb2.GetTaskResultRequest(task_id=common_pb2.TaskId(value=task_id))
+        )
+
+    async def cancel_task(self, task_id: str, *, reason: str = "") -> daemon_pb2.CancelTaskResponse:
+        assert self._daemon is not None
+        return await self._daemon.CancelTask(
+            daemon_pb2.CancelTaskRequest(
+                task_id=common_pb2.TaskId(value=task_id),
+                reason=reason,
+            )
+        )
+
     async def discover(self, skill_id: str, *, tags: list[str] | None = None, limit: int = 10) -> list[dict[str, Any]]:
         if self._registry is None:
             return []

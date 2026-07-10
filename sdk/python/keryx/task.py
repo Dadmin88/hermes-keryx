@@ -82,9 +82,20 @@ class Task:
 
 
 class TaskHandle:
-    def __init__(self, task: Task, cancel_fn: Callable[[], Coroutine[Any, Any, None]] | None = None) -> None:
+    def __init__(
+        self,
+        task: Task,
+        cancel_fn: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        refresh_fn: Callable[[], Coroutine[Any, Any, Task]] | None = None,
+        *,
+        poll_interval: float = 0.1,
+        max_poll_interval: float = 1.0,
+    ) -> None:
         self._task = task
         self._cancel_fn = cancel_fn
+        self._refresh_fn = refresh_fn
+        self._poll_interval = max(0.01, poll_interval)
+        self._max_poll_interval = max(self._poll_interval, max_poll_interval)
         self._done = asyncio.Event()
         if task.status.is_terminal:
             self._done.set()
@@ -97,13 +108,38 @@ class TaskHandle:
     def status(self) -> TaskStatus:
         return self._task.status
 
-    async def wait(self, timeout: float | None = None) -> Task:
-        await asyncio.wait_for(self._done.wait(), timeout=timeout)
+    async def refresh(self) -> Task:
+        if self._refresh_fn is not None and not self._task.status.is_terminal:
+            self._task = await self._refresh_fn()
+            if self._task.status.is_terminal:
+                self._done.set()
         return self._task
+
+    async def wait(self, timeout: float | None = None) -> Task:
+        if self._refresh_fn is None:
+            await asyncio.wait_for(self._done.wait(), timeout=timeout)
+            return self._task
+
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        delay = self._poll_interval
+        while True:
+            await self.refresh()
+            if self._task.status.is_terminal:
+                return self._task
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+                await asyncio.sleep(min(delay, remaining))
+            else:
+                await asyncio.sleep(delay)
+            delay = min(self._max_poll_interval, delay * 1.5)
 
     async def cancel(self) -> None:
         if self._cancel_fn is not None:
             await self._cancel_fn()
+        await self.refresh()
 
 
 class IncomingTask:

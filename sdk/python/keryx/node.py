@@ -699,7 +699,46 @@ class KeryxNode:
                 ) from exc
             raise
         task = Task(task_id=response.task_id.value or task_id, status=LegacyTaskStatus.SUBMITTED)
-        return TaskHandle(task=task)
+
+        async def refresh_remote() -> Task:
+            assert self._client is not None
+            result_response = await self._client.get_task_result(task.task_id)
+            task.status = _legacy_status(result_response.status)
+            if result_response.found and result_response.HasField("result"):
+                result = result_response.result
+                task.status = _legacy_status(result_response.status, outcome=result.outcome)
+                artifacts: list[Artifact] = []
+                result_text = result.result_metadata.get("result_text", "")
+                for item in result.output_artifacts:
+                    preview = item.metadata.get("text_preview", "")
+                    parts = [Part(text=preview, media_type=item.media_type or "text/plain")] if preview else []
+                    artifacts.append(Artifact(name=item.path, parts=parts))
+                if result_text and not artifacts:
+                    artifacts.append(
+                        Artifact(
+                            name="result",
+                            parts=[Part(text=result_text, media_type="text/plain")],
+                        )
+                    )
+                task.artifacts = artifacts
+                task.metadata = {
+                    **dict(task.metadata or {}),
+                    **{str(key): str(value) for key, value in result.result_metadata.items()},
+                    "executor_peer_id": result.executor_peer_id,
+                    "duration_ms": str(result.duration_ms),
+                    "error_reason": result.error_reason,
+                }
+            return task
+
+        async def cancel_remote() -> None:
+            assert self._client is not None
+            await self._client.cancel_task(task.task_id, reason="canceled by TaskHandle")
+
+        return TaskHandle(
+            task=task,
+            refresh_fn=refresh_remote,
+            cancel_fn=cancel_remote,
+        )
 
     async def register_skills(
         self,
@@ -754,6 +793,29 @@ class KeryxNode:
         if not self._running or self._client is None:
             raise RuntimeError("Node not started. Call await node.start() first.")
 
+
+
+def _legacy_status(status: str, *, outcome: int = 0) -> LegacyTaskStatus:
+    normalized = status.strip().lower()
+    if normalized == "completed":
+        return LegacyTaskStatus.COMPLETED
+    if normalized in {"failed", "dead_lettered", "timed_out"}:
+        return LegacyTaskStatus.FAILED
+    if normalized == "canceled":
+        return LegacyTaskStatus.CANCELED
+    if normalized == "rejected":
+        return LegacyTaskStatus.REJECTED
+    if normalized in {"running", "working", "leased"}:
+        return LegacyTaskStatus.WORKING
+    if outcome == 1:
+        return LegacyTaskStatus.COMPLETED
+    if outcome in {2, 4}:
+        return LegacyTaskStatus.FAILED
+    if outcome == 3:
+        return LegacyTaskStatus.CANCELED
+    if outcome == 5:
+        return LegacyTaskStatus.REJECTED
+    return LegacyTaskStatus.SUBMITTED
 
 
 def _task_from_claim(claimed: ClaimedTask) -> Task:

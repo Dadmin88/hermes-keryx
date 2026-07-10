@@ -7,7 +7,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
 use keryx_proto::v1::{
-    AckTaskRequest, AckTaskResponse, HealthRequest, HealthResponse, NodeFrame, PublishTaskRequest,
+    AckFrameRequest, AckFrameResponse, AckTaskRequest, AckTaskResponse, HealthRequest,
+    HealthResponse, NodeFrame, PublishResultRequest, PublishResultResponse, PublishTaskRequest,
     PublishTaskResponse, RegisterNodeRequest, RegisterNodeResponse, RelayFrame, TaskEnvelope,
 };
 use tokio::net::TcpListener;
@@ -99,7 +100,7 @@ impl KeryxRelay for RelayHealthService {
             while let Some(next) = inbound.next().await {
                 match next {
                     Ok(frame) => {
-                        if let Err(err) = route_node_frame(&runtime, frame) {
+                        if let Err(err) = route_node_frame(&runtime, &source_node_id, frame) {
                             tracing::warn!(
                                 source_node_id = %source_node_id,
                                 error = %err,
@@ -150,11 +151,16 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<PublishTaskRequest>,
     ) -> Result<Response<PublishTaskResponse>, Status> {
-        let task = request
-            .into_inner()
+        let inner = request.into_inner();
+        let task = inner
             .task
             .ok_or_else(|| Status::invalid_argument("PublishTask requires task"))?;
-        let target_node_id = target_node_id_from_task(&task)?;
+        let target_node_id = if inner.target_node_id.trim().is_empty() {
+            target_node_id_from_task(&task)?
+        } else {
+            inner.target_node_id.trim().to_string()
+        };
+        let source_node_id = required_node_value(&inner.source_node_id, "source_node_id")?;
         if let Some(registry) = &self.registry {
             let peer_id = parse_registry_peer_id(&target_node_id)?;
             if let Some(skill) = skill_from_task(&task) {
@@ -184,14 +190,64 @@ impl KeryxRelay for RelayHealthService {
             ));
         }
 
+        let frame_id = frame_id_for_task(&task);
         let frame = RelayFrame {
-            frame_id: frame_id_for_task(&task),
+            frame_id: frame_id.clone(),
             task: Some(task),
+            result: None,
+            authenticated_source_node_id: source_node_id,
+            destination_node_id: target_node_id.clone(),
         };
         self.runtime.route_frame(target_node_id, frame);
         Ok(Response::new(PublishTaskResponse {
             task_id: Some(task_id),
+            frame_id,
         }))
+    }
+
+    async fn publish_result(
+        &self,
+        request: Request<PublishResultRequest>,
+    ) -> Result<Response<PublishResultResponse>, Status> {
+        let inner = request.into_inner();
+        let result = inner
+            .result
+            .ok_or_else(|| Status::invalid_argument("PublishResult requires result"))?;
+        let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
+        let source_node_id = required_node_value(&inner.source_node_id, "source_node_id")?;
+        let task_id = result
+            .task_id
+            .as_ref()
+            .map(|value| value.value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::invalid_argument("PublishResult requires result.task_id"))?;
+        let frame_id = if inner.frame_id.trim().is_empty() {
+            format!("result-{task_id}")
+        } else {
+            inner.frame_id.trim().to_string()
+        };
+        self.runtime.route_frame(
+            target_node_id.clone(),
+            RelayFrame {
+                frame_id: frame_id.clone(),
+                task: None,
+                result: Some(result),
+                authenticated_source_node_id: source_node_id,
+                destination_node_id: target_node_id,
+            },
+        );
+        Ok(Response::new(PublishResultResponse {
+            accepted: true,
+            frame_id,
+        }))
+    }
+
+    async fn ack_frame(
+        &self,
+        request: Request<AckFrameRequest>,
+    ) -> Result<Response<AckFrameResponse>, Status> {
+        let accepted = self.runtime.ack_frame(&request.into_inner().frame_id);
+        Ok(Response::new(AckFrameResponse { accepted }))
     }
 
     async fn ack_task(
@@ -248,26 +304,59 @@ fn node_id_from_metadata<T>(request: &Request<T>) -> Result<String, Status> {
         })
 }
 
+fn required_node_value(value: &str, field: &str) -> Result<String, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(Status::invalid_argument(format!("{field} is required")))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
 fn parse_registry_peer_id(value: &str) -> Result<PeerId, Status> {
     PeerId::new(value.trim()).map_err(|error| {
         Status::invalid_argument(format!("node id is not a valid registry peer id: {error}"))
     })
 }
 
-fn route_node_frame(runtime: &RelayRuntime, frame: NodeFrame) -> Result<(), Status> {
-    let task = frame
-        .task
-        .ok_or_else(|| Status::invalid_argument("NodeFrame requires task"))?;
-    let target_node_id = target_node_id_from_task(&task)?;
-    let relay_frame = RelayFrame {
-        frame_id: if frame.frame_id.trim().is_empty() {
-            frame_id_for_task(&task)
+fn route_node_frame(
+    runtime: &RelayRuntime,
+    source_node_id: &str,
+    frame: NodeFrame,
+) -> Result<(), Status> {
+    let target_node_id = required_node_value(&frame.target_node_id, "target_node_id")?;
+    let has_task = frame.task.is_some();
+    let has_result = frame.result.is_some();
+    if has_task == has_result {
+        return Err(Status::invalid_argument(
+            "NodeFrame must contain exactly one of task or result",
+        ));
+    }
+    let frame_id = if frame.frame_id.trim().is_empty() {
+        if let Some(task) = frame.task.as_ref() {
+            frame_id_for_task(task)
         } else {
-            frame.frame_id
-        },
-        task: Some(task),
+            let task_id = frame
+                .result
+                .as_ref()
+                .and_then(|result| result.task_id.as_ref())
+                .map(|task_id| task_id.value.trim())
+                .unwrap_or("unknown");
+            format!("result-{task_id}")
+        }
+    } else {
+        frame.frame_id
     };
-    runtime.route_frame(target_node_id, relay_frame);
+    runtime.route_frame(
+        target_node_id.clone(),
+        RelayFrame {
+            frame_id,
+            task: frame.task,
+            result: frame.result,
+            authenticated_source_node_id: source_node_id.to_string(),
+            destination_node_id: target_node_id,
+        },
+    );
     Ok(())
 }
 
