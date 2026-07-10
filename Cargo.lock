@@ -1684,6 +1684,7 @@ name = "keryx-store"
 version = "0.1.0"
 dependencies = [
  "keryx-core",
+ "libc",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

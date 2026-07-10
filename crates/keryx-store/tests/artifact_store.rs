@@ -167,6 +167,59 @@ async fn sqlite_deduplicates_blob_files_and_cleans_them_up() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn sqlite_blob_put_rejects_preexisting_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (store, _db_path, blob_dir) = temp_sqlite_store().await;
+    let task = task("artifact-symlink-task");
+    store.accept_task(task.clone()).await.unwrap();
+    let bytes = vec![8_u8; MAX_INLINE_ARTIFACT_BYTES + 1];
+    let meta = artifact_meta(
+        task.task_id(),
+        "artifact-symlink-write",
+        &bytes,
+        "application/octet-stream",
+    );
+    std::fs::create_dir_all(&blob_dir).unwrap();
+    let victim = blob_dir.parent().unwrap().join("victim.txt");
+    std::fs::write(&victim, b"do not overwrite").unwrap();
+    symlink(&victim, blob_dir.join(meta.digest.as_str())).unwrap();
+
+    let error = store
+        .put_artifact(&meta, &bytes, &blob_dir)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::Database(_)));
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not overwrite");
+}
+
+#[tokio::test]
+async fn sqlite_blob_get_rejects_tampered_content() {
+    let (store, _db_path, blob_dir) = temp_sqlite_store().await;
+    let task = task("artifact-tampered-task");
+    store.accept_task(task.clone()).await.unwrap();
+    let bytes = vec![9_u8; MAX_INLINE_ARTIFACT_BYTES + 1];
+    let meta = artifact_meta(
+        task.task_id(),
+        "artifact-tampered-read",
+        &bytes,
+        "application/octet-stream",
+    );
+    let stored = store.put_artifact(&meta, &bytes, &blob_dir).await.unwrap();
+    let tampered = vec![10_u8; bytes.len()];
+    std::fs::write(blob_dir.join(stored.digest.as_str()), tampered).unwrap();
+
+    let error = store
+        .get_artifact(&meta.artifact_id, &blob_dir)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::DigestMismatch { .. }));
+}
+
+#[tokio::test]
 async fn sqlite_put_artifact_rejects_unknown_task_digest_mismatch_and_size_limit() {
     let (store, _db_path, blob_dir) = temp_sqlite_store().await;
     let task_id = TaskId::new("missing-artifact-task").unwrap();

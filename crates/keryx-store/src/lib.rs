@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    fs::{File, OpenOptions},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Mutex,
@@ -1281,7 +1282,7 @@ impl SqliteStore {
             row.try_get::<Option<Vec<u8>>, _>("inline_blob")?
                 .ok_or_else(|| StoreError::ArtifactNotFound(artifact_id.clone()))?
         } else {
-            std::fs::read(blob_path(blob_dir, &record.digest))?
+            read_verified_blob(blob_dir, &record.digest, record.byte_len)?
         };
 
         Ok((record, bytes))
@@ -2552,6 +2553,69 @@ fn ensure_blob_dir(blob_dir: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+fn read_verified_blob(blob_dir: &Path, digest: &Digest, byte_len: u64) -> StoreResult<Vec<u8>> {
+    let path = blob_path(blob_dir, digest);
+    let bytes = read_blob_file(&path)?;
+    if bytes.len() as u64 != byte_len {
+        return Err(StoreError::Database(format!(
+            "blob {} has byte length {}, expected {byte_len}",
+            digest.as_str(),
+            bytes.len()
+        )));
+    }
+    let actual = Digest::compute(&bytes);
+    if &actual != digest {
+        return Err(StoreError::DigestMismatch {
+            expected: digest.as_str().to_owned(),
+            actual: actual.as_str().to_owned(),
+        });
+    }
+    Ok(bytes)
+}
+
+fn read_blob_file(path: &Path) -> StoreResult<Vec<u8>> {
+    let mut file = open_blob_file_for_read(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StoreError::Database(format!(
+            "blob path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn open_blob_file_for_read(path: &Path) -> StoreResult<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(StoreError::from)
+}
+
+fn write_new_blob_file(path: &Path, bytes: &[u8]) -> StoreResult<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(StoreError::from)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn is_not_found_message(message: &str) -> bool {
+    message.contains("No such file or directory") || message.contains("os error 2")
+}
+
 fn remove_blob_file_if_present(path: &Path) -> StoreResult<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -2659,8 +2723,22 @@ async fn prepare_blob_write_with_executor(
         .is_some();
     let path = blob_path(blob_dir, digest);
     ensure_blob_dir(blob_dir)?;
-    if !blob_previously_tracked || !path.exists() {
-        std::fs::write(&path, bytes)?;
+    if blob_previously_tracked {
+        match read_verified_blob(blob_dir, digest, bytes.len() as u64) {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => {
+                return Err(StoreError::DigestMismatch {
+                    expected: digest.as_str().to_owned(),
+                    actual: Digest::compute(&read_blob_file(&path)?).as_str().to_owned(),
+                });
+            }
+            Err(StoreError::Database(message)) if is_not_found_message(&message) => {
+                write_new_blob_file(&path, bytes)?;
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        write_new_blob_file(&path, bytes)?;
     }
     Ok(PreparedBlobWrite {
         path,
