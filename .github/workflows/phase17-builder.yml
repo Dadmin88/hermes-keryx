@@ -55,6 +55,13 @@ jobs:
           else
             echo 'Phase 17 TaskHandle polling is already committed'
           fi
+      - name: Apply deterministic topology seeds once
+        run: |
+          if grep -q '"keypair_path": str(work_dir / "relay.key")' scripts/e2e_two_node.py; then
+            python scripts/apply_phase17_e2e_fix.py
+          else
+            echo 'Two-node harness already creates deterministic identities'
+          fi
       - name: Format
         run: cargo fmt --all
       - name: Check workspace
@@ -91,7 +98,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add proto crates sdk scripts
-          git commit -m 'feat(phase17): complete durable remote result observation'
+          git commit -m 'test(phase17): harden the real two-node topology proof'
           git push origin HEAD:${{ github.head_ref }}
       - name: Fail unsuccessful verification
         if: steps.verify.outputs.status != '0'
