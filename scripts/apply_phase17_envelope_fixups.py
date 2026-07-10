@@ -48,3 +48,9 @@ replace_once(
     "store: ready sqlite schema_version=5 supported_schema_version=5",
     "store: ready sqlite schema_version=6 supported_schema_version=6",
 )
+
+replace_once(
+    "crates/keryx-store/tests/artifact_store.rs",
+    "assert_eq!(store.schema_version().await.unwrap(), 5);",
+    "assert_eq!(store.schema_version().await.unwrap(), 6);",
+)
