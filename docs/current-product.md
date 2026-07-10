@@ -6,7 +6,7 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 
 | Component | Implemented surface |
 |---|---|
-| `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
+| `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, durable task envelopes, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
 | `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
@@ -42,7 +42,7 @@ Important defaults:
 
 | Setting | Default |
 |---|---:|
-| schema version | `5` |
+| schema version | `6` |
 | lease TTL when omitted | `300_000 ms` |
 | lease recovery interval | `30_000 ms` |
 | deadline enforcement interval | `30_000 ms` |
@@ -60,13 +60,16 @@ Important defaults:
 `keryx-store` provides `InMemoryStore` for tests and `SqliteStore` for runtime. The SQLite store owns:
 
 - task snapshots and per-task event log
+- complete encoded `TaskEnvelope` records keyed by task ID
 - idempotency keys
 - active/inactive leases
 - retry/dead-letter metadata
 - artifact metadata plus inline bytes/blob references
 - deadline/cancellation fields
 
-The current task store does **not** durably retain the complete submitted `TaskEnvelope`. `SubmitTask` stores a lifecycle `TaskRecord`, so messages, origin identity, correlation metadata, and requested capability are not yet recoverable by an Agency worker after relay delivery.
+Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart.
+
+The store intentionally treats the encoded envelope as opaque bytes and does not depend on `keryx-proto`; protobuf encoding and decoding remain daemon/SDK concerns. Idempotent retries must match both the lifecycle record and the stored envelope. Conflicting envelope bytes fail closed.
 
 Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR` is unset. Operator dual-run uses `~/.hermes/.keryx/data`.
 
@@ -88,21 +91,23 @@ sender keryxd SendTask
   -> relay PublishTask
   -> destination keryx-node stream
   -> destination keryxd SubmitTask
-  -> destination lifecycle row
+  -> destination lifecycle row + durable full envelope
 ```
 
 A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
 
+Phase 17.1 is complete at the storage/daemon layer: relay-delivered envelopes can survive destination-daemon restart without losing their task messages or context.
+
 Missing today:
 
-- durable retention of the full incoming envelope
 - an atomic claim-next or pending-task delivery API for workers
+- transport-authenticated sender identity attached to the claimed envelope
 - Python `serve_forever()` dispatch into registered `on_task()` handlers
 - authenticated terminal result/artifact routing back to the origin
 - a remotely updated `TaskHandle.wait()`
 - a repeatable two-daemon/two-edge-node Agency E2E
 
-This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
+This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, durable envelope retention, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
 
 ## Operator CLI
 
