@@ -338,7 +338,7 @@ async fn sqlite_migration_v4_creates_artifact_tables() {
     let store = SqliteStore::connect(&db_path).await.unwrap();
     store.migrate().await.unwrap();
 
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
     assert!(table_exists(&db_path, "artifacts").await);
     assert!(table_exists(&db_path, "blobs").await);
 }
