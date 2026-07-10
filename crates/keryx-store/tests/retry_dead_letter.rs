@@ -1,7 +1,7 @@
 use keryx_core::{
     AgentId, IdempotencyKey, KeryxEventType, LeaseId, RetryPolicy, TaskId, TaskStatus,
 };
-use keryx_store::{InMemoryStore, LeaseRecord, SqliteStore, TaskRecord, TaskStore};
+use keryx_store::{InMemoryStore, LeaseRecord, SqliteStore, StoreError, TaskRecord, TaskStore};
 use tempfile::tempdir;
 
 fn task(id: &str) -> TaskRecord {
@@ -237,4 +237,154 @@ async fn replay_preserves_snapshot_retry_metadata_across_retry_and_dead_letter_i
         store.replay_task(record.task_id()).await.unwrap(),
         dead_lettered
     );
+}
+
+#[test]
+fn manual_retry_and_dead_letter_require_matching_worker_in_memory() {
+    let store = InMemoryStore::default();
+    let retry_record = task("manual-retry-owner-task");
+    store.accept_task(retry_record.clone()).unwrap();
+    let retry_lease = lease(retry_record.task_id(), "manual-retry-owner-lease", "owner");
+    store
+        .lease_task(retry_record.task_id(), retry_lease.clone())
+        .unwrap();
+    let attacker = AgentId::new("attacker").unwrap();
+
+    assert_eq!(
+        store
+            .retry_task(retry_record.task_id(), &retry_lease.lease_id, &attacker)
+            .unwrap_err(),
+        StoreError::LeaseOwnerMismatch {
+            task_id: retry_record.task_id().clone(),
+            worker_id: attacker.clone(),
+        }
+    );
+
+    let retried = store
+        .retry_task(
+            retry_record.task_id(),
+            &retry_lease.lease_id,
+            retry_lease.worker_id.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(retried.status, TaskStatus::Pending);
+
+    let dead_record = TaskRecord::new(
+        TaskId::new("manual-dead-owner-task").unwrap(),
+        TaskStatus::Pending,
+        Some(IdempotencyKey::new("idem-manual-dead-owner").unwrap()),
+    );
+    store.accept_task(dead_record.clone()).unwrap();
+    let dead_lease = lease(dead_record.task_id(), "manual-dead-owner-lease", "owner");
+    store
+        .lease_task(dead_record.task_id(), dead_lease.clone())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .dead_letter_task(
+                dead_record.task_id(),
+                &dead_lease.lease_id,
+                &attacker,
+                "not mine",
+            )
+            .unwrap_err(),
+        StoreError::LeaseOwnerMismatch {
+            task_id: dead_record.task_id().clone(),
+            worker_id: attacker,
+        }
+    );
+
+    let dead = store
+        .dead_letter_task(
+            dead_record.task_id(),
+            &dead_lease.lease_id,
+            dead_lease.worker_id.as_ref().unwrap(),
+            "still broken",
+        )
+        .unwrap();
+    assert_eq!(dead.status, TaskStatus::Failed);
+    assert!(dead.dead_lettered);
+}
+
+#[tokio::test]
+async fn manual_retry_and_dead_letter_require_matching_worker_in_sqlite() {
+    let store = temp_store().await;
+    let retry_record = task("sqlite-manual-retry-owner-task");
+    store.accept_task(retry_record.clone()).await.unwrap();
+    let retry_lease = lease(
+        retry_record.task_id(),
+        "sqlite-manual-retry-owner-lease",
+        "owner",
+    );
+    store
+        .lease_task(retry_record.task_id(), retry_lease.clone())
+        .await
+        .unwrap();
+    let attacker = AgentId::new("attacker").unwrap();
+
+    assert_eq!(
+        store
+            .retry_task(retry_record.task_id(), &retry_lease.lease_id, &attacker)
+            .await
+            .unwrap_err(),
+        StoreError::LeaseOwnerMismatch {
+            task_id: retry_record.task_id().clone(),
+            worker_id: attacker.clone(),
+        }
+    );
+
+    let retried = store
+        .retry_task(
+            retry_record.task_id(),
+            &retry_lease.lease_id,
+            retry_lease.worker_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.status, TaskStatus::Pending);
+
+    let dead_record = TaskRecord::new(
+        TaskId::new("sqlite-manual-dead-owner-task").unwrap(),
+        TaskStatus::Pending,
+        Some(IdempotencyKey::new("idem-sqlite-manual-dead-owner").unwrap()),
+    );
+    store.accept_task(dead_record.clone()).await.unwrap();
+    let dead_lease = lease(
+        dead_record.task_id(),
+        "sqlite-manual-dead-owner-lease",
+        "owner",
+    );
+    store
+        .lease_task(dead_record.task_id(), dead_lease.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .dead_letter_task(
+                dead_record.task_id(),
+                &dead_lease.lease_id,
+                &attacker,
+                "not mine",
+            )
+            .await
+            .unwrap_err(),
+        StoreError::LeaseOwnerMismatch {
+            task_id: dead_record.task_id().clone(),
+            worker_id: attacker,
+        }
+    );
+
+    let dead = store
+        .dead_letter_task(
+            dead_record.task_id(),
+            &dead_lease.lease_id,
+            dead_lease.worker_id.as_ref().unwrap(),
+            "still broken",
+        )
+        .await
+        .unwrap();
+    assert_eq!(dead.status, TaskStatus::Failed);
+    assert!(dead.dead_lettered);
 }

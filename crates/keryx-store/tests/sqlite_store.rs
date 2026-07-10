@@ -525,7 +525,12 @@ async fn sqlite_replay_rejects_dead_lettered_snapshot_without_retry_count() {
         .await
         .unwrap();
     let dead_lettered = store
-        .dead_letter_task(record.task_id(), "still broken")
+        .dead_letter_task(
+            record.task_id(),
+            &lease.lease_id,
+            lease.worker_id.as_ref().unwrap(),
+            "still broken",
+        )
         .await
         .unwrap();
     assert!(dead_lettered.dead_lettered);

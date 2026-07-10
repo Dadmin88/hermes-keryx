@@ -438,7 +438,12 @@ impl InMemoryStore {
         self.dead_letter_task_in_state(&mut state, task_id, &active, task, error_reason)
     }
 
-    pub fn retry_task(&self, task_id: &TaskId, lease_id: &LeaseId) -> StoreResult<TaskRecord> {
+    pub fn retry_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+    ) -> StoreResult<TaskRecord> {
         let mut state = self.lock()?;
         let task = state
             .tasks
@@ -451,10 +456,17 @@ impl InMemoryStore {
             .cloned()
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         self.retry_task_in_state(&mut state, task_id, &active, task)
     }
 
-    pub fn dead_letter_task(&self, task_id: &TaskId, reason: &str) -> StoreResult<TaskRecord> {
+    pub fn dead_letter_task(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
+        reason: &str,
+    ) -> StoreResult<TaskRecord> {
         let mut state = self.lock()?;
         let task = state
             .tasks
@@ -466,6 +478,8 @@ impl InMemoryStore {
             .get(task_id)
             .cloned()
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         self.dead_letter_task_in_state(&mut state, task_id, &active, task, reason)
     }
 
@@ -1487,6 +1501,7 @@ impl SqliteStore {
         &self,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        worker_id: &AgentId,
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
@@ -1494,6 +1509,7 @@ impl SqliteStore {
             .await?
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
         ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         let updated = sqlite_retry_task_in_tx(&mut tx, task_id, &task).await?;
         tx.commit().await?;
         Ok(updated)
@@ -1502,13 +1518,17 @@ impl SqliteStore {
     pub async fn dead_letter_task(
         &self,
         task_id: &TaskId,
+        lease_id: &LeaseId,
+        worker_id: &AgentId,
         reason: &str,
     ) -> StoreResult<TaskRecord> {
         let mut tx = self.pool.begin().await?;
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
-        let _active = fetch_active_lease_with_executor(&mut tx, task_id)
+        let active = fetch_active_lease_with_executor(&mut tx, task_id)
             .await?
             .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+        ensure_matching_lease_id(task_id, &active, lease_id)?;
+        ensure_matching_worker_id(task_id, &active, worker_id)?;
         let updated = sqlite_dead_letter_task_in_tx(&mut tx, task_id, &task, reason).await?;
         tx.commit().await?;
         Ok(updated)
