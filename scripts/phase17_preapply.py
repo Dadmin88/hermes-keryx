@@ -94,4 +94,36 @@ if unused_import not in text:
     raise SystemExit('expected generated PendingTaskEnvelope import was not found')
 text = text.replace(unused_import, correct_import, 1)
 
+secure_default_patch = r'''
+
+# Keep KeryxConfig aligned with the secure owner-specific socket helper.
+replace_once(
+    "sdk/python/keryx/config.py",
+    "from dataclasses import dataclass, replace\n",
+    "from dataclasses import dataclass, field, replace\n",
+)
+replace_once(
+    "sdk/python/keryx/config.py",
+    "from typing import Any\n\nDEFAULT_DAEMON_ENDPOINT = \"unix:///tmp/keryx-daemon.sock\"\n",
+    "from typing import Any\n\nfrom keryx.client import default_daemon_endpoint\n\nDEFAULT_DAEMON_ENDPOINT = \"unix://~/.hermes/keryx/run/keryx-daemon.sock\"\n",
+)
+replace_once(
+    "sdk/python/keryx/config.py",
+    "    daemon_endpoint: str = DEFAULT_DAEMON_ENDPOINT\n",
+    "    daemon_endpoint: str = field(default_factory=default_daemon_endpoint)\n",
+)
+replace_once(
+    "sdk/python/keryx/config.py",
+    "                default=DEFAULT_DAEMON_ENDPOINT,\n            ) or DEFAULT_DAEMON_ENDPOINT,\n",
+    "                default=default_daemon_endpoint(),\n            ) or default_daemon_endpoint(),\n",
+)
+replace_once(
+    "sdk/python/keryx/config.py",
+    "                or DEFAULT_DAEMON_ENDPOINT\n",
+    "                or default_daemon_endpoint()\n",
+)
+'''
+if 'Keep KeryxConfig aligned with the secure owner-specific socket helper.' not in text:
+    text += secure_default_patch
+
 path.write_text(text, encoding='utf-8')
