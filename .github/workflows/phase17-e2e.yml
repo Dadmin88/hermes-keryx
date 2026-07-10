@@ -46,11 +46,8 @@ jobs:
       - name: Install Python SDK
         run: python -m pip install -e 'sdk/python[dev]'
 
-      - name: Prepare deterministic test identities
-        run: |
-          if grep -q '"keypair_path": str(work_dir / "relay.key")' scripts/e2e_two_node.py; then
-            python scripts/apply_phase17_e2e_fix.py
-          fi
+      - name: Prepare deterministic identities and Python endpoints
+        run: python scripts/apply_phase17_e2e_fix.py
 
       - name: Run real two-node round trip
         run: |
