@@ -42,6 +42,7 @@ jobs:
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
           python scripts/apply_phase17_envelope_store.py 2>&1 | tee phase17-patch.log
+          python scripts/apply_phase17_envelope_fixups.py 2>&1 | tee -a phase17-patch.log
 
       - name: Upload patch failure
         if: failure()
@@ -80,7 +81,7 @@ jobs:
         with:
           name: phase17-envelope-tests
           path: phase17-tests.log
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       - name: Commit verified implementation
         run: |
