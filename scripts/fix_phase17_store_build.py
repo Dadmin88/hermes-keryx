@@ -79,6 +79,7 @@ daemon.write_text(text)
 for relative in [
     "crates/keryx-cli/tests/daemon_client.rs",
     "crates/keryx-store/tests/artifact_store.rs",
+    "crates/keryx-store/tests/envelope_store.rs",
 ]:
     path = ROOT / relative
     text = path.read_text()
@@ -87,4 +88,6 @@ for relative in [
         "store: ready sqlite schema_version=7 supported_schema_version=7",
     )
     text = text.replace("schema_version().await.unwrap(), 6", "schema_version().await.unwrap(), 7")
+    text = text.replace("CURRENT_SCHEMA_VERSION, 6", "CURRENT_SCHEMA_VERSION, 7")
+    text = text.replace("schema_is_v6", "schema_is_v7")
     path.write_text(text)
