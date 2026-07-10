@@ -20,10 +20,12 @@ use tonic::{Request, Response, Status};
 use crate::health::RelayHealthReport;
 use crate::registry::{SkillRegistry, StoredSkill};
 use crate::runtime::RelayRuntime;
+use crate::security::NodeTokenAuth;
 use keryx_core::PeerId;
 
 /// gRPC metadata key used by `ConnectNode` to identify the streaming node.
 pub const NODE_ID_METADATA_KEY: &str = "x-keryx-node-id";
+pub const NODE_TOKEN_METADATA_KEY: &str = "x-keryx-node-token";
 
 const RELAY_STREAM_BUFFER: usize = 128;
 const TARGET_NODE_METADATA_KEYS: &[&str] = &[
@@ -47,6 +49,7 @@ const SKILL_METADATA_KEYS: &[&str] = &[
 pub struct RelayHealthService {
     runtime: Arc<RelayRuntime>,
     registry: Option<Arc<SkillRegistry>>,
+    node_auth: Option<Arc<NodeTokenAuth>>,
 }
 
 impl RelayHealthService {
@@ -55,6 +58,7 @@ impl RelayHealthService {
         Self {
             runtime,
             registry: None,
+            node_auth: None,
         }
     }
 
@@ -63,7 +67,59 @@ impl RelayHealthService {
         Self {
             runtime,
             registry: Some(registry),
+            node_auth: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_registry_and_auth(
+        runtime: Arc<RelayRuntime>,
+        registry: Arc<SkillRegistry>,
+        node_auth: Arc<NodeTokenAuth>,
+    ) -> Self {
+        Self {
+            runtime,
+            registry: Some(registry),
+            node_auth: Some(node_auth),
+        }
+    }
+
+    fn authenticate_request<T>(
+        &self,
+        request: &Request<T>,
+        claimed_node_id: &str,
+    ) -> Result<String, Status> {
+        let claimed_node_id = claimed_node_id.trim();
+        if claimed_node_id.is_empty() {
+            return Err(Status::invalid_argument("source node id is required"));
+        }
+        let Some(auth) = &self.node_auth else {
+            return Ok(claimed_node_id.to_string());
+        };
+        let metadata_node_id = request
+            .metadata()
+            .get(NODE_ID_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::unauthenticated("node id metadata is required"))?;
+        if metadata_node_id != claimed_node_id {
+            return Err(Status::permission_denied(
+                "claimed source node does not match authenticated node metadata",
+            ));
+        }
+        let token = request
+            .metadata()
+            .get(NODE_TOKEN_METADATA_KEY)
+            .and_then(|value| value.to_str().ok());
+        let node_id = metadata_node_id
+            .parse()
+            .map_err(|error| Status::invalid_argument(format!("invalid node id: {error}")))?;
+        auth.authenticate_optional(&node_id, token)
+            .map_err(|failure| {
+                Status::unauthenticated(format!("node authentication failed: {}", failure.reason()))
+            })?;
+        Ok(metadata_node_id.to_string())
     }
 
     async fn refresh_registry_metric(&self) {
@@ -84,6 +140,7 @@ impl KeryxRelay for RelayHealthService {
         request: Request<tonic::Streaming<NodeFrame>>,
     ) -> Result<Response<Self::ConnectNodeStream>, Status> {
         let node_id = node_id_from_metadata(&request)?;
+        let node_id = self.authenticate_request(&request, &node_id)?;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
 
@@ -129,13 +186,25 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
-        let request = request.into_inner();
-        let node_id = request
+        let inner = request.into_inner();
+        let node_id = inner
             .node_id
             .as_ref()
             .map(|node_id| node_id.value.trim())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Status::invalid_argument("RegisterNode requires node_id"))?;
+        if let Some(auth) = &self.node_auth {
+            let parsed = node_id
+                .parse()
+                .map_err(|error| Status::invalid_argument(format!("invalid node id: {error}")))?;
+            auth.authenticate(&parsed, inner.token.trim())
+                .map_err(|failure| {
+                    Status::unauthenticated(format!(
+                        "node authentication failed: {}",
+                        failure.reason()
+                    ))
+                })?;
+        }
         self.runtime.register_node(node_id.to_string());
         if let Some(registry) = &self.registry {
             let peer_id = parse_registry_peer_id(node_id)?;
@@ -151,6 +220,8 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<PublishTaskRequest>,
     ) -> Result<Response<PublishTaskResponse>, Status> {
+        let claimed_source = request.get_ref().source_node_id.clone();
+        let authenticated_source = self.authenticate_request(&request, &claimed_source)?;
         let inner = request.into_inner();
         let task = inner
             .task
@@ -160,7 +231,7 @@ impl KeryxRelay for RelayHealthService {
         } else {
             inner.target_node_id.trim().to_string()
         };
-        let source_node_id = required_node_value(&inner.source_node_id, "source_node_id")?;
+        let source_node_id = authenticated_source;
         if let Some(registry) = &self.registry {
             let peer_id = parse_registry_peer_id(&target_node_id)?;
             if let Some(skill) = skill_from_task(&task) {
@@ -209,12 +280,14 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<PublishResultRequest>,
     ) -> Result<Response<PublishResultResponse>, Status> {
+        let claimed_source = request.get_ref().source_node_id.clone();
+        let authenticated_source = self.authenticate_request(&request, &claimed_source)?;
         let inner = request.into_inner();
         let result = inner
             .result
             .ok_or_else(|| Status::invalid_argument("PublishResult requires result"))?;
         let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
-        let source_node_id = required_node_value(&inner.source_node_id, "source_node_id")?;
+        let source_node_id = authenticated_source;
         let task_id = result
             .task_id
             .as_ref()
@@ -246,6 +319,8 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<AckFrameRequest>,
     ) -> Result<Response<AckFrameResponse>, Status> {
+        let node_id = node_id_from_metadata(&request)?;
+        self.authenticate_request(&request, &node_id)?;
         let accepted = self.runtime.ack_frame(&request.into_inner().frame_id);
         Ok(Response::new(AckFrameResponse { accepted }))
     }
@@ -423,6 +498,21 @@ pub async fn serve_grpc_health(
         Some(registry) => RelayHealthService::with_registry(runtime, registry),
         None => RelayHealthService::new(runtime),
     };
+    tonic::transport::Server::builder()
+        .add_service(KeryxRelayServer::new(service))
+        .serve_with_incoming(incoming)
+        .await
+}
+
+pub async fn serve_grpc_health_with_auth(
+    runtime: Arc<RelayRuntime>,
+    registry: Arc<SkillRegistry>,
+    node_auth: Arc<NodeTokenAuth>,
+    addr: SocketAddr,
+) -> Result<(), tonic::transport::Error> {
+    let listener = TcpListener::bind(addr).await.expect("bind health grpc");
+    let incoming = TcpListenerStream::new(listener);
+    let service = RelayHealthService::with_registry_and_auth(runtime, registry, node_auth);
     tonic::transport::Server::builder()
         .add_service(KeryxRelayServer::new(service))
         .serve_with_incoming(incoming)

@@ -116,6 +116,7 @@ impl RelayTaskPublisher for NoopRelayPublisher {
 pub struct GrpcRelayTaskPublisher {
     endpoint: String,
     source_peer_id: PeerId,
+    node_token: Option<String>,
 }
 
 impl GrpcRelayTaskPublisher {
@@ -124,6 +125,10 @@ impl GrpcRelayTaskPublisher {
         Self {
             endpoint: endpoint.into(),
             source_peer_id,
+            node_token: std::env::var("HERMES_KERYX_NODE_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
     }
 
@@ -153,12 +158,32 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
             target_peer_id.as_str().to_string(),
         );
         let mut client = self.connect(target_peer_id).await?;
+        let mut request = Request::new(PublishTaskRequest {
+            task: Some(envelope),
+            target_node_id: target_peer_id.as_str().to_string(),
+            source_node_id: self.source_peer_id.as_str().to_string(),
+        });
+        request.metadata_mut().insert(
+            "x-keryx-node-id",
+            self.source_peer_id
+                .as_str()
+                .parse()
+                .map_err(|error| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: format!("invalid source peer metadata: {error}"),
+                })?,
+        );
+        if let Some(token) = &self.node_token {
+            request.metadata_mut().insert(
+                "x-keryx-node-token",
+                token.parse().map_err(|error| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: format!("invalid node token metadata: {error}"),
+                })?,
+            );
+        }
         client
-            .publish_task(Request::new(PublishTaskRequest {
-                task: Some(envelope),
-                target_node_id: target_peer_id.as_str().to_string(),
-                source_node_id: self.source_peer_id.as_str().to_string(),
-            }))
+            .publish_task(request)
             .await
             .map(|_| ())
             .map_err(|status| RoutingError::RelayFailed {

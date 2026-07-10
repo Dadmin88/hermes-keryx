@@ -35,6 +35,7 @@ const NODE_SKILLS_ENV: &str = "HERMES_KERYX_NODE_SKILLS";
 const NODE_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
 const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
+const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
 
 /// Run an edge node until SIGINT: listen, dial bootstrap peers, optionally register skills.
@@ -74,8 +75,13 @@ pub async fn run_edge_node() -> Result<()> {
         (Some(relay_endpoint), Some(daemon_endpoint)) => {
             let registry_peer_id = registry_peer_id.clone();
             Some(tokio::spawn(async move {
-                if let Err(error) =
-                    run_relay_stream(relay_endpoint, registry_peer_id, daemon_endpoint).await
+                if let Err(error) = run_relay_stream(
+                    relay_endpoint,
+                    registry_peer_id,
+                    node_token(),
+                    daemon_endpoint,
+                )
+                .await
                 {
                     tracing::warn!(error = %error, "relay stream task exited");
                 }
@@ -133,6 +139,30 @@ fn handle_node_swarm_event(event: SwarmEvent<RelayClientBehaviourEvent>) {
     }
 }
 
+fn node_token() -> Option<String> {
+    std::env::var(NODE_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn add_node_auth_metadata<T>(
+    request: &mut Request<T>,
+    node_id: &str,
+    token: Option<&str>,
+) -> Result<()> {
+    request
+        .metadata_mut()
+        .insert(crate::health_server::NODE_ID_METADATA_KEY, node_id.parse()?);
+    if let Some(token) = token {
+        request.metadata_mut().insert(
+            crate::health_server::NODE_TOKEN_METADATA_KEY,
+            token.parse()?,
+        );
+    }
+    Ok(())
+}
+
 fn daemon_endpoint() -> Option<String> {
     std::env::var(DAEMON_ENDPOINT_ENV)
         .ok()
@@ -151,6 +181,7 @@ fn relay_endpoint() -> Option<String> {
 async fn run_relay_stream(
     relay_endpoint: String,
     registry_peer_id: String,
+    node_token: Option<String>,
     daemon_endpoint: String,
 ) -> Result<()> {
     let mut relay = KeryxRelayClient::connect(relay_endpoint.clone())
@@ -158,10 +189,7 @@ async fn run_relay_stream(
         .with_context(|| format!("keryx node stream: relay unavailable at {relay_endpoint}"))?;
     let (_tx, rx) = mpsc::channel::<NodeFrame>(8);
     let mut request = Request::new(ReceiverStream::new(rx));
-    request.metadata_mut().insert(
-        crate::health_server::NODE_ID_METADATA_KEY,
-        registry_peer_id.parse()?,
-    );
+    add_node_auth_metadata(&mut request, &registry_peer_id, node_token.as_deref())?;
     let mut stream = relay
         .connect_node(request)
         .await
@@ -204,8 +232,14 @@ async fn run_relay_stream(
                     continue;
                 }
                 let mut ack_client = KeryxRelayClient::connect(relay_endpoint.clone()).await?;
+                let mut ack_request = Request::new(AckFrameRequest { frame_id: frame.frame_id });
+                add_node_auth_metadata(
+                    &mut ack_request,
+                    &registry_peer_id,
+                    node_token.as_deref(),
+                )?;
                 ack_client
-                    .ack_frame(AckFrameRequest { frame_id: frame.frame_id })
+                    .ack_frame(ack_request)
                     .await
                     .context("keryx node stream: relay AckFrame failed")?;
             }
@@ -221,14 +255,18 @@ async fn run_relay_stream(
                 if !delivery.has_delivery {
                     continue;
                 }
-                let publish = relay
-                    .publish_result(PublishResultRequest {
-                        result: delivery.result,
-                        target_node_id: delivery.target_peer_id,
-                        source_node_id: registry_peer_id.clone(),
-                        frame_id: delivery.delivery_id.clone(),
-                    })
-                    .await;
+                let mut publish_request = Request::new(PublishResultRequest {
+                    result: delivery.result,
+                    target_node_id: delivery.target_peer_id,
+                    source_node_id: registry_peer_id.clone(),
+                    frame_id: delivery.delivery_id.clone(),
+                });
+                add_node_auth_metadata(
+                    &mut publish_request,
+                    &registry_peer_id,
+                    node_token.as_deref(),
+                )?;
+                let publish = relay.publish_result(publish_request).await;
                 match publish {
                     Ok(_) => {
                         daemon

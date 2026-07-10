@@ -14,7 +14,7 @@ use keryx_relay::{
     autonat::map_autonat_status,
     bootstrap::dial_bootstrap_peers,
     config::RelayConfig,
-    health_server::{serve_grpc_health, serve_http_health},
+    health_server::{serve_grpc_health, serve_grpc_health_with_auth, serve_http_health},
     registry::{SkillRegistry, DEFAULT_CLEANUP_INTERVAL, REGISTRY_GOSSIP_TOPIC},
     registry_server::{serve_registry_rpc, RegistryRpcService},
     runtime::RelayRuntime,
@@ -75,6 +75,15 @@ async fn main() -> Result<()> {
     let registry = Arc::new(SkillRegistry::with_default_ttl(registry_ttl));
     let _registry_cleanup = registry.spawn_cleanup(DEFAULT_CLEANUP_INTERVAL);
 
+    let node_auth = process
+        .toml
+        .as_ref()
+        .map(|config| config.load_node_token_auth(&config_path))
+        .transpose()?
+        .unwrap_or_default();
+    let node_auth_configured = node_auth.is_configured();
+    let node_auth = Arc::new(node_auth);
+
     let shared_allowlist: Option<SharedAllowlist> = process
         .allowlist
         .as_ref()
@@ -94,8 +103,14 @@ async fn main() -> Result<()> {
     if let Some(addr) = process.relay.parse_health_grpc_bind()? {
         let rt = Arc::clone(&runtime);
         let reg = Arc::clone(&registry);
+        let auth = Arc::clone(&node_auth);
         tokio::spawn(async move {
-            if let Err(err) = serve_grpc_health(rt, Some(reg), addr).await {
+            let result = if node_auth_configured {
+                serve_grpc_health_with_auth(rt, reg, auth, addr).await
+            } else {
+                serve_grpc_health(rt, Some(reg), addr).await
+            };
+            if let Err(err) = result {
                 tracing::error!(%addr, error = %err, "gRPC health server exited");
             }
         });

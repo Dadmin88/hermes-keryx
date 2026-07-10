@@ -528,7 +528,7 @@ json_block_start = '''    relay_config = work_dir / "relay.json"
         + "\\n",
         encoding="utf-8",
     )'''
-toml_block = '''    relay_config = work_dir / "relay.toml"
+toml_block = """    relay_config = work_dir / "relay.toml"
     relay_config.write_text(
         f'''[relay]
 listen_addresses = ["tcp:0"]
@@ -552,7 +552,7 @@ node_id = "{RECEIVER_PEER}"
 token = "{RECEIVER_TOKEN}"
 ''',
         encoding="utf-8",
-    )'''
+    )"""
 if json_block_start in text:
     text = text.replace(json_block_start, toml_block)
 else:

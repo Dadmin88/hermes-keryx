@@ -40,6 +40,8 @@ SKILL_ID = "e2e.echo"
 SENDER_PEER = "sender-peer"
 RECEIVER_PEER = "receiver-peer"
 EXPECTED_TEXT = "remote-result:phase17-cross-node"
+SENDER_TOKEN = "sender-token-phase17"
+RECEIVER_TOKEN = "receiver-token-phase17"
 
 
 @dataclass
@@ -163,6 +165,7 @@ def daemon_env(
             "HERMES_KERYX_RELAY_ENDPOINT": f"http://127.0.0.1:{relay_port}",
             "HERMES_KERYX_RELAY_HEALTH_ENDPOINT": f"http://127.0.0.1:{relay_port}",
             "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT": f"http://127.0.0.1:{registry_port}",
+            "HERMES_KERYX_NODE_TOKEN": SENDER_TOKEN if peer_id == SENDER_PEER else RECEIVER_TOKEN,
         }
     )
     return env
@@ -183,6 +186,9 @@ def edge_env(
     key_path.parent.mkdir(parents=True, exist_ok=True)
     seed = 1 if peer_id == SENDER_PEER else 2
     key_path.write_bytes(bytes([seed]) + bytes(31))
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    seed = 1 if peer_id == SENDER_PEER else 2
+    key_path.write_bytes(bytes([seed]) + bytes(31))
     env = base_env()
     env.update(
         {
@@ -195,6 +201,7 @@ def edge_env(
             "HERMES_KERYX_NODE_NAME": peer_id,
             "HERMES_KERYX_NODE_DESCRIPTION": f"Phase 17 test node {peer_id}",
             "HERMES_KERYX_NODE_SKILLS": skills,
+            "HERMES_KERYX_NODE_TOKEN": SENDER_TOKEN if peer_id == SENDER_PEER else RECEIVER_TOKEN,
         }
     )
     return env
@@ -333,26 +340,29 @@ def supervisor(args: argparse.Namespace) -> int:
     registry_port = free_port()
     sender_port = free_port()
     receiver_port = free_port()
-    relay_config = work_dir / "relay.json"
+    relay_config = work_dir / "relay.toml"
     relay_config.write_text(
-        json.dumps(
-            {
-                "listen_addresses": ["tcp:0"],
-                "bootstrap_peers": [],
-                "enable_mdns": False,
-                "keypair_path": None,
-                "max_circuits": 16,
-                "max_reservations": 16,
-                "max_reservations_per_peer": 4,
-                "connection_timeout_ms": 5_000,
-                "use_ipv6": False,
-                "health_grpc_bind": f"127.0.0.1:{relay_port}",
-                "health_http_bind": "",
-                "registry_grpc_bind": f"127.0.0.1:{registry_port}",
-            },
-            indent=2,
-        )
-        + "\n",
+        f'''[relay]
+listen_addresses = ["tcp:0"]
+bootstrap_peers = []
+enable_mdns = false
+max_circuits = 16
+max_reservations = 16
+max_reservations_per_peer = 4
+connection_timeout_ms = 5000
+use_ipv6 = false
+health_grpc_bind = "127.0.0.1:{relay_port}"
+health_http_bind = ""
+registry_grpc_bind = "127.0.0.1:{registry_port}"
+
+[[security.node_tokens]]
+node_id = "{SENDER_PEER}"
+token = "{SENDER_TOKEN}"
+
+[[security.node_tokens]]
+node_id = "{RECEIVER_PEER}"
+token = "{RECEIVER_TOKEN}"
+''',
         encoding="utf-8",
     )
 
