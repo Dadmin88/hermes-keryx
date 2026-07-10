@@ -119,16 +119,12 @@ if text.count(idempotency_marker) != 1:
     raise SystemExit("expected local completion test marker exactly once")
 text = text.replace(idempotency_marker, idempotency_test, 1)
 
-fixture_call = '''# Existing test fixtures that construct InMemoryState explicitly need the new maps.
-replace_once(
-    STORE,
-    "            envelopes: HashMap::new(),\n        };",
-    "            envelopes: HashMap::new(),\n"
-    "            results: HashMap::new(),\n"
-    "            result_outbox: HashMap::new(),\n"
-    "        };",
-)
-'''
+fixture_start = "# Existing test fixtures that construct InMemoryState explicitly need the new maps.\n"
+fixture_end = "# ---------------------------------------------------------------------------\n# Daemon integration. Only the reserved authenticated-sender key creates outbox.\n"
+if text.count(fixture_start) != 1 or text.count(fixture_end) != 1:
+    raise SystemExit("expected exactly one bounded fixture generator section")
+start = text.index(fixture_start)
+end = text.index(fixture_end, start)
 fixture_patch = '''# Existing test fixtures that construct InMemoryState explicitly need the new maps.
 fixture_path = Path(STORE)
 fixture_text = fixture_path.read_text(encoding="utf-8")
@@ -143,9 +139,8 @@ fixture_count = fixture_text.count(fixture_old)
 if fixture_count != 3:
     raise SystemExit(f"{STORE}: expected 3 explicit InMemoryState fixtures, found {fixture_count}")
 fixture_path.write_text(fixture_text.replace(fixture_old, fixture_new), encoding="utf-8")
+
 '''
-if text.count(fixture_call) != 1:
-    raise SystemExit("expected the single-fixture generator block exactly once")
-text = text.replace(fixture_call, fixture_patch, 1)
+text = text[:start] + fixture_patch + text[end:]
 
 path.write_text(text, encoding="utf-8")
