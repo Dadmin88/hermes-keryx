@@ -91,5 +91,7 @@ async fn complete_task_via_rpc_clears_lease_and_marks_completed() {
         .await
         .unwrap_err();
 
-    assert_eq!(second_complete.code(), Code::NotFound);
+    // Durable terminal results make completion replay explicit and idempotent.
+    // The task still exists, but a second terminal write is rejected.
+    assert_eq!(second_complete.code(), Code::AlreadyExists);
 }
