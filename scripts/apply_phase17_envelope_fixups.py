@@ -54,3 +54,35 @@ replace_once(
     "assert_eq!(store.schema_version().await.unwrap(), 5);",
     "assert_eq!(store.schema_version().await.unwrap(), 6);",
 )
+
+replace_once(
+    "crates/keryx-store/tests/sqlite_store.rs",
+    '''async fn sqlite_migration_from_empty_database_creates_schema_version() {
+    let store = temp_store().await;
+
+    assert_eq!(store.schema_version().await.unwrap(), 5);
+}''',
+    '''async fn sqlite_migration_from_empty_database_creates_schema_version() {
+    let store = temp_store().await;
+
+    assert_eq!(store.schema_version().await.unwrap(), 6);
+}''',
+)
+
+replace_once(
+    "crates/keryx-store/tests/sqlite_store.rs",
+    '''    store.migrate().await.unwrap();
+
+    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().status,
+        TaskStatus::Pending
+    );''',
+    '''    store.migrate().await.unwrap();
+
+    assert_eq!(store.schema_version().await.unwrap(), 6);
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().status,
+        TaskStatus::Pending
+    );''',
+)
