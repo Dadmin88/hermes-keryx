@@ -2,8 +2,13 @@ mod common;
 
 use common::RpcTestHarness;
 use keryx_core::{LimitsConfig, TaskStatus};
-use keryx_daemon::KeryxDaemonConfig;
-use keryx_proto::v1::{DoctorRequest, StatusRequest, SubmitTaskRequest, TaskEnvelope, TaskId};
+use keryx_daemon::{
+    handle_incoming_task, IncomingDispatchConfig, IncomingHandleResult, IncomingRelayTask,
+    KeryxDaemonConfig, StaticSenderAllowlist,
+};
+use keryx_proto::v1::{
+    DoctorRequest, SendTaskRequest, StatusRequest, SubmitTaskRequest, TaskEnvelope, TaskId,
+};
 use tonic::Code;
 
 fn envelope(task_id: &str) -> TaskEnvelope {
@@ -118,6 +123,134 @@ async fn submit_rejects_when_envelope_is_too_large() {
 
     assert_eq!(error.code(), Code::ResourceExhausted);
     assert!(error.message().contains("envelope_bytes"));
+}
+
+#[tokio::test]
+async fn local_send_task_respects_pending_queue_limit() {
+    let mut harness = harness_with_limits(LimitsConfig {
+        max_pending_tasks: 1,
+        max_envelope_bytes: 0,
+    })
+    .await;
+    let local_peer = harness.runtime.config().local_peer_id().to_string();
+
+    harness
+        .client
+        .submit_task(SubmitTaskRequest {
+            envelope: Some(envelope("local-send-full-1")),
+        })
+        .await
+        .unwrap();
+    let error = harness
+        .client
+        .send_task(SendTaskRequest {
+            target_peer_id: local_peer,
+            envelope: Some(envelope("local-send-full-2")),
+            timeout_ms: 0,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.message().contains("pending_tasks"));
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_send_task_respects_envelope_size_limit() {
+    let mut harness = harness_with_limits(LimitsConfig {
+        max_pending_tasks: 0,
+        max_envelope_bytes: 1,
+    })
+    .await;
+    let local_peer = harness.runtime.config().local_peer_id().to_string();
+
+    let error = harness
+        .client
+        .send_task(SendTaskRequest {
+            target_peer_id: local_peer,
+            envelope: Some(envelope("local-send-too-large")),
+            timeout_ms: 0,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.message().contains("envelope_bytes"));
+}
+
+#[tokio::test]
+async fn incoming_relay_task_respects_pending_queue_limit() {
+    let harness = harness_with_limits(LimitsConfig {
+        max_pending_tasks: 1,
+        max_envelope_bytes: 0,
+    })
+    .await;
+    let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
+
+    let first = handle_incoming_task(
+        harness.runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new("frame-1", "node-trusted", envelope("incoming-full-1")),
+    )
+    .await;
+    assert!(matches!(first, IncomingHandleResult::Accepted { .. }));
+
+    let second = handle_incoming_task(
+        harness.runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new("frame-2", "node-trusted", envelope("incoming-full-2")),
+    )
+    .await;
+    match second {
+        IncomingHandleResult::Store(error) => {
+            assert!(error.to_string().contains("pending_tasks"));
+        }
+        other => panic!("expected pending limit store error, got {other:?}"),
+    }
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn incoming_relay_task_respects_envelope_size_limit() {
+    let harness = harness_with_limits(LimitsConfig {
+        max_pending_tasks: 0,
+        max_envelope_bytes: 1,
+    })
+    .await;
+    let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
+
+    let result = handle_incoming_task(
+        harness.runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new("frame-1", "node-trusted", envelope("incoming-too-large")),
+    )
+    .await;
+    match result {
+        IncomingHandleResult::Store(error) => {
+            assert!(error.to_string().contains("envelope_bytes"));
+        }
+        other => panic!("expected envelope limit store error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
