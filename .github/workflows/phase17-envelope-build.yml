@@ -30,6 +30,17 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/apply_phase17_envelope_store.py")
+          text = path.read_text(encoding="utf-8")
+          old = '    "    pub async fn put_artifact(\\n        &self,",\n'
+          new = '    "    pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {",\n'
+          if old not in text:
+              raise SystemExit("ambiguous SQLite insertion anchor was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
           python scripts/apply_phase17_envelope_store.py 2>&1 | tee phase17-patch.log
 
       - name: Upload patch failure
