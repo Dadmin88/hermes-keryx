@@ -286,7 +286,7 @@ async fn run_status() -> Result<()> {
         print_daemon_status(&endpoint, &status);
     } else {
         let runtime = KeryxDaemonRuntime::startup(default_config()).await?;
-        print_status(&runtime.status_report().await?);
+        print_status(&runtime.status_report());
     }
     Ok(())
 }
@@ -297,7 +297,7 @@ async fn run_doctor() -> Result<()> {
         print_daemon_doctor(&endpoint, &doctor);
     } else {
         let runtime = KeryxDaemonRuntime::startup(default_config()).await?;
-        print_doctor(&runtime.doctor_report().await?);
+        print_doctor(&runtime.doctor_report());
     }
     Ok(())
 }
@@ -337,33 +337,6 @@ fn default_config() -> KeryxDaemonConfig {
 fn print_daemon_status(endpoint: &str, status: &StatusResponse) {
     println!("keryx status: {}", status.status);
     println!("source: daemon {endpoint}");
-    println!("data_dir: {}", status.data_dir);
-    println!("db_path: {}", status.db_path);
-    let store_readiness = if status.store_ready {
-        "ready"
-    } else {
-        "not-ready"
-    };
-    println!(
-        "store: {store_readiness} {} schema_version={} supported_schema_version={}",
-        status.store_kind, status.schema_version, status.supported_schema_version
-    );
-    println!(
-        "startup_recovery: recovered_tasks={} cleaned_terminal_leases={} corruption_count={} duration_ms={}",
-        status.recovered_tasks,
-        status.cleaned_terminal_leases,
-        status.corruption_count,
-        status.startup_recovery_duration_ms
-    );
-    println!(
-        "limits: pending_tasks={}/{} envelope_bytes_limit={}",
-        pending_tasks_label(status.current_pending_tasks),
-        limit_label(status.max_pending_tasks),
-        limit_label(status.max_envelope_bytes)
-    );
-    for warning in &status.warnings {
-        println!("warning: {warning}");
-    }
 }
 
 fn print_daemon_doctor(endpoint: &str, doctor: &DoctorResponse) {
@@ -400,15 +373,6 @@ fn print_status(status: &KeryxStatusReport) {
         status.corruption_count,
         status.startup_recovery_duration_ms
     );
-    println!(
-        "limits: pending_tasks={}/{} envelope_bytes_limit={}",
-        pending_tasks_label(status.current_pending_tasks),
-        limit_label(status.max_pending_tasks),
-        limit_label(status.max_envelope_bytes)
-    );
-    for warning in &status.warnings {
-        println!("warning: {warning}");
-    }
 }
 
 fn print_doctor(doctor: &KeryxDoctorReport) {
@@ -427,16 +391,4 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-fn limit_label(limit: u64) -> String {
-    if limit == 0 {
-        "unlimited".to_string()
-    } else {
-        limit.to_string()
-    }
-}
-
-fn pending_tasks_label(count: Option<u64>) -> String {
-    count.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
