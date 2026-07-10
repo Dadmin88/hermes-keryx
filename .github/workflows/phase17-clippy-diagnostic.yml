@@ -1,0 +1,33 @@
+name: Phase 17 Clippy Diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-clippy:
+    if: github.head_ref == 'feat/phase17-complete-roundtrip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Capture Clippy output
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets -- -D warnings > phase17-clippy.log 2>&1
+          status=$?
+          cat phase17-clippy.log
+          echo "clippy_status=$status"
+          exit 0
+      - name: Upload Clippy diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-clippy-diagnostic
+          path: phase17-clippy.log
+          if-no-files-found: error
