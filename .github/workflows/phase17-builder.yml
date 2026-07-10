@@ -27,11 +27,27 @@ jobs:
       - name: Format
         run: cargo fmt --all
       - name: Check Rust workspace
+        id: verify
+        shell: bash
         run: |
-          cargo fmt --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          set +e
+          {
+            cargo fmt --check
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
+          } 2>&1 | tee phase17-build.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-build-log
+          path: phase17-build.log
+          if-no-files-found: error
       - name: Commit generated implementation
+        if: steps.verify.outputs.status == '0'
         run: |
           if git diff --quiet; then
             echo 'No generated changes'
@@ -42,3 +58,6 @@ jobs:
           git add proto crates scripts
           git commit -m 'feat(store): persist authenticated terminal results and outbox'
           git push origin HEAD:${{ github.head_ref }}
+      - name: Fail unsuccessful verification
+        if: steps.verify.outputs.status != '0'
+        run: exit 1
