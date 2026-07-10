@@ -8,6 +8,7 @@ on:
       - "proto/**"
       - "sdk/python/**"
       - "scripts/e2e_two_node.py"
+      - "scripts/apply_phase17_e2e_fix.py"
       - ".github/workflows/phase17-e2e.yml"
   push:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - "proto/**"
       - "sdk/python/**"
       - "scripts/e2e_two_node.py"
+      - "scripts/apply_phase17_e2e_fix.py"
       - ".github/workflows/phase17-e2e.yml"
 
 permissions:
@@ -43,6 +45,12 @@ jobs:
 
       - name: Install Python SDK
         run: python -m pip install -e 'sdk/python[dev]'
+
+      - name: Prepare deterministic test identities
+        run: |
+          if grep -q '"keypair_path": str(work_dir / "relay.key")' scripts/e2e_two_node.py; then
+            python scripts/apply_phase17_e2e_fix.py
+          fi
 
       - name: Run real two-node round trip
         run: |
