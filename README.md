@@ -6,7 +6,7 @@ It provides:
 
 - local daemon (`keryxd`) with SQLite-backed task lifecycle
 - cross-node relay (`keryx-relay`) with libp2p, health probes, peer allowlisting, and a skill registry
-- edge node binary (`keryx-node`) for relay bootstrap + registry advertisement
+- edge node binary (`keryx-node`) for relay bootstrap, registry advertisement, and relay-frame delivery into a local daemon
 - operator CLI (`keryx`)
 - Python SDK (`keryx`) for Hermes Agency and standalone clients
 - cancellation, deadlines, artifacts, backpressure, routing policy, and migration tooling
@@ -59,15 +59,17 @@ proto/                 Protobuf definitions
 | 9 | Artifact storage + artifact RPC/CLI | Implemented |
 | 10 | Backpressure + configurable limits | Implemented |
 | 11 | Cancellation + deadline fields, store APIs, daemon `CancelTask`, deadline loop | Implemented |
-| 12 | Relay transport, node identity, offline mailbox, daemon `SendTask`/peers | Implemented |
+| 12 | Relay publication, node identity, offline mailbox, daemon `SendTask`/peers | Transport primitives implemented; full Agent round trip pending Phase 17 |
 | 13 | Peer discovery + skill registry with TTL and registry gossip | Implemented |
 | 14 | Security model + routing policy, relay allowlist and node-token auth primitives | Implemented |
-| 15 | Python SDK (`KeryxNode`) | Implemented |
+| 15 | Python SDK (`KeryxNode`) | Local lifecycle/submission helpers implemented; remote handler/result loop pending Phase 17 |
 | 16 | Migration script + dual-run infrastructure | Implemented |
+| 17 | Durable daemon-to-Agent dispatch and terminal result/artifact return | Planned and tracked in issue #10 |
 
 Primary references:
 
 - [docs/current-product.md](docs/current-product.md)
+- [docs/phase17-cross-node-agent-delivery.md](docs/phase17-cross-node-agent-delivery.md)
 - [docs/lifecycle-store-daemon-semantics.md](docs/lifecycle-store-daemon-semantics.md)
 - [docs/worker-loop.md](docs/worker-loop.md)
 - [docs/observability.md](docs/observability.md)
@@ -94,10 +96,10 @@ cargo build --release \
 
 ## Operator quickstart
 
-### Local dual-run (recommended for Agency migration)
+### Local dual-run
 
 ```bash
-# Start keryxd + keryx-relay on non-conflicting loopback ports
+# Start one keryxd + one keryx-relay on non-conflicting loopback ports
 ./scripts/keryx-dual-run.sh --start
 ./scripts/keryx-dual-run.sh --status
 ./scripts/keryx-dual-run.sh --stop
@@ -114,6 +116,8 @@ Dual-run defaults (loopback only; avoids common legacy AgentAnycast ports 4001/5
 | Relay libp2p TCP/QUIC | `127.0.0.1:4101` |
 
 Runtime files live under `~/.hermes/.keryx/` (`logs/`, `run/`, `data/`, relay config).
+
+This quickstart validates daemon/relay infrastructure health. It does **not** start two edge nodes or prove a complete remote Hermes Agency handler and result/artifact round trip. That work is Phase 17.
 
 ### Manual daemon
 
@@ -185,6 +189,8 @@ finally:
     await node.close()
 ```
 
+This example proves local daemon submission. The AgentAnycast-compatible `serve_forever()` and `TaskHandle.wait()` surfaces do not yet complete a remote Agency execution/result loop. See [Phase 17](docs/phase17-cross-node-agent-delivery.md).
+
 Details: [sdk/python/README.md](sdk/python/README.md).
 
 ## Migration from AgentAnycast
@@ -201,12 +207,14 @@ Full guide: [docs/migration-from-agentanycast.md](docs/migration-from-agentanyca
 
 ## Hermes Agency integration
 
-Hermes Agency treats Keryx as the primary transport:
+Hermes Agency treats Keryx as its primary transport:
 
 - Config: `agency.transport_backend: keryx`
 - Vendored Python SDK: `Hermes_Agency/src/keryx/` when packaging Agency
 - Node/pool modules import `from keryx import ...` directly
 - AgentAnycast remains a legacy fallback only
+
+The current integration supports local lifecycle, registry discovery, relay publication, and destination daemon submission. Complete remote Agent handler execution and terminal result/artifact return remain Phase 17 work and should not be presented as shipped until the cross-process E2E passes.
 
 This repo stays independent so Keryx can be PR'd upstream without the full Agency product surface.
 
