@@ -30,6 +30,9 @@ class TaskStatus(enum.Enum):
 @dataclass
 class Part:
     text: str | None = None
+    raw: bytes = b""
+    media_type: str = "text/plain"
+    metadata: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Part:
@@ -38,13 +41,25 @@ class Part:
         text = data.get("text")
         if text is not None and not isinstance(text, str):
             raise ValueError("Part text must be a string")
-        return cls(text=text)
+        raw = data.get("raw") or b""
+        if not isinstance(raw, bytes):
+            raise ValueError("Part raw content must be bytes")
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("Part metadata must be a dictionary")
+        return cls(
+            text=text,
+            raw=raw,
+            media_type=str(data.get("media_type") or "text/plain"),
+            metadata={str(key): str(value) for key, value in metadata.items()},
+        )
 
 
 @dataclass
 class Message:
     role: str = "user"
     parts: list[Part] = field(default_factory=list)
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,17 +112,87 @@ class IncomingTask:
         task: Task,
         sender_card: Any | None,
         update_fn: Callable[[str, TaskStatus, list[Artifact] | None, str | None], Coroutine[Any, Any, None]],
+        *,
+        lease_id: str = "",
+        worker_id: str = "",
+        sender_peer_id: str = "",
     ) -> None:
         self._task = task
         self.sender_card = sender_card
         self._update_fn = update_fn
+        self._lease_id = lease_id
+        self._worker_id = worker_id
+        self._sender_peer_id = sender_peer_id
+        self._terminal = asyncio.Event()
+        self._terminal_lock = asyncio.Lock()
 
     @property
     def task_id(self) -> str:
         return self._task.task_id
 
+    @property
+    def context_id(self) -> str:
+        return self._task.context_id
+
+    @property
+    def messages(self) -> list[Message]:
+        return self._task.messages
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        return dict(self._task.metadata or {})
+
+    @property
+    def target_skill_id(self) -> str:
+        return self._task.target_skill_id
+
+    @property
+    def peer_id(self) -> str:
+        return self._sender_peer_id or self._task.originator_peer_id
+
+    @property
+    def lease_id(self) -> str:
+        return self._lease_id
+
+    @property
+    def worker_id(self) -> str:
+        return self._worker_id
+
+    @property
+    def status(self) -> TaskStatus:
+        return self._task.status
+
+    @property
+    def is_terminal(self) -> bool:
+        return self._terminal.is_set()
+
+    async def wait_terminal(self) -> TaskStatus:
+        await self._terminal.wait()
+        return self._task.status
+
+    async def update_status(self, status: str | TaskStatus) -> None:
+        resolved = status if isinstance(status, TaskStatus) else TaskStatus(str(status).lower())
+        if resolved in (TaskStatus.SUBMITTED, TaskStatus.WORKING):
+            self._task.status = resolved
+            return
+        if resolved == TaskStatus.COMPLETED:
+            await self.complete()
+            return
+        await self.fail(f"task marked {resolved.value}")
+
     async def complete(self, artifacts: list[Artifact] | None = None) -> None:
-        await self._update_fn(self.task_id, TaskStatus.COMPLETED, artifacts, None)
+        async with self._terminal_lock:
+            if self._terminal.is_set():
+                return
+            await self._update_fn(self.task_id, TaskStatus.COMPLETED, artifacts, None)
+            self._task.status = TaskStatus.COMPLETED
+            self._task.artifacts = list(artifacts or [])
+            self._terminal.set()
 
     async def fail(self, error: str) -> None:
-        await self._update_fn(self.task_id, TaskStatus.FAILED, None, error)
+        async with self._terminal_lock:
+            if self._terminal.is_set():
+                return
+            await self._update_fn(self.task_id, TaskStatus.FAILED, None, error)
+            self._task.status = TaskStatus.FAILED
+            self._terminal.set()
