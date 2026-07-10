@@ -93,7 +93,7 @@ strip_scheme() {
 }
 
 host_port() {
-  local addr=$1
+  local addr=$1 host port
   if [[ "$addr" == http://* || "$addr" == https://* || "$addr" == tcp://* ]]; then
     addr=$(strip_scheme "$addr")
   fi
@@ -102,7 +102,12 @@ host_port() {
   if [[ "$addr" == *']:'* || "$addr" == unix://* ]]; then
     return 1
   fi
-  printf '%s %s\n' "${addr%:*}" "${addr##*:}"
+  host=${addr%:*}
+  port=${addr##*:}
+  if [[ -z "$host" || "$host" == "$addr" || ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    return 1
+  fi
+  printf '%s %s\n' "$host" "$port"
 }
 
 tcp_listening() {
@@ -110,7 +115,7 @@ tcp_listening() {
   if ! read -r host port < <(host_port "$addr"); then
     return 1
   fi
-  timeout 1 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1
+  timeout 1 bash -c '</dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1
 }
 
 ensure_relay_config() {
