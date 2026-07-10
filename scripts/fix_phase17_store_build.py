@@ -76,18 +76,14 @@ if addition not in text:
     text = text.replace(anchor, addition, 1)
 daemon.write_text(text)
 
-for relative in [
-    "crates/keryx-cli/tests/daemon_client.rs",
-    "crates/keryx-store/tests/artifact_store.rs",
-    "crates/keryx-store/tests/envelope_store.rs",
-]:
-    path = ROOT / relative
+for path in (ROOT / "crates").rglob("*.rs"):
     text = path.read_text()
-    text = text.replace(
+    updated = text.replace(
         "store: ready sqlite schema_version=6 supported_schema_version=6",
         "store: ready sqlite schema_version=7 supported_schema_version=7",
     )
-    text = text.replace("schema_version().await.unwrap(), 6", "schema_version().await.unwrap(), 7")
-    text = text.replace("CURRENT_SCHEMA_VERSION, 6", "CURRENT_SCHEMA_VERSION, 7")
-    text = text.replace("schema_is_v6", "schema_is_v7")
-    path.write_text(text)
+    updated = updated.replace("schema_version().await.unwrap(), 6", "schema_version().await.unwrap(), 7")
+    updated = updated.replace("CURRENT_SCHEMA_VERSION, 6", "CURRENT_SCHEMA_VERSION, 7")
+    updated = updated.replace("schema_is_v6", "schema_is_v7")
+    if updated != text:
+        path.write_text(updated)
