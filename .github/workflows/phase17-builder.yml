@@ -65,6 +65,8 @@ jobs:
           else
             echo 'Authenticated relay source binding is already committed'
           fi
+      - name: Repair authenticated relay endpoint wiring
+        run: python scripts/fix_phase17_relay_config.py
       - name: Format
         run: cargo fmt --all
       - name: Check workspace
@@ -101,7 +103,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add proto crates sdk scripts
-          git commit -m 'feat(phase17): authenticate relay task and result sources'
+          git commit -m 'fix(phase17): finalize authenticated relay configuration'
           git push origin HEAD:${{ github.head_ref }}
       - name: Fail unsuccessful verification
         if: steps.verify.outputs.status != '0'
