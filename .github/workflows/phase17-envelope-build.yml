@@ -27,7 +27,18 @@ jobs:
           components: rustfmt, clippy
 
       - name: Apply asserted Phase 17.1 patch
-        run: python scripts/apply_phase17_envelope_store.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/apply_phase17_envelope_store.py 2>&1 | tee phase17-patch.log
+
+      - name: Upload patch failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-envelope-patch
+          path: phase17-patch.log
+          if-no-files-found: error
 
       - name: Format and verify
         run: |
