@@ -152,7 +152,7 @@ async fn full_worker_lifecycle_with_recovery_requeues_abandoned_lease() {
 
     let status = client.status(StatusRequest {}).await.unwrap().into_inner();
     assert_eq!(status.status, "ready");
-    assert!(!status.store_ready);
+    assert!(status.store_ready);
 
     let id1 = CoreTaskId::new("e2e-task-1").unwrap();
     let id2 = CoreTaskId::new("e2e-task-2").unwrap();

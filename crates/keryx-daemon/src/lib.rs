@@ -1,5 +1,7 @@
 //! Local daemon startup/runtime foundation for Hermes Keryx.
 
+mod cancellation;
+mod deadline_enforcement_loop;
 mod discovery;
 mod health_loop;
 mod incoming;
@@ -12,24 +14,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keryx_core::{
-    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, LeaseId, MediaType,
-    PeerId, RetryPolicy, TaskId, TaskStatus, MAX_BLOB_BYTES,
+    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, KeryxEventType,
+    LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
+    ValidationError, MAX_BLOB_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
     keryx_daemon_server::{KeryxDaemon, KeryxDaemonServer},
-    AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, ClaimTaskRequest,
-    ClaimTaskResponse, CompleteTaskRequest, CompleteTaskResponse, DeleteArtifactRequest,
-    DeleteArtifactResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
-    DoctorResponse, FailTaskRequest, FailTaskResponse, GetArtifactRequest, GetArtifactResponse,
-    HeartbeatRequest, HeartbeatResponse, IdempotencyKey as ProtoIdempotencyKey,
-    LeaseId as ProtoLeaseId, ListArtifactsRequest, ListArtifactsResponse, ListPeersRequest,
-    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, PutArtifactRequest,
-    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,
-    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskId as ProtoTaskId,
+    AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, CancelTaskRequest,
+    CancelTaskResponse, ClaimTaskRequest, ClaimTaskResponse, CompleteTaskRequest,
+    CompleteTaskResponse, DeleteArtifactRequest, DeleteArtifactResponse, DiscoverSkillsRequest,
+    DiscoverSkillsResponse, DoctorRequest, DoctorResponse, FailTaskRequest, FailTaskResponse,
+    GetArtifactRequest, GetArtifactResponse, HeartbeatRequest, HeartbeatResponse,
+    IdempotencyKey as ProtoIdempotencyKey, LeaseId as ProtoLeaseId, ListArtifactsRequest,
+    ListArtifactsResponse, ListPeersRequest, ListPeersResponse, LivenessRequest, LivenessResponse,
+    PeerDescriptor, PutArtifactRequest, PutArtifactResponse, ReadinessRequest, ReadinessResponse,
+    SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse, SubmitTaskRequest,
+    SubmitTaskResponse, TaskId as ProtoTaskId,
 };
+use prost::Message;
 use tokio::sync::watch;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
@@ -39,6 +44,8 @@ use keryx_store::{
     CURRENT_SCHEMA_VERSION,
 };
 
+pub use cancellation::{CancellationSnapshot, CancellationState};
+pub use deadline_enforcement_loop::{DeadlineEnforcementLoop, DeadlineEnforcementLoopHandle};
 pub use discovery::{
     ConfiguredSkill, DiscoveryHandle, DiscoverySettings, RegistrationSettings,
     DEFAULT_REFRESH_LEAD_SECONDS, DEFAULT_REGISTRATION_TTL_SECONDS,
@@ -50,8 +57,9 @@ pub use incoming::{
 };
 pub use lease_recovery_loop::{LeaseRecoveryLoop, LeaseRecoveryLoopHandle};
 pub use routing::{
-    routing_error_to_status, DeliveryRoute, NoopRelayPublisher, PeerDirectory, PeerInfo,
-    RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter, DEFAULT_SEND_TASK_TIMEOUT_MS,
+    routing_error_to_status, DeliveryRoute, GrpcRelayTaskPublisher, NoopRelayPublisher,
+    PeerDirectory, PeerInfo, RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter,
+    DEFAULT_SEND_TASK_TIMEOUT_MS,
 };
 
 /// Default background health probe interval.
@@ -59,6 +67,9 @@ const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 60_000;
 
 /// Default background stale-lease scan interval.
 const DEFAULT_LEASE_RECOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// Default background task-deadline scan interval.
+const DEFAULT_DEADLINE_ENFORCEMENT_INTERVAL_MS: u64 = 30_000;
 
 /// Default worker lease TTL when callers omit `lease_duration_ms`.
 const DEFAULT_LEASE_DEFAULT_TTL_MS: i64 = 300_000;
@@ -159,13 +170,16 @@ pub struct KeryxDaemonConfig {
     blob_dir: PathBuf,
     startup_recovery_now_ms: i64,
     lease_recovery_interval_ms: u64,
+    deadline_enforcement_interval_ms: u64,
     lease_default_ttl_ms: i64,
     health_check_interval_ms: u64,
     shutdown_timeout_ms: u64,
     fail_retry_policy: RetryPolicy,
+    limits: LimitsConfig,
     local_peer_id: PeerId,
     send_task_timeout_ms: u64,
     discovery: Option<DiscoverySettings>,
+    relay_endpoint: Option<String>,
 }
 
 impl KeryxDaemonConfig {
@@ -177,13 +191,16 @@ impl KeryxDaemonConfig {
             data_dir,
             startup_recovery_now_ms,
             lease_recovery_interval_ms: DEFAULT_LEASE_RECOVERY_INTERVAL_MS,
+            deadline_enforcement_interval_ms: DEFAULT_DEADLINE_ENFORCEMENT_INTERVAL_MS,
             lease_default_ttl_ms: DEFAULT_LEASE_DEFAULT_TTL_MS,
             health_check_interval_ms: DEFAULT_HEALTH_CHECK_INTERVAL_MS,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
             fail_retry_policy: RetryPolicy::default(),
+            limits: LimitsConfig::default(),
             local_peer_id: PeerId::new(DEFAULT_LOCAL_PEER_ID).expect("static local peer id"),
             send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
             discovery: None,
+            relay_endpoint: None,
         }
     }
 
@@ -225,6 +242,20 @@ impl KeryxDaemonConfig {
     }
 
     #[must_use]
+    pub fn with_deadline_enforcement_interval_ms(
+        mut self,
+        deadline_enforcement_interval_ms: u64,
+    ) -> Self {
+        self.deadline_enforcement_interval_ms = deadline_enforcement_interval_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn deadline_enforcement_interval_ms(&self) -> u64 {
+        self.deadline_enforcement_interval_ms
+    }
+
+    #[must_use]
     pub fn with_health_check_interval_ms(mut self, health_check_interval_ms: u64) -> Self {
         self.health_check_interval_ms = health_check_interval_ms;
         self
@@ -255,6 +286,17 @@ impl KeryxDaemonConfig {
     #[must_use]
     pub const fn fail_retry_policy(&self) -> RetryPolicy {
         self.fail_retry_policy
+    }
+
+    #[must_use]
+    pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> &LimitsConfig {
+        &self.limits
     }
 
     #[must_use]
@@ -294,13 +336,38 @@ impl KeryxDaemonConfig {
     pub fn discovery(&self) -> Option<&DiscoverySettings> {
         self.discovery.as_ref()
     }
+
+    #[must_use]
+    pub fn with_relay_endpoint(mut self, relay_endpoint: Option<String>) -> Self {
+        self.relay_endpoint = relay_endpoint
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn relay_endpoint(&self) -> Option<&str> {
+        self.relay_endpoint.as_deref()
+    }
 }
 
+const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
+const RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const RELAY_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
 const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
 const DAEMON_REGISTRATION_TTL_ENV: &str = "HERMES_KERYX_DAEMON_REGISTRATION_TTL_SECONDS";
+
+/// Build relay task publishing endpoint from environment when configured.
+#[must_use]
+pub fn relay_endpoint_from_env() -> Option<String> {
+    std::env::var(RELAY_ENDPOINT_ENV)
+        .or_else(|_| std::env::var(RELAY_HEALTH_ENDPOINT_ENV))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 /// Build discovery settings from environment when a relay registry endpoint is configured.
 #[must_use]
@@ -366,6 +433,12 @@ pub struct KeryxStatusReport {
     pub corruption_count: usize,
     pub startup_recovery_duration_ms: u128,
     pub store: StoreReadinessReport,
+    pub max_pending_tasks: u64,
+    pub max_envelope_bytes: u64,
+    pub current_pending_tasks: Option<u64>,
+    pub deadline_enforcement_interval_ms: u64,
+    pub cancellation: CancellationSnapshot,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +490,8 @@ pub struct KeryxDaemonRuntime {
     shutdown: Arc<ShutdownState>,
     router: Arc<TaskRouter>,
     discovery: Arc<RwLock<Option<Arc<DiscoveryHandle>>>>,
+    submit_backpressure_lock: Arc<Mutex<()>>,
+    cancellation: Arc<CancellationState>,
 }
 
 impl KeryxDaemonRuntime {
@@ -446,9 +521,15 @@ impl KeryxDaemonRuntime {
             startup_recovery_duration_ms: startup_recovery_started_at.elapsed().as_millis(),
         };
         let peer_directory = Arc::new(PeerDirectory::new(config.local_peer_id().clone()));
+        let publisher: Arc<dyn RelayTaskPublisher> = config.relay_endpoint().map_or_else(
+            || Arc::new(NoopRelayPublisher) as Arc<dyn RelayTaskPublisher>,
+            |endpoint| {
+                Arc::new(GrpcRelayTaskPublisher::new(endpoint)) as Arc<dyn RelayTaskPublisher>
+            },
+        );
         let router = Arc::new(TaskRouter::new(
             peer_directory,
-            Arc::new(NoopRelayPublisher),
+            publisher,
             config.send_task_timeout_ms(),
         ));
         let discovery = Arc::new(RwLock::new(None));
@@ -461,6 +542,8 @@ impl KeryxDaemonRuntime {
             shutdown: Arc::new(ShutdownState::new()),
             router,
             discovery,
+            submit_backpressure_lock: Arc::new(Mutex::new(())),
+            cancellation: Arc::new(CancellationState::new()),
         };
         if let Some(settings) = runtime.config.discovery.clone() {
             runtime
@@ -490,7 +573,15 @@ impl KeryxDaemonRuntime {
                 "relay skill registry is not configured",
             ));
         };
-        handle.discover(request).await
+        let response = handle.discover(request).await?;
+        if self.config.relay_endpoint().is_some() {
+            for registration in &response.registrations {
+                if let Ok(peer_id) = PeerId::new(registration.peer_id.trim()) {
+                    self.router.set_peer_routable(&peer_id, true).await;
+                }
+            }
+        }
+        Ok(response)
     }
 
     /// Reject new RPC handlers while keeping the listener up (used by integration tests).
@@ -558,9 +649,22 @@ impl KeryxDaemonRuntime {
         *self.readiness.write().await = snapshot;
     }
 
-    #[must_use]
-    pub fn status_report(&self) -> KeryxStatusReport {
-        KeryxStatusReport {
+    pub async fn status_report(&self) -> StoreResult<KeryxStatusReport> {
+        let mut warnings = Vec::new();
+        let current_pending_tasks = match self
+            .store
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+        {
+            Ok(count) => Some(count),
+            Err(error) => {
+                let warning = format!("pending task count unavailable: {error}");
+                warn!(component = "keryxd", error = %error, "status report continuing without pending task count");
+                warnings.push(warning);
+                None
+            }
+        };
+        Ok(KeryxStatusReport {
             daemon_ready: true,
             data_dir: self.config.data_dir().to_path_buf(),
             db_path: self.report.db_path.clone(),
@@ -575,13 +679,21 @@ impl KeryxDaemonRuntime {
                 path: self.report.db_path.clone(),
                 ready: true,
             },
-        }
+            max_pending_tasks: self.config.limits().max_pending_tasks,
+            max_envelope_bytes: self.config.limits().max_envelope_bytes,
+            current_pending_tasks,
+            deadline_enforcement_interval_ms: self.config.deadline_enforcement_interval_ms(),
+            cancellation: self.cancellation.snapshot(),
+            warnings,
+        })
     }
 
-    #[must_use]
-    pub fn doctor_report(&self) -> KeryxDoctorReport {
-        let status = self.status_report();
-        let checks = vec![
+    pub async fn doctor_report(&self) -> StoreResult<KeryxDoctorReport> {
+        let status = self.status_report().await?;
+        let limits_ready = status.current_pending_tasks.is_some_and(|pending| {
+            status.max_pending_tasks == 0 || pending < status.max_pending_tasks
+        });
+        let mut checks = vec![
             DoctorCheck {
                 name: "data_dir",
                 ready: status.data_dir.is_dir(),
@@ -616,12 +728,22 @@ impl KeryxDaemonRuntime {
                 ),
             },
         ];
+        checks.push(DoctorCheck {
+            name: "limits",
+            ready: limits_ready,
+            detail: limits_detail(&status),
+        });
+        checks.push(DoctorCheck {
+            name: "cancellation",
+            ready: true,
+            detail: cancellation_detail(&status),
+        });
         let healthy = status.daemon_ready && checks.iter().all(|check| check.ready);
-        KeryxDoctorReport {
+        Ok(KeryxDoctorReport {
             healthy,
             status,
             checks,
-        }
+        })
     }
 
     #[must_use]
@@ -644,16 +766,15 @@ impl KeryxDaemonRuntime {
             .check_envelope_bytes(envelope_bytes)
             .map_err(|error| StoreError::Validation(error.into()))?;
         let _submit_backpressure_guard = self.submit_backpressure_lock.lock().await;
-        let pending_count = self.count_pending_tasks_for_backpressure().await?;
+        let pending_count = self
+            .store
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await?;
         self.config
             .limits()
             .check_pending_tasks(pending_count)
             .map_err(|error| StoreError::Validation(error.into()))?;
         self.store.accept_task(record).await
-    }
-
-    async fn count_pending_tasks_for_backpressure(&self) -> StoreResult<u64> {
-        self.store.count_tasks_by_status(TaskStatus::Pending).await
     }
 
     #[must_use]
@@ -671,10 +792,26 @@ impl KeryxDaemonRuntime {
         self.metrics.snapshot()
     }
 
+    #[must_use]
+    pub fn cancellation(&self) -> &Arc<CancellationState> {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub fn cancellation_snapshot(&self) -> CancellationSnapshot {
+        self.cancellation.snapshot()
+    }
+
     /// Spawn the background stale-lease recovery loop (see [`LeaseRecoveryLoop`]).
     #[must_use]
     pub fn spawn_lease_recovery_loop(self: &Arc<Self>) -> LeaseRecoveryLoopHandle {
         LeaseRecoveryLoop::spawn(Arc::clone(self))
+    }
+
+    /// Spawn the background deadline enforcement loop (see [`DeadlineEnforcementLoop`]).
+    #[must_use]
+    pub fn spawn_deadline_enforcement_loop(self: &Arc<Self>) -> DeadlineEnforcementLoopHandle {
+        DeadlineEnforcementLoop::spawn(Arc::clone(self))
     }
 
     /// Spawn the background store health probe loop (see [`HealthLoop`]).
@@ -744,7 +881,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     ) -> Result<Response<StatusResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         test_rpc_delay().await;
-        let report = self.runtime.status_report();
+        let report = self
+            .runtime
+            .status_report()
+            .await
+            .map_err(store_error_to_status)?;
+        let metrics = self.runtime.metrics_snapshot();
         let status = if report.daemon_ready {
             "ready"
         } else {
@@ -752,7 +894,37 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         };
         Ok(Response::new(StatusResponse {
             status: status.to_string(),
-            ..StatusResponse::default()
+            data_dir: report.data_dir.display().to_string(),
+            db_path: report.db_path.display().to_string(),
+            schema_version: report.schema_version,
+            supported_schema_version: report.supported_schema_version,
+            recovered_tasks: report.recovered_tasks as u64,
+            cleaned_terminal_leases: report.cleaned_terminal_leases as u64,
+            corruption_count: report.corruption_count as u64,
+            startup_recovery_duration_ms: report.startup_recovery_duration_ms as u64,
+            store_kind: report.store.kind.to_string(),
+            store_ready: report.store.ready,
+            store_path: report.store.path.display().to_string(),
+            tasks_submitted: metrics.tasks_submitted,
+            tasks_claimed: metrics.tasks_claimed,
+            tasks_completed: metrics.tasks_completed,
+            tasks_failed: metrics.tasks_failed,
+            heartbeats: metrics.heartbeats,
+            leases_recovered: metrics.leases_recovered,
+            recovery_ticks: metrics.recovery_ticks,
+            active_leases: metrics.active_leases,
+            dead_letters: metrics.dead_letters,
+            max_pending_tasks: report.max_pending_tasks,
+            max_envelope_bytes: report.max_envelope_bytes,
+            current_pending_tasks: report.current_pending_tasks,
+            warnings: report.warnings,
+            cancel_requests: report.cancellation.cancel_requests,
+            tasks_canceled: report.cancellation.tasks_canceled,
+            deadline_ticks: report.cancellation.deadline_ticks,
+            deadline_failures: report.cancellation.deadline_failures,
+            last_deadline_scan_ms: report.cancellation.last_deadline_scan_ms,
+            last_deadline_failures: report.cancellation.last_deadline_failures,
+            deadline_enforcement_interval_ms: report.deadline_enforcement_interval_ms,
         }))
     }
 
@@ -762,7 +934,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         _request: Request<DoctorRequest>,
     ) -> Result<Response<DoctorResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
-        let report = self.runtime.doctor_report();
+        let report = self
+            .runtime
+            .doctor_report()
+            .await
+            .map_err(store_error_to_status)?;
         let status = if report.healthy { "pass" } else { "fail" };
         let messages = report
             .checks
@@ -818,10 +994,28 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
         let envelope_bytes = envelope.encoded_len() as u64;
+        self.runtime
+            .config()
+            .limits()
+            .check_envelope_bytes(envelope_bytes)
+            .map_err(limit_exceeded_to_status)?;
         let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let _submit_backpressure_guard = self.runtime.submit_backpressure_lock.lock().await;
+        let pending_count = self
+            .runtime
+            .store()
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime
+            .config()
+            .limits()
+            .check_pending_tasks(pending_count)
+            .map_err(limit_exceeded_to_status)?;
         let accepted = self
             .runtime
-            .accept_pending_task_with_backpressure(record, envelope_bytes)
+            .store()
+            .accept_task(record)
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_submitted();
@@ -999,6 +1193,38 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     }
 
     #[instrument(
+        name = "keryx::rpc::cancel_task",
+        skip(self, request),
+        fields(task_id = tracing::field::Empty, reason = tracing::field::Empty)
+    )]
+    async fn cancel_task(
+        &self,
+        request: Request<CancelTaskRequest>,
+    ) -> Result<Response<CancelTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let task_id = parse_required_task_id(inner.task_id.as_ref())?;
+        let reason = normalized_cancel_reason(&inner.reason);
+        tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        tracing::Span::current().record("reason", tracing::field::display(&reason));
+        self.runtime.cancellation().increment_cancel_requests();
+        let task = self
+            .runtime
+            .store()
+            .accept_legacy_event(&task_id, KeryxEventType::TaskCanceled)
+            .await
+            .map_err(store_error_to_status)?;
+        self.runtime.cancellation().increment_tasks_canceled();
+        self.runtime.metrics().increment_tasks_failed();
+        Ok(Response::new(CancelTaskResponse {
+            task_id: Some(proto_task_id(task.task_id())),
+            status: task_status_label(task.status).to_string(),
+            reason,
+            canceled: true,
+        }))
+    }
+
+    #[instrument(
         name = "keryx::rpc::put_artifact",
         skip(self, request),
         fields(task_id = tracing::field::Empty, artifact_id = tracing::field::Empty)
@@ -1157,7 +1383,8 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             let guard = self.runtime.submit_backpressure_lock.lock().await;
             let pending_count = self
                 .runtime
-                .count_pending_tasks_for_backpressure()
+                .store()
+                .count_tasks_by_status(TaskStatus::Pending)
                 .await
                 .map_err(store_error_to_status)?;
             self.runtime
@@ -1249,6 +1476,55 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
     }
+}
+
+fn normalized_cancel_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        "canceled by request".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn limit_label(limit: u64) -> String {
+    if limit == 0 {
+        "unlimited".to_string()
+    } else {
+        limit.to_string()
+    }
+}
+
+fn pending_tasks_label(count: Option<u64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn limits_detail(status: &KeryxStatusReport) -> String {
+    let mut detail = format!(
+        "pending_tasks={}/{} envelope_bytes_limit={}",
+        pending_tasks_label(status.current_pending_tasks),
+        limit_label(status.max_pending_tasks),
+        limit_label(status.max_envelope_bytes)
+    );
+    if !status.warnings.is_empty() {
+        detail.push_str(" warnings=");
+        detail.push_str(&status.warnings.join("; "));
+    }
+    detail
+}
+
+fn cancellation_detail(status: &KeryxStatusReport) -> String {
+    let cancellation = status.cancellation;
+    format!(
+        "cancel_requests={} tasks_canceled={} deadline_ticks={} deadline_failures={} last_deadline_scan_ms={} last_deadline_failures={} deadline_interval_ms={}",
+        cancellation.cancel_requests,
+        cancellation.tasks_canceled,
+        cancellation.deadline_ticks,
+        cancellation.deadline_failures,
+        cancellation.last_deadline_scan_ms,
+        cancellation.last_deadline_failures,
+        status.deadline_enforcement_interval_ms
+    )
 }
 
 fn parse_required_task_id(id: Option<&ProtoTaskId>) -> Result<TaskId, Status> {
@@ -1386,6 +1662,9 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             key.as_str(),
             existing_task_id.as_str()
         )),
+        StoreError::Validation(ValidationError::LimitExceeded { .. }) => {
+            Status::resource_exhausted(error_detail.clone())
+        }
         StoreError::Validation(error) => Status::failed_precondition(error.to_string()),
         StoreError::CorruptEventStream(task_id) => {
             Status::data_loss(format!("corrupt event stream for task {task_id}"))
@@ -1443,4 +1722,8 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         }
     }
     status
+}
+
+fn limit_exceeded_to_status(error: LimitExceeded) -> Status {
+    store_error_to_status(StoreError::Validation(error.into()))
 }

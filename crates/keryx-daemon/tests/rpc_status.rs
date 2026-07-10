@@ -22,17 +22,23 @@ async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
         .unwrap();
     let status = client.status(StatusRequest {}).await.unwrap().into_inner();
     assert_eq!(status.status, "ready");
-    assert_eq!(status.data_dir, "");
-    assert_eq!(status.db_path, "");
-    assert_eq!(status.schema_version, 0);
-    assert_eq!(status.supported_schema_version, 0);
+    assert_eq!(status.data_dir, data_dir.display().to_string());
+    assert_eq!(
+        status.db_path,
+        data_dir.join("keryx.db").display().to_string()
+    );
+    assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(status.supported_schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(status.recovered_tasks, 0);
     assert_eq!(status.cleaned_terminal_leases, 0);
     assert_eq!(status.corruption_count, 0);
-    assert_eq!(status.startup_recovery_duration_ms, 0);
-    assert_eq!(status.store_kind, "");
-    assert!(!status.store_ready);
-    assert_eq!(status.store_path, "");
+    assert!(status.startup_recovery_duration_ms <= 1_000);
+    assert_eq!(status.store_kind, "sqlite");
+    assert!(status.store_ready);
+    assert_eq!(
+        status.store_path,
+        data_dir.join("keryx.db").display().to_string()
+    );
     assert_eq!(status.tasks_submitted, 0);
     assert_eq!(status.tasks_claimed, 0);
     assert_eq!(status.tasks_completed, 0);

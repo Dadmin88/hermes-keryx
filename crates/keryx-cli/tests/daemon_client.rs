@@ -41,10 +41,12 @@ async fn cli_status_uses_daemon_endpoint_when_configured() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("keryx status: ready"));
     assert!(stdout.contains("source: daemon http://"));
-    assert!(!stdout.contains("data_dir:"));
-    assert!(!stdout.contains("db_path:"));
-    assert!(!stdout.contains("store:"));
-    assert!(!stdout.contains("startup_recovery:"));
+    assert!(stdout.contains("data_dir:"));
+    assert!(stdout.contains("db_path:"));
+    assert!(stdout.contains("store: ready sqlite schema_version=5 supported_schema_version=5"));
+    assert!(stdout.contains(
+        "startup_recovery: recovered_tasks=0 cleaned_terminal_leases=0 corruption_count=0 duration_ms="
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
