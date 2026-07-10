@@ -4,9 +4,10 @@ Python SDK for [Hermes Keryx](https://github.com/DeployFaith/hermes-keryx).
 
 - **Package name:** `keryx`
 - **Import name:** `keryx`
+- **Python:** 3.11+
 - Replaces the former `agentanycast` Python package for Hermes Agency node lifecycle when `agency.transport_backend: keryx`.
 
-Hermes Agency also vendors this SDK under `Hermes_Agency/src/keryx/` for packaging. Prefer developing protocol/SDK changes here and syncing into Agency when cutting an integration slice.
+Hermes Agency may vendor this SDK under `Hermes_Agency/src/keryx/` for packaging. Prefer developing protocol/SDK changes here and syncing into Agency when cutting an integration slice.
 
 ## Install
 
@@ -18,10 +19,14 @@ python -m pip install -e ".[dev]"
 Regenerate protobuf stubs after proto changes:
 
 ```bash
-./scripts/generate_protos.sh
+python -m grpc_tools.protoc \
+  -I ../../proto \
+  --python_out=. \
+  --grpc_python_out=. \
+  ../../proto/hermes/keryx/v1/*.proto
 ```
 
-## Quick start
+## Quick start: native daemon API
 
 ```python
 import asyncio
@@ -37,18 +42,33 @@ async def main() -> None:
     node = KeryxNode(
         card=card,
         daemon_endpoint="127.0.0.1:50051",
-        relay_endpoint="127.0.0.1:51053",
+        registry_endpoint="127.0.0.1:51053",
+        worker_id="worker-a",
     )
-    await node.start()
+    await node.connect()
     try:
-        print("peer_id", getattr(node, "peer_id", None))
-        agents = await node.discover("echo")
-        print("discovered", agents)
+        print(await node.status())
+        state = await node.submit(message="hello", metadata={"skill": "echo"})
+        lease = await node.claim(state.task_id)
+        await node.heartbeat(state.task_id, lease.lease_id)
+        result = await node.complete(
+            state.task_id,
+            lease.lease_id,
+            result_metadata={"ok": "true"},
+        )
+        print(result.status)
     finally:
-        await node.stop()
+        await node.close()
 
 asyncio.run(main())
 ```
+
+Native `KeryxNode` daemon methods:
+
+- connection/status: `connect()`, `close()`, async context manager, `status()`, `doctor()`
+- discovery: `peers()`, `skills(skill_id="", tags=None, limit=10)`
+- lifecycle: `submit()`, `claim()`, `heartbeat()`, `complete()`, `fail()`, `cancel()`
+- aliases: `submit_task()`, `claim_task()`, `heartbeat_task()`, `complete_task()`, `fail_task()`, `cancel_task()`
 
 Public exports include:
 
@@ -58,14 +78,72 @@ Public exports include:
 - `TaskState`, `TaskResult`, `TaskArtifact`
 - `peer_id_to_did_key`, `register_agent`, `deregister_agent`
 
-## Environment
+## AgentAnycast-compatible transition helpers
+
+The SDK keeps transition helpers so older Hermes Agency call sites can migrate incrementally:
+
+```python
+async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endpoint="127.0.0.1:51053") as node:
+    await node.start()
+    await node.register_skills(ttl_seconds=300)
+    agents = await node.discover("echo", limit=1)
+    handle = await node.send_task({"parts": [{"text": "hello"}]}, peer_id=agents[0]["peer_id"])
+    print(handle.task_id)
+    await node.deregister_skills()
+    await node.stop()
+```
+
+Compatibility notes:
+
+- `send_task(..., skill="...")` resolves the first registry match.
+- `send_task(..., url="...")` is not implemented.
+- `serve_forever()` is currently a lightweight keepalive loop; relay frame subscription/worker execution remains daemon/runtime integration work.
+- `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
+
+## Configuration
+
+`load_config()` reads a TOML file from an explicit path, `HERMES_KERYX_CONFIG`, or `KERYX_CONFIG`, then applies environment overrides.
+
+Supported TOML forms:
+
+```toml
+daemon_endpoint = "127.0.0.1:50051"
+registry_endpoint = "127.0.0.1:51053"
+worker_id = "worker-a"
+default_lease_duration_ms = 120000
+request_timeout_ms = 30000
+
+[daemon]
+endpoint = "127.0.0.1:50051"
+
+[registry]
+endpoint = "127.0.0.1:51053"
+
+[relay]
+endpoint = "127.0.0.1:51053"
+
+[worker]
+id = "worker-a"
+default_lease_duration_ms = 120000
+
+[defaults]
+request_timeout_ms = 30000
+lease_duration_ms = 120000
+```
+
+Environment variables:
 
 | Variable | Default / typical | Purpose |
 |----------|-------------------|---------|
-| `HERMES_KERYX_DAEMON_ENDPOINT` | `127.0.0.1:50051` or `http://127.0.0.1:50051` | `keryxd` gRPC |
-| `HERMES_KERYX_REGISTRY_ENDPOINT` | dual-run: `127.0.0.1:51053` | relay skill registry |
-| `HERMES_KERYX_RELAY_CONFIG` | `~/.hermes/.keryx/relay.json` | relay config path |
-| `HERMES_KERYX_DATA_DIR` | `~/.hermes/.keryx/data` | daemon data (when running binaries) |
+| `HERMES_KERYX_CONFIG` / `KERYX_CONFIG` | unset | SDK TOML config path |
+| `HERMES_KERYX_DAEMON_ENDPOINT` / `KERYX_DAEMON_ENDPOINT` | SDK default `unix:///tmp/keryx-daemon.sock`; repo examples use `127.0.0.1:50051` | `keryxd` gRPC endpoint |
+| `HERMES_KERYX_REGISTRY_ENDPOINT` / `KERYX_REGISTRY_ENDPOINT` | dual-run: `127.0.0.1:51053` | relay skill registry endpoint |
+| `HERMES_KERYX_RELAY_ENDPOINT` / `KERYX_RELAY_ENDPOINT` | unset | compatibility relay endpoint alias |
+| `HERMES_KERYX_WORKER_ID` / `KERYX_WORKER_ID` | unset | default worker id for claim/heartbeat/complete/fail |
+| `HERMES_KERYX_DEFAULT_LEASE_DURATION_MS` / `KERYX_DEFAULT_LEASE_DURATION_MS` | `0` (daemon default) | claim/heartbeat lease duration |
+| `HERMES_KERYX_REQUEST_TIMEOUT_MS` / `KERYX_REQUEST_TIMEOUT_MS` | unset | caller-managed request timeout hint |
+
+`grpc_target()` strips `http://`, `https://`, and `tcp://` for Python gRPC channels; `unix://` endpoints are passed through.
 
 ## Tests
 
