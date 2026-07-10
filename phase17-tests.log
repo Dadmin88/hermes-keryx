@@ -1,0 +1,916 @@
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m memchr v2.8.2
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m pin-project-lite v0.2.17
+[1m[92m   Compiling[0m futures-core v0.3.32
+[1m[92m   Compiling[0m bytes v1.12.0
+[1m[92m   Compiling[0m once_cell v1.21.4
+[1m[92m   Compiling[0m typenum v1.20.1
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m subtle v2.6.1
+[1m[92m   Compiling[0m futures-io v0.3.32
+[1m[92m   Compiling[0m futures-task v0.3.32
+[1m[92m   Compiling[0m generic-array v0.14.7
+[1m[92m   Compiling[0m thiserror v2.0.18
+[1m[92m   Compiling[0m futures-sink v0.3.32
+[1m[92m   Compiling[0m cpufeatures v0.2.17
+[1m[92m   Compiling[0m slab v0.4.12
+[1m[92m   Compiling[0m log v0.4.33
+[1m[92m   Compiling[0m futures-channel v0.3.32
+[1m[92m   Compiling[0m zerofrom v0.1.8
+[1m[92m   Compiling[0m stable_deref_trait v1.2.1
+[1m[92m   Compiling[0m crypto-common v0.1.7
+[1m[92m   Compiling[0m block-buffer v0.10.4
+[1m[92m   Compiling[0m futures-util v0.3.32
+[1m[92m   Compiling[0m yoke v0.8.3
+[1m[92m   Compiling[0m digest v0.10.7
+[1m[92m   Compiling[0m smallvec v1.15.2
+[1m[92m   Compiling[0m sha2 v0.10.9
+[1m[92m   Compiling[0m tracing-core v0.1.36
+[1m[92m   Compiling[0m zerovec v0.11.6
+[1m[92m   Compiling[0m serde v1.0.228
+[1m[92m   Compiling[0m tracing v0.1.44
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m tinystr v0.8.3
+[1m[92m   Compiling[0m errno v0.3.14
+[1m[92m   Compiling[0m socket2 v0.6.4
+[1m[92m   Compiling[0m writeable v0.6.3
+[1m[92m   Compiling[0m percent-encoding v2.3.2
+[1m[92m   Compiling[0m litemap v0.8.2
+[1m[92m   Compiling[0m signal-hook-registry v1.4.8
+[1m[92m   Compiling[0m icu_locale_core v2.2.0
+[1m[92m   Compiling[0m either v1.16.0
+[1m[92m   Compiling[0m potential_utf v0.1.5
+[1m[92m   Compiling[0m zerotrie v0.2.4
+[1m[92m   Compiling[0m mio v1.2.1
+[1m[92m   Compiling[0m utf8_iter v1.0.4
+[1m[92m   Compiling[0m icu_collections v2.2.0
+[1m[92m   Compiling[0m tokio v1.52.3
+[1m[92m   Compiling[0m scopeguard v1.2.0
+[1m[92m   Compiling[0m lock_api v0.4.14
+[1m[92m   Compiling[0m icu_provider v2.2.0
+[1m[92m   Compiling[0m icu_normalizer_data v2.2.0
+[1m[92m   Compiling[0m icu_properties_data v2.2.0
+[1m[92m   Compiling[0m itoa v1.0.18
+[1m[92m   Compiling[0m icu_properties v2.2.0
+[1m[92m   Compiling[0m form_urlencoded v1.2.2
+[1m[92m   Compiling[0m futures-executor v0.3.32
+[1m[92m   Compiling[0m foldhash v0.1.5
+[1m[92m   Compiling[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m hashbrown v0.15.5
+[1m[92m   Compiling[0m icu_normalizer v2.2.0
+[1m[92m   Compiling[0m parking_lot_core v0.9.12
+[1m[92m   Compiling[0m idna_adapter v1.2.2
+[1m[92m   Compiling[0m parking_lot v0.12.5
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m idna v1.1.0
+[1m[92m   Compiling[0m url v2.5.8
+[1m[92m   Compiling[0m indexmap v2.14.0
+[1m[92m   Compiling[0m getrandom v0.2.17
+[1m[92m   Compiling[0m anyhow v1.0.103
+[1m[92m   Compiling[0m itertools v0.14.0
+[1m[92m   Compiling[0m bitflags v2.13.0
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m keryx-core v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-core)
+[1m[92m   Compiling[0m fnv v1.0.7
+[1m[92m   Compiling[0m pin-project v1.1.13
+[1m[92m   Compiling[0m rand_core v0.6.4
+[1m[92m   Compiling[0m zeroize v1.9.0
+[1m[92m   Compiling[0m zmij v1.0.21
+[1m[92m   Compiling[0m prost-derive v0.14.4
+[1m[92m   Compiling[0m base64 v0.22.1
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m futures v0.3.32
+[1m[92m   Compiling[0m linux-raw-sys v0.12.1
+[1m[92m   Compiling[0m prost v0.14.4
+[1m[92m   Compiling[0m rustix v1.1.4
+[1m[92m   Compiling[0m fastrand v2.4.1
+[1m[92m   Compiling[0m data-encoding v2.11.0
+[1m[92m   Compiling[0m ppv-lite86 v0.2.21
+[1m[92m   Compiling[0m serde_json v1.0.150
+[1m[92m   Compiling[0m rand_chacha v0.3.1
+[1m[92m   Compiling[0m rand v0.8.6
+[1m[92m   Compiling[0m curve25519-dalek v4.1.3
+[1m[92m   Compiling[0m tokio-stream v0.1.18
+[1m[92m   Compiling[0m unsigned-varint v0.8.0
+[1m[92m   Compiling[0m static_assertions v1.1.0
+[1m[92m   Compiling[0m signature v2.2.0
+[1m[92m   Compiling[0m hmac v0.12.1
+[1m[92m   Compiling[0m ed25519 v2.2.3
+[1m[92m   Compiling[0m byteorder v1.5.0
+[1m[92m   Compiling[0m const-str v0.4.3
+[1m[92m   Compiling[0m ed25519-dalek v2.2.0
+[1m[92m   Compiling[0m hkdf v0.12.4
+[1m[92m   Compiling[0m data-encoding-macro v0.1.20
+[1m[92m   Compiling[0m base256emoji v1.0.2
+[1m[92m   Compiling[0m multihash v0.19.5
+[1m[92m   Compiling[0m base-x v0.2.11
+[1m[92m   Compiling[0m base45 v3.2.0
+[1m[92m   Compiling[0m futures-timer v3.0.4
+[1m[92m   Compiling[0m bs58 v0.5.1
+[1m[92m   Compiling[0m multibase v0.9.3
+[1m[92m   Compiling[0m libp2p-identity v0.2.14
+[1m[92m   Compiling[0m quick-protobuf v0.8.1
+[1m[92m   Compiling[0m unsigned-varint v0.7.2
+[1m[92m   Compiling[0m arrayref v0.3.9
+[1m[92m   Compiling[0m web-time v1.1.0
+[1m[92m   Compiling[0m multistream-select v0.13.0
+[1m[92m   Compiling[0m rw-stream-sink v0.4.0
+[1m[92m   Compiling[0m void v1.0.2
+[1m[92m   Compiling[0m multiaddr v0.18.2
+[1m[92m   Compiling[0m http v1.4.2
+[1m[92m   Compiling[0m getrandom v0.4.3
+[1m[92m   Compiling[0m tokio-util v0.7.18
+[1m[92m   Compiling[0m tower-service v0.3.3
+[1m[92m   Compiling[0m libp2p-core v0.42.0
+[1m[92m   Compiling[0m http-body v1.0.1
+[1m[92m   Compiling[0m atomic-waker v1.1.2
+[1m[92m   Compiling[0m untrusted v0.9.0
+[1m[92m   Compiling[0m try-lock v0.2.5
+[1m[92m   Compiling[0m ring v0.17.14
+[1m[92m   Compiling[0m want v0.3.1
+[1m[92m   Compiling[0m h2 v0.4.15
+[1m[92m   Compiling[0m pulldown-cmark v0.13.4
+[1m[92m   Compiling[0m httparse v1.10.1
+[1m[92m   Compiling[0m lru v0.12.5
+[1m[92m   Compiling[0m sync_wrapper v1.0.2
+[1m[92m   Compiling[0m num-conv v0.2.2
+[1m[92m   Compiling[0m tower-layer v0.3.3
+[1m[92m   Compiling[0m time-core v0.1.9
+[1m[92m   Compiling[0m httpdate v1.0.3
+[1m[92m   Compiling[0m time-macros v0.2.31
+[1m[92m   Compiling[0m petgraph v0.8.3
+[1m[92m   Compiling[0m libp2p-swarm v0.45.1
+[1m[92m   Compiling[0m tempfile v3.27.0
+[1m[92m   Compiling[0m prost-types v0.14.4
+[1m[92m   Compiling[0m pulldown-cmark-to-cmark v22.0.0
+[1m[92m   Compiling[0m http-body-util v0.1.3
+[1m[92m   Compiling[0m powerfmt v0.2.0
+[1m[92m   Compiling[0m hyper v1.10.1
+[1m[92m   Compiling[0m mime v0.3.17
+[1m[92m   Compiling[0m deranged v0.5.8
+[1m[92m   Compiling[0m axum-core v0.5.6
+[1m[92m   Compiling[0m hyper-util v0.1.20
+[1m[92m   Compiling[0m time v0.3.53
+[1m[92m   Compiling[0m prost-build v0.14.4
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m tower v0.5.3
+[1m[92m   Compiling[0m aho-corasick v1.1.4
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m minimal-lexical v0.2.1
+[1m[92m   Compiling[0m tinyvec_macros v0.1.1
+[1m[92m   Compiling[0m regex-syntax v0.8.11
+[1m[92m   Compiling[0m matchit v0.8.4
+[1m[92m   Compiling[0m nom v7.1.3
+[1m[92m   Compiling[0m axum v0.8.9
+[1m[92m   Compiling[0m regex-automata v0.4.14
+[1m[92m   Compiling[0m tinyvec v1.11.0
+[1m[92m   Compiling[0m tonic-prost-build v0.14.6
+[1m[92m   Compiling[0m hyper-timeout v0.5.2
+[1m[92m   Compiling[0m netlink-packet-core v0.8.1
+[1m[92m   Compiling[0m rand_core v0.9.5
+[1m[92m   Compiling[0m rustls-pki-types v1.15.0
+[1m[92m   Compiling[0m ipnet v2.12.0
+[1m[92m   Compiling[0m tonic v0.14.6
+[1m[92m   Compiling[0m rustls-webpki v0.103.13
+[1m[92m   Compiling[0m rand_chacha v0.9.0
+[1m[92m   Compiling[0m keryx-proto v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-proto)
+[1m[92m   Compiling[0m rusticata-macros v4.1.0
+[1m[92m   Compiling[0m concurrent-queue v2.5.0
+[1m[92m   Compiling[0m netlink-sys v0.8.8
+[1m[92m   Compiling[0m asynchronous-codec v0.7.0
+[1m[92m   Compiling[0m socket2 v0.5.10
+[1m[92m   Compiling[0m parking v2.2.1
+[1m[92m   Compiling[0m crc-catalog v2.5.0
+[1m[92m   Compiling[0m crc v3.4.0
+[1m[92m   Compiling[0m event-listener v5.4.1
+[1m[92m   Compiling[0m asn1-rs v0.6.2
+[1m[92m   Compiling[0m tonic-prost v0.14.6
+[1m[92m   Compiling[0m netlink-proto v0.12.0
+[1m[92m   Compiling[0m nix v0.30.1
+[1m[92m   Compiling[0m rustls v0.23.41
+[1m[92m   Compiling[0m rand v0.9.4
+[1m[92m   Compiling[0m netlink-packet-route v0.28.0
+[1m[92m   Compiling[0m crossbeam-queue v0.3.12
+[1m[92m   Compiling[0m num-integer v0.1.46
+[1m[92m   Compiling[0m keryx-observe v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-observe)
+[1m[92m   Compiling[0m hashlink v0.10.0
+[1m[92m   Compiling[0m spin v0.9.8
+[1m[92m   Compiling[0m ryu v1.0.23
+[1m[92m   Compiling[0m num-bigint v0.4.7
+[1m[92m   Compiling[0m rtnetlink v0.20.0
+[1m[92m   Compiling[0m quick-protobuf-codec v0.3.1
+[1m[92m   Compiling[0m futures-bounded v0.2.4
+[1m[92m   Compiling[0m untrusted v0.7.1
+[1m[92m   Compiling[0m spin v0.5.2
+[1m[92m   Compiling[0m ring v0.16.20
+[1m[92m   Compiling[0m if-watch v3.2.2
+[1m[92m   Compiling[0m hickory-proto v0.24.4
+[1m[92m   Compiling[0m libsqlite3-sys v0.30.1
+[1m[92m   Compiling[0m futures-intrusive v0.5.0
+[1m[92m   Compiling[0m der-parser v9.0.0
+[1m[92m   Compiling[0m oid-registry v0.7.1
+[1m[92m   Compiling[0m matchers v0.2.0
+[1m[92m   Compiling[0m sharded-slab v0.1.7
+[1m[92m   Compiling[0m yasna v0.5.2
+[1m[92m   Compiling[0m pem v3.0.6
+[1m[92m   Compiling[0m tracing-serde v0.2.0
+[1m[92m   Compiling[0m tracing-log v0.2.0
+[1m[92m   Compiling[0m thread_local v1.1.9
+[1m[92m   Compiling[0m nohash-hasher v0.2.0
+[1m[92m   Compiling[0m nu-ansi-term v0.50.3
+[1m[92m   Compiling[0m lru-slab v0.1.2
+[1m[92m   Compiling[0m linked-hash-map v0.5.6
+[1m[92m   Compiling[0m rustc-hash v2.1.3
+[1m[92m   Compiling[0m lru-cache v0.1.2
+[1m[92m   Compiling[0m quinn-proto v0.11.15
+[1m[92m   Compiling[0m tracing-subscriber v0.3.23
+[1m[92m   Compiling[0m sqlx-core v0.8.6
+[1m[92m   Compiling[0m rcgen v0.11.3
+[1m[92m   Compiling[0m x509-parser v0.16.0
+[1m[92m   Compiling[0m atoi v2.0.0
+[1m[92m   Compiling[0m quinn-udp v0.5.14
+[1m[92m   Compiling[0m futures-rustls v0.26.0
+[1m[92m   Compiling[0m serde_urlencoded v0.7.1
+[1m[92m   Compiling[0m flume v0.11.1
+[1m[92m   Compiling[0m rustls-webpki v0.101.7
+[1m[92m   Compiling[0m resolv-conf v0.7.6
+[1m[92m   Compiling[0m dtoa v1.0.11
+[1m[92m   Compiling[0m prometheus-client v0.22.3
+[1m[92m   Compiling[0m libp2p-tls v0.5.0
+[1m[92m   Compiling[0m hickory-resolver v0.24.4
+[1m[92m   Compiling[0m sqlx-sqlite v0.8.6
+[1m[92m   Compiling[0m quinn v0.11.11
+[1m[92m   Compiling[0m snow v0.9.6
+[1m[92m   Compiling[0m yamux v0.13.10
+[1m[92m   Compiling[0m yamux v0.12.1
+[1m[92m   Compiling[0m libp2p-request-response v0.27.0
+[1m[92m   Compiling[0m regex v1.12.4
+[1m[92m   Compiling[0m futures-ticker v0.0.3
+[1m[92m   Compiling[0m x25519-dalek v2.0.1
+[1m[92m   Compiling[0m toml_datetime v0.6.11
+[1m[92m   Compiling[0m serde_spanned v0.6.9
+[1m[92m   Compiling[0m winnow v0.7.15
+[1m[92m   Compiling[0m hex_fmt v0.3.0
+[1m[92m   Compiling[0m toml_write v0.1.2
+[1m[92m   Compiling[0m sqlx-macros-core v0.8.6
+[1m[92m   Compiling[0m libp2p-gossipsub v0.47.0
+[1m[92m   Compiling[0m toml_edit v0.22.27
+[1m[92m   Compiling[0m libp2p-noise v0.45.0
+[1m[92m   Compiling[0m libp2p-autonat v0.13.0
+[1m[92m   Compiling[0m libp2p-yamux v0.46.0
+[1m[92m   Compiling[0m libp2p-dns v0.42.0
+[1m[92m   Compiling[0m libp2p-quic v0.11.1
+[1m[92m   Compiling[0m libp2p-mdns v0.46.0
+[1m[92m   Compiling[0m libp2p-tcp v0.42.0
+[1m[92m   Compiling[0m libp2p-relay v0.18.0
+[1m[92m   Compiling[0m libp2p-identify v0.45.0
+[1m[92m   Compiling[0m libp2p-ping v0.45.0
+[1m[92m   Compiling[0m libp2p-allow-block-list v0.4.0
+[1m[92m   Compiling[0m libp2p-connection-limits v0.4.0
+[1m[92m   Compiling[0m toml v0.8.23
+[1m[92m   Compiling[0m libp2p v0.54.1
+[1m[92m   Compiling[0m sqlx-macros v0.8.6
+[1m[92m   Compiling[0m keryx-relay v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-relay)
+[1m[92m   Compiling[0m uuid v1.23.4
+[1m[92m   Compiling[0m sqlx v0.8.6
+[1m[92m   Compiling[0m keryx-store v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-store)
+[1m[92m   Compiling[0m utf8parse v0.2.2
+[1m[92m   Compiling[0m anstyle-parse v1.0.0
+[1m[92m   Compiling[0m colorchoice v1.0.5
+[1m[92m   Compiling[0m anstyle-query v1.1.5
+[1m[92m   Compiling[0m anstyle v1.0.14
+[1m[92m   Compiling[0m is_terminal_polyfill v1.70.2
+[1m[92m   Compiling[0m anstream v1.0.0
+[1m[92m   Compiling[0m strsim v0.11.1
+[1m[92m   Compiling[0m clap_lex v1.1.0
+[1m[92m   Compiling[0m keryx-daemon v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-daemon)
+[1m[92m   Compiling[0m clap_builder v4.6.0
+[1m[92m   Compiling[0m keryx-policy v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-policy)
+[1m[92m   Compiling[0m clap v4.6.1
+[1m[92m   Compiling[0m keryx-testkit v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-testkit)
+[1m[92m   Compiling[0m keryx-cli v0.1.0 (/home/runner/work/hermes-keryx/hermes-keryx/crates/keryx-cli)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1m 49s
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/keryx-4ef1bc9a294695ea)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/cli_relay_node.rs (target/debug/deps/cli_relay_node-1267486a935f3cf7)
+
+running 5 tests
+test cli_relay_and_node_subcommands_parse ... ok
+test cli_node_status_uses_daemon_endpoint ... ok
+test cli_relay_registry_list_shows_registrations ... ok
+test cli_node_discover_filters_by_skill ... ok
+test cli_relay_status_uses_health_endpoint ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+[1m[92m     Running[0m tests/daemon_client.rs (target/debug/deps/daemon_client-f0b7af7c86b43da2)
+
+running 5 tests
+test cli_status_reports_unavailable_daemon_when_endpoint_cannot_connect ... ok
+test cli_doctor_reports_unavailable_daemon_when_endpoint_cannot_connect ... ok
+test cli_status_uses_daemon_endpoint_when_configured ... ok
+test cli_doctor_uses_daemon_endpoint_when_configured ... ok
+test cli_artifact_commands_round_trip_file_content_against_daemon ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_core-91f51218b83c762f)
+
+running 14 tests
+test artifact::tests::digest_compute_matches_sha256_reference ... ok
+test artifact::tests::size_validation_and_inline_thresholds_are_explicit ... ok
+test artifact::tests::media_type_defaults_when_empty ... ok
+test artifact::tests::digest_rejects_invalid_hex ... ok
+test legacy::tests::operational_legacy_returns_none_for_normalize ... ok
+test legacy::tests::task_leased_collapses_to_task_started_transition ... ok
+test legacy::tests::terminal_legacy_failures_map_to_task_failed ... ok
+test legacy::tests::unknown_combinations_are_not_operational_and_do_not_normalize ... ok
+test limits::tests::envelope_limit_rejects_only_when_size_exceeds_limit ... ok
+test limits::tests::default_limits_match_phase_10_contract ... ok
+test limits::tests::zero_limits_are_unlimited ... ok
+test limits::tests::pending_limit_rejects_when_queue_is_at_capacity ... ok
+test retry_policy::tests::default_policy_requeues_until_max_then_dead_letters ... ok
+test retry_policy::tests::no_retries_never_requeues_and_dead_letters_immediately ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/error_model.rs (target/debug/deps/error_model-2deb53fa6b9ae3da)
+
+running 2 tests
+test core_error_model_has_task_and_policy_variants ... ok
+test state_transition_errors_promote_to_validation_wrapped_core_error ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/id_types.rs (target/debug/deps/id_types-a419c5ff30558058)
+
+running 3 tests
+test all_core_id_types_reject_empty_values ... ok
+test id_types_reject_control_characters_and_slashes ... ok
+test id_types_parse_display_and_serialize_as_strings ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/task_lifecycle_test.rs (target/debug/deps/task_lifecycle_test-cfd5833580844609)
+
+running 12 tests
+test cancellation_rejects_terminal_tasks ... ok
+test cancellation_terminal_event_moves_pending_or_running_task_to_failed ... ok
+test agent_card_skill_identity_is_deduplicated_and_lookup_is_stable ... ok
+test cancellation_request_is_an_operational_event_for_pending_and_running_tasks ... ok
+test cancellation_transition_helpers_emit_task_canceled_event ... ok
+test completed_task_rejects_all_subsequent_transitions ... ok
+test core_error_variants_cover_lifecycle_and_existing_policy_paths ... ok
+test failed_task_rejects_all_subsequent_transitions ... ok
+test invalid_and_terminal_lifecycle_violations_use_validation_wrapped_core_error ... ok
+test pending_running_failed_lifecycle_is_allowed ... ok
+test task_defaults_to_pending_on_construction ... ok
+test pending_running_completed_lifecycle_is_allowed ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_daemon-c69b7fb84f1d4ea7)
+
+running 5 tests
+test discovery::tests::refresh_interval_clamps_short_ttl ... ok
+test incoming::tests::static_allowlist_rejects_unknown_sender ... ok
+test discovery::tests::refresh_interval_defaults_to_five_seconds_before_ttl ... ok
+test incoming::tests::from_relay_frame_preserves_frame_id ... ok
+test routing::tests::routing_policy_requires_approval_for_matching_capability ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/keryxd-7fd5aa039980b2f3)
+
+running 3 tests
+test tests::daemon_addr_accepts_loopback_addresses ... ok
+test tests::daemon_addr_ignores_empty_values ... ok
+test tests::daemon_addr_rejects_wildcard_and_non_loopback_addresses ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/artifact_rpc.rs (target/debug/deps/artifact_rpc-dc0fe02bf1ee987b)
+
+running 5 tests
+test artifact_rpc_delete_missing_artifact_returns_deleted_false ... ok
+test artifact_rpc_validates_missing_task_and_bad_identifier_inputs ... ok
+test artifact_rpc_round_trips_inline_content_and_lists_then_deletes ... ok
+test artifact_rpc_lists_only_artifacts_for_the_requested_task ... ok
+test artifact_rpc_put_rejects_oversize_uploads_with_resource_exhausted ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.65s
+
+[1m[92m     Running[0m tests/backpressure.rs (target/debug/deps/backpressure-df4bcb0e25e639e4)
+
+running 10 tests
+test incoming_relay_task_respects_envelope_size_limit ... ok
+test incoming_relay_task_respects_pending_queue_limit ... ok
+test local_send_task_respects_envelope_size_limit ... ok
+test local_send_task_respects_pending_queue_limit ... ok
+test status_reports_configured_limits_and_current_pending_count ... ok
+test doctor_reports_limit_usage_and_fails_when_at_capacity ... ok
+test concurrent_submits_do_not_overshoot_pending_queue_limit ... ok
+test submit_rejects_when_envelope_is_too_large ... ok
+test submit_rejects_when_pending_queue_is_full ... ok
+test status_and_doctor_report_unknown_pending_count_after_count_failure ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+[1m[92m     Running[0m tests/claim_next_task.rs (target/debug/deps/claim_next_task-e4abd4c86a461685)
+
+running 5 tests
+test claim_next_returns_no_work_without_waiting ... ok
+test concurrent_workers_never_receive_the_same_task ... ok
+test claim_next_selects_oldest_matching_envelope ... ok
+test stale_claim_is_recoverable_and_can_be_claimed_again ... ok
+test long_poll_wakes_after_submit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m tests/discovery_integration.rs (target/debug/deps/discovery_integration-ca8f7896af79f018)
+
+running 2 tests
+test daemon_startup_registers_configured_skills ... ok
+test daemon_registers_and_discover_skills_returns_registration ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/e2e_worker_loop.rs (target/debug/deps/e2e_worker_loop-ca8070a06c9e937c)
+
+running 1 test
+test full_worker_lifecycle_with_recovery_requeues_abandoned_lease ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+[1m[92m     Running[0m tests/envelope_persistence.rs (target/debug/deps/envelope_persistence-6f0732eeea1fcec9)
+
+running 1 test
+test submit_task_retains_complete_envelope_across_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/graceful_shutdown.rs (target/debug/deps/graceful_shutdown-cdd5e1677013447a)
+
+running 2 tests
+test new_rpc_rejected_when_daemon_is_shutting_down ... ok
+test in_flight_rpc_completes_during_shutdown ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+[1m[92m     Running[0m tests/health_probes.rs (target/debug/deps/health_probes-10bf3c67cfa0b673)
+
+running 2 tests
+test liveness_rpc_is_always_true_while_daemon_is_running ... ok
+test readiness_rpc_reports_not_ready_after_store_corruption_probe ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/heartbeat.rs (target/debug/deps/heartbeat-02f9ba0006afba05)
+
+running 1 test
+test heartbeat_via_rpc_renews_active_lease ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+[1m[92m     Running[0m tests/incoming_tasks.rs (target/debug/deps/incoming_tasks-a861b70b1e06d678)
+
+running 5 tests
+test incoming_invalid_envelope_returns_error_without_store_write ... ok
+test incoming_task_dispatched_to_local_worker ... ok
+test incoming_task_accepted_into_store ... ok
+test incoming_task_rejected_from_non_allowed_sender ... ok
+test incoming_task_loop_processes_relay_channel ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m tests/lease_recovery_loop.rs (target/debug/deps/lease_recovery_loop-442e159d47a19318)
+
+running 3 tests
+test recovery_loop_shuts_down_gracefully ... ok
+test recovery_loop_recovers_rpc_claimed_task_after_lease_expires ... ok
+test recovery_loop_returns_expired_lease_task_to_pending_and_logs_event ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+[1m[92m     Running[0m tests/rpc_status.rs (target/debug/deps/rpc_status-99d2cd51c3493c0d)
+
+running 1 test
+test daemon_rpc_reports_runtime_status_and_doctor_readiness ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+[1m[92m     Running[0m tests/startup_recovery.rs (target/debug/deps/startup_recovery-c2d23458bc3cb19b)
+
+running 8 tests
+test runtime_status_report_reflects_ready_sqlite_store ... ok
+test startup_creates_default_database_under_data_dir ... ok
+test runtime_doctor_report_marks_runtime_healthy_when_store_ready ... ok
+test startup_returns_typed_error_for_migration_failure ... ok
+test runtime_status_report_counts_terminal_stale_lease_cleanup ... ok
+test startup_returns_typed_error_for_unsupported_schema ... ok
+test startup_migrates_sqlite_and_recovers_stale_leases_before_reporting_ready ... ok
+test startup_returns_typed_error_when_startup_recovery_detects_corruption ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+[1m[92m     Running[0m tests/task_claim.rs (target/debug/deps/task_claim-3f388ea9171fd2f4)
+
+running 2 tests
+test claim_task_via_rpc_leases_pending_task_as_running ... ok
+test claim_task_via_rpc_rejects_completed_tasks_with_failed_precondition ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m tests/task_complete.rs (target/debug/deps/task_complete-8ed8e2de147b414c)
+
+running 1 test
+test complete_task_via_rpc_clears_lease_and_marks_completed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/task_fail.rs (target/debug/deps/task_fail-ab8bb60f56b71033)
+
+running 1 test
+test fail_task_via_rpc_clears_lease_and_returns_failure_metadata ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/task_fail_retry.rs (target/debug/deps/task_fail_retry-168861a8ac0d2b89)
+
+running 1 test
+test fail_task_via_rpc_requeues_with_retry_count_until_dead_lettered ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/task_illegal_transitions.rs (target/debug/deps/task_illegal_transitions-96497aac1b3ea78a)
+
+running 1 test
+test complete_or_fail_on_pending_task_without_lease_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/task_routing.rs (target/debug/deps/task_routing-af11183d38d97428)
+
+running 11 tests
+test send_task_known_routable_peer_without_publisher_is_unavailable ... ok
+test list_peers_includes_local_peer ... ok
+test send_task_relay_failure_maps_to_unavailable ... ok
+test grpc_relay_task_publisher_maps_publish_failure ... ok
+test grpc_relay_task_publisher_publishes_to_relay_mailbox ... ok
+test send_task_routes_to_relay_routable_peer_without_connected_peerstore_entry ... ok
+test send_task_routes_to_relay_peer ... ok
+test send_task_routes_to_local_store ... ok
+test send_task_unknown_peer_is_not_found ... ok
+test send_task_with_configured_relay_publisher_routes_unconnected_peer ... ok
+test send_task_relay_timeout_maps_to_deadline_exceeded ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m tests/task_submission.rs (target/debug/deps/task_submission-c8bc2164b76a3f95)
+
+running 1 test
+test submit_task_via_rpc_accepts_pending_task ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/tracing_instrumentation.rs (target/debug/deps/tracing_instrumentation-74add7dec903d156)
+
+running 1 test
+test rpc_handlers_emit_named_tracing_spans ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_observe-cf9e5e09ae0092e3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/metrics.rs (target/debug/deps/metrics-256bc98d6c280254)
+
+running 3 tests
+test active_leases_gauge_tracks_claim_complete_fail_and_recovery ... ok
+test decrement_active_leases_can_go_negative_when_misused ... ok
+test counters_increment_independently ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/relay_metrics.rs (target/debug/deps/relay_metrics-384c38c969510002)
+
+running 1 test
+test relay_counters_track_peers_registry_and_routing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_policy-371f52bde37f0d15)
+
+running 5 tests
+test tests::node_key_round_trips_and_debug_redacts_secret ... ok
+test tests::scoped_agent_identity_round_trips_under_node ... ok
+test tests::redaction_hides_secret_metadata_and_inline_tokens ... ok
+test tests::capability_policy_orders_agent_node_global_default ... ok
+test tests::token_authenticator_accepts_valid_and_denies_bad_tokens ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_proto-6cd0b3f56384ad79)
+
+running 2 tests
+test tests::generated_event_type_values_are_available ... ok
+test tests::generated_task_status_values_are_available ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_relay-fbe576569f3bba0f)
+
+running 17 tests
+test config::tests::default_listen_addresses_include_tcp_and_quic ... ok
+test config::tests::parses_shorthand_port ... ok
+test health::tests::health_report_reflects_metrics_and_transport ... ok
+test health::tests::http_response_is_valid_json_body ... ok
+test registry::tests::discover_filters_by_tags ... ok
+test registry::tests::discover_respects_limit ... ok
+test registry::tests::gossip_snapshot_syncs_registry ... ok
+test registry::tests::node_registration_appears_without_skills ... ok
+test registry::tests::register_then_discover_by_skill ... ok
+test registry::tests::unregister_removes_skills_from_discovery ... ok
+test security::tests::empty_allowlist_allow_permits_everyone ... ok
+test security::tests::node_token_auth_accepts_valid_token_and_rejects_bad_or_revoked_nodes ... ok
+test security::tests::empty_allowlist_deny_denies_everyone ... ok
+test security::tests::relay_config_loads_inline_node_tokens ... ok
+test security::tests::reload_picks_up_new_keys ... ok
+test security::tests::loads_peer_ids_from_toml ... ok
+test registry::tests::ttl_expiry_removes_registration ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m unittests src/node_main.rs (target/debug/deps/keryx_node-03b8dea1ce721af1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/keryx_relay-4d47f6930c7d7372)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/autonat.rs (target/debug/deps/autonat-9596e3d014fca5d7)
+
+running 1 test
+test autonat_client_observes_nat_status ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+
+[1m[92m     Running[0m tests/binary.rs (target/debug/deps/binary-b2a694df87ec04d4)
+
+running 1 test
+[2m2026-07-10T14:56:11.471726Z[0m [32m INFO[0m [2mlibp2p_swarm[0m[2m:[0m [3mlocal_peer_id[0m[2m=[0m12D3KooWR4N7g1Tea7DfbgUf5hVSTRwjxXpHPLtQAW6KghXSZwDV
+[2m2026-07-10T14:56:11.471949Z[0m [32m INFO[0m [2mkeryx_relay[0m[2m:[0m Hermes Keryx relay listening [3maddr[0m[2m=[0m/ip4/127.0.0.1/tcp/0 [3mlocal_peer_id[0m[2m=[0m12D3KooWR4N7g1Tea7DfbgUf5hVSTRwjxXpHPLtQAW6KghXSZwDV
+[2m2026-07-10T14:56:11.472271Z[0m [32m INFO[0m [2mkeryx_relay[0m[2m:[0m Hermes Keryx relay listening [3maddr[0m[2m=[0m/ip4/127.0.0.1/udp/0/quic-v1 [3mlocal_peer_id[0m[2m=[0m12D3KooWR4N7g1Tea7DfbgUf5hVSTRwjxXpHPLtQAW6KghXSZwDV
+[2m2026-07-10T14:56:11.472333Z[0m [32m INFO[0m [2mkeryx_relay[0m[2m:[0m Hermes Keryx relay started [3mcomponent[0m[2m=[0m"keryx-relay" [3mlocal_peer_id[0m[2m=[0m12D3KooWR4N7g1Tea7DfbgUf5hVSTRwjxXpHPLtQAW6KghXSZwDV
+[2m2026-07-10T14:56:11.472471Z[0m [32m INFO[0m [2mkeryx_relay[0m[2m:[0m relay ready on address [3maddress[0m[2m=[0m/ip4/127.0.0.1/tcp/40605
+[2m2026-07-10T14:56:11.472573Z[0m [32m INFO[0m [2mkeryx_relay[0m[2m:[0m relay ready on address [3maddress[0m[2m=[0m/ip4/127.0.0.1/udp/37842/quic-v1
+test relay_binary_starts_with_default_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
+
+[1m[92m     Running[0m tests/health.rs (target/debug/deps/health-a9b3abed9a6a157d)
+
+running 2 tests
+test swarm_connection_events_update_peer_metric ... ok
+test grpc_health_reports_peer_and_registry_counts ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+[1m[92m     Running[0m tests/registry_grpc.rs (target/debug/deps/registry_grpc-b8a89de9102cf88c)
+
+running 3 tests
+test grpc_register_and_discover_skill ... ok
+test grpc_discover_filters_tags_and_limit ... ok
+test grpc_unregister_and_ttl ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+[1m[92m     Running[0m tests/relay.rs (target/debug/deps/relay-76e820a29dc7fd90)
+
+running 2 tests
+test relay_traversal_connects_listener_and_dialer ... ignored, relay circuit reservation flaky on loopback without DCUtR; smoke covered by relay_client_connects_to_relay_server
+test relay_client_connects_to_relay_server ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+[1m[92m     Running[0m tests/relay_grpc.rs (target/debug/deps/relay_grpc-80d934ed1c3066aa)
+
+running 6 tests
+test publish_task_skill_metadata_is_discoverable_for_target_node ... ok
+test ack_task_removes_pending_offline_mailbox_entry ... ok
+test connect_node_relays_node_frames_to_connected_target ... ok
+test register_node_appears_in_skill_registry ... ok
+test publish_task_stores_offline_mailbox_and_delivers_on_reconnect ... ok
+test offline_registered_nodes_are_pruned_after_registry_timeout ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+[1m[92m     Running[0m tests/security.rs (target/debug/deps/security-d7ccc6b3c1a42073)
+
+running 4 tests
+test config_reload_picks_up_new_allowlist_keys ... ok
+test rejected_peer_does_not_connect_to_relay_server ... ok
+test allowed_peer_connects_to_relay_server ... ok
+test empty_allowlist_denies_by_default ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m tests/transport.rs (target/debug/deps/transport-665665dd7dfefc5d)
+
+running 1 test
+test two_nodes_connect_over_tcp ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_store-b3878a09f4bcd810)
+
+running 7 tests
+test tests::accept_legacy_event_appends_operational_task_queued_without_status_change ... ok
+test tests::accept_legacy_event_rejects_unknown_status_combination ... ok
+test tests::in_memory_replay_reports_missing_events_as_corruption ... ok
+test tests::in_memory_replay_reports_snapshot_event_status_mismatch_as_corruption ... ok
+test tests::accept_legacy_event_normalizes_task_leased_to_running_with_task_started_event ... ok
+test tests::in_memory_replay_rejects_dead_lettered_snapshot_without_retry_count ... ok
+test tests::in_memory_recovery_cleans_terminal_stale_lease_without_changing_terminal_status ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/artifact_store.rs (target/debug/deps/artifact_store-d295d82e63964205)
+
+running 13 tests
+test in_memory_store_round_trips_blob_artifacts_and_removes_blob_file_on_delete ... ok
+test sqlite_blob_put_rejects_preexisting_symlink ... ok
+test sqlite_blob_get_rejects_tampered_content ... ok
+test sqlite_artifact_task_ownership_moves_across_tasks ... ok
+test sqlite_delete_inline_artifact_removes_metadata ... ok
+test sqlite_deduplicates_blob_files_and_cleans_them_up ... ok
+test sqlite_list_artifacts_for_empty_task_is_empty ... ok
+test sqlite_inline_and_blob_threshold_behavior_is_explicit ... ok
+test sqlite_duplicate_put_is_idempotent_and_overwrite_replaces_old_blob ... ok
+test sqlite_migration_v4_creates_artifact_tables ... ok
+test sqlite_missing_artifact_reads_and_deletes_return_not_found ... ok
+test sqlite_round_trips_inline_artifacts_and_lists_them ... ok
+test sqlite_put_artifact_rejects_unknown_task_digest_mismatch_and_size_limit ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.17s
+
+[1m[92m     Running[0m tests/envelope_store.rs (target/debug/deps/envelope_store-785fb4dd83602943)
+
+running 6 tests
+test in_memory_rejects_mismatched_ids_without_accepting_task ... ok
+test in_memory_accepts_task_and_envelope_atomically ... ok
+test sqlite_mismatch_rolls_back_lifecycle_acceptance ... ok
+test legacy_lifecycle_only_acceptance_still_works ... ok
+test sqlite_idempotent_retry_requires_identical_envelope ... ok
+test sqlite_envelope_survives_reopen_and_schema_is_v6 ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m tests/in_memory_lease_recovery.rs (target/debug/deps/in_memory_lease_recovery-12e8a926b2dbb6a6)
+
+running 6 tests
+test in_memory_lease_renewal_updates_metadata_only_and_keeps_running_status ... ok
+test in_memory_lease_task_persists_lease_and_task_started_event ... ok
+test in_memory_recovery_limit_is_applied_after_deterministic_ordering ... ok
+test in_memory_recovery_preserves_terminal_tasks_and_cleans_stale_metadata ... ok
+test in_memory_recovery_requeues_expired_running_leases_deterministically ... ok
+test in_memory_stale_tokens_are_rejected_after_recovery_and_reissue ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/in_memory_store.rs (target/debug/deps/in_memory_store-c974090becf1595a)
+
+running 9 tests
+test accepted_task_is_persisted_with_task_created_event_before_ack ... ok
+test conflicting_idempotency_key_reuse_is_rejected ... ok
+test count_tasks_by_status_returns_pending_running_and_terminal_counts ... ok
+test completed_and_failed_tasks_are_terminally_immutable ... ok
+test lease_owner_mismatch_and_missing_owner_are_rejected ... ok
+test duplicate_idempotency_key_returns_existing_compatible_task ... ok
+test pending_running_completed_succeeds_via_lease_and_complete ... ok
+test pending_completed_fails_with_validation_error ... ok
+test pending_running_failed_succeeds_via_lease_and_fail ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/pending_envelopes.rs (target/debug/deps/pending_envelopes-c1f7562ea4646b2d)
+
+running 1 test
+test pending_envelopes_are_deterministic_and_exclude_lifecycle_only_tasks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/retry_dead_letter.rs (target/debug/deps/retry_dead_letter-bbe257b5612fbdfe)
+
+running 6 tests
+test fail_task_with_no_retries_goes_directly_to_failed_without_dead_letter ... ok
+test fail_task_retries_to_pending_until_policy_exhausted ... ok
+test manual_retry_and_dead_letter_require_matching_worker_in_memory ... ok
+test replay_preserves_snapshot_retry_metadata_across_retry_and_dead_letter_in_memory ... ok
+test manual_retry_and_dead_letter_require_matching_worker_in_sqlite ... ok
+test replay_preserves_snapshot_retry_metadata_across_retry_and_dead_letter_in_sqlite ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m tests/sqlite_lease_recovery.rs (target/debug/deps/sqlite_lease_recovery-908f12332d20efc2)
+
+running 8 tests
+test sqlite_lease_task_persists_lease_and_task_started_event ... ok
+test sqlite_lease_renewal_updates_metadata_only_and_keeps_running_status ... ok
+test sqlite_recovery_limit_is_applied_after_deterministic_ordering ... ok
+test sqlite_recovery_cleans_terminal_stale_lease_without_changing_terminal_status ... ok
+test sqlite_recovery_preserves_terminal_tasks_and_cleans_stale_metadata ... ok
+test sqlite_recovery_requeues_expired_running_leases_deterministically ... ok
+test sqlite_replay_reports_missing_events_as_corruption ... ok
+test sqlite_stale_tokens_are_rejected_after_recovery_and_reissue ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+[1m[92m     Running[0m tests/sqlite_store.rs (target/debug/deps/sqlite_store-9e6e31a1f864d5b1)
+
+running 13 tests
+test sqlite_idempotency_duplicate_and_conflict_behave_like_memory_store ... ok
+test sqlite_lease_owner_mismatch_and_missing_owner_are_rejected ... ok
+test sqlite_count_tasks_by_status_returns_current_counts ... ok
+test sqlite_completed_and_failed_tasks_are_terminally_immutable ... ok
+test sqlite_migration_from_empty_database_creates_schema_version ... ok
+test sqlite_legacy_awaiting_approval_task_is_not_downgraded_to_pending ... ok
+test sqlite_pending_completed_fails_with_validation_error ... ok
+test sqlite_pending_running_completed_succeeds_via_lease_and_complete ... ok
+test sqlite_migration_requeues_legacy_active_leases_without_fabricating_owner ... ok
+test sqlite_pending_running_failed_succeeds_via_lease_and_fail ... ok
+test sqlite_replay_and_recovery_report_missing_events_as_corruption ... ok
+test sqlite_replay_and_recovery_report_status_mismatch_as_corruption ... ok
+test sqlite_replay_rejects_dead_lettered_snapshot_without_retry_count ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/keryx_testkit-f1a505a13cbac53d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_daemon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_observe
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_policy
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_proto
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_relay
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m keryx_testkit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

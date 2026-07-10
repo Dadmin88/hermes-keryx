@@ -168,6 +168,12 @@ impl TaskEnvelopeRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTaskEnvelope {
+    pub task: TaskRecord,
+    pub envelope: TaskEnvelopeRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEventRecord {
     pub task_id: TaskId,
     pub sequence: u64,
@@ -435,6 +441,40 @@ impl InMemoryStore {
             .get(task_id)
             .cloned()
             .ok_or_else(|| StoreError::TaskEnvelopeNotFound(task_id.clone()))
+    }
+
+    pub fn pending_task_envelopes(&self, limit: usize) -> StoreResult<Vec<PendingTaskEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.lock()?;
+        let mut pending = state
+            .tasks
+            .values()
+            .filter(|task| task.status == TaskStatus::Pending)
+            .filter_map(|task| {
+                state
+                    .envelopes
+                    .get(task.task_id())
+                    .map(|envelope| PendingTaskEnvelope {
+                        task: task.clone(),
+                        envelope: envelope.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            left.envelope
+                .received_at_ms
+                .cmp(&right.envelope.received_at_ms)
+                .then_with(|| {
+                    left.task
+                        .task_id()
+                        .as_str()
+                        .cmp(right.task.task_id().as_str())
+                })
+        });
+        pending.truncate(limit);
+        Ok(pending)
     }
 
     pub fn lease_task(&self, task_id: &TaskId, lease: LeaseRecord) -> StoreResult<TaskRecord> {
@@ -1525,6 +1565,22 @@ impl SqliteStore {
         row.map(row_to_task_envelope)
             .transpose()?
             .ok_or_else(|| StoreError::TaskEnvelopeNotFound(task_id.clone()))
+    }
+
+    pub async fn pending_task_envelopes(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<PendingTaskEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT t.task_id, t.status, t.idempotency_key, t.retry_count, t.dead_lettered, t.dead_letter_reason, t.deadline_ms, e.encoded_envelope, e.received_at_ms                      FROM tasks t INNER JOIN task_envelopes e ON e.task_id = t.task_id                      WHERE t.status = 'pending'                      ORDER BY e.received_at_ms ASC, t.task_id ASC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_pending_task_envelope).collect()
     }
 
     pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {
@@ -2700,6 +2756,35 @@ async fn fetch_task_envelope_optional_with_executor(
     .fetch_optional(&mut **tx)
     .await?;
     row.map(row_to_task_envelope).transpose()
+}
+
+fn row_to_pending_task_envelope(row: sqlx::sqlite::SqliteRow) -> StoreResult<PendingTaskEnvelope> {
+    let task_id = TaskId::new(row.get::<String, _>("task_id"))?;
+    let status = str_to_status(&row.get::<String, _>("status"))?;
+    let idempotency_key = row
+        .try_get::<Option<String>, _>("idempotency_key")?
+        .map(IdempotencyKey::new)
+        .transpose()?;
+    let task = TaskRecord {
+        id: task_id.clone(),
+        status,
+        idempotency_key,
+        deadline_ms: row.try_get::<Option<i64>, _>("deadline_ms")?,
+        retry_count: row
+            .try_get::<Option<i64>, _>("retry_count")?
+            .unwrap_or(0)
+            .max(0) as u32,
+        dead_lettered: row.try_get::<Option<i64>, _>("dead_lettered")?.unwrap_or(0) != 0,
+        dead_letter_reason: row.try_get::<Option<String>, _>("dead_letter_reason")?,
+    };
+    Ok(PendingTaskEnvelope {
+        task,
+        envelope: TaskEnvelopeRecord {
+            task_id,
+            encoded_envelope: row.get::<Vec<u8>, _>("encoded_envelope"),
+            received_at_ms: row.get::<i64, _>("received_at_ms"),
+        },
+    })
 }
 
 fn row_to_lease(row: sqlx::sqlite::SqliteRow) -> StoreResult<LeaseRecord> {

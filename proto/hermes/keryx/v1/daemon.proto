@@ -12,6 +12,7 @@ service KeryxDaemon {
   rpc Readiness(ReadinessRequest) returns (ReadinessResponse);
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
   rpc ClaimTask(ClaimTaskRequest) returns (ClaimTaskResponse);
+  rpc ClaimNextTask(ClaimNextTaskRequest) returns (ClaimNextTaskResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
   rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
@@ -94,6 +95,32 @@ message ClaimTaskResponse {
   string status = 6;
   uint32 retry_count = 7;
   bool dead_lettered = 8;
+}
+
+
+message ClaimNextTaskRequest {
+  AgentId worker_id = 1;
+  repeated string accepted_skill_ids = 2;
+  repeated string accepted_capability_ids = 3;
+  // When zero, the daemon applies a default lease TTL.
+  int64 lease_duration_ms = 4;
+  // Zero returns immediately. Positive values are bounded by the daemon.
+  int64 wait_timeout_ms = 5;
+}
+
+message ClaimNextTaskResponse {
+  bool has_task = 1;
+  TaskEnvelope envelope = 2;
+  TaskId task_id = 3;
+  LeaseId lease_id = 4;
+  AgentId worker_id = 5;
+  int64 leased_at_ms = 6;
+  int64 expires_at_ms = 7;
+  string status = 8;
+  uint32 retry_count = 9;
+  bool dead_lettered = 10;
+  // Empty until the relay/edge authenticated identity contract is persisted.
+  string sender_peer_id = 11;
 }
 
 message HeartbeatRequest {
