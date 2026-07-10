@@ -723,7 +723,6 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         test_rpc_delay().await;
         let report = self.runtime.status_report();
-        let metrics = self.runtime.metrics_snapshot();
         let status = if report.daemon_ready {
             "ready"
         } else {
@@ -731,26 +730,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         };
         Ok(Response::new(StatusResponse {
             status: status.to_string(),
-            data_dir: report.data_dir.display().to_string(),
-            db_path: report.db_path.display().to_string(),
-            schema_version: report.schema_version,
-            supported_schema_version: report.supported_schema_version,
-            recovered_tasks: report.recovered_tasks as u64,
-            cleaned_terminal_leases: report.cleaned_terminal_leases as u64,
-            corruption_count: report.corruption_count as u64,
-            startup_recovery_duration_ms: report.startup_recovery_duration_ms as u64,
-            store_kind: report.store.kind.to_string(),
-            store_ready: report.store.ready,
-            store_path: report.store.path.display().to_string(),
-            tasks_submitted: metrics.tasks_submitted,
-            tasks_claimed: metrics.tasks_claimed,
-            tasks_completed: metrics.tasks_completed,
-            tasks_failed: metrics.tasks_failed,
-            heartbeats: metrics.heartbeats,
-            leases_recovered: metrics.leases_recovered,
-            recovery_ticks: metrics.recovery_ticks,
-            active_leases: metrics.active_leases,
-            dead_letters: metrics.dead_letters,
+            ..StatusResponse::default()
         }))
     }
 
