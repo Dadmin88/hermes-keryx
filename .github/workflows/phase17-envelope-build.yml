@@ -51,11 +51,36 @@ jobs:
           path: phase17-patch.log
           if-no-files-found: error
 
-      - name: Format and verify
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Clippy
+        shell: bash
         run: |
-          cargo fmt --all
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          set -o pipefail
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee phase17-clippy.log
+
+      - name: Upload Clippy failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-envelope-clippy
+          path: phase17-clippy.log
+          if-no-files-found: error
+
+      - name: Workspace tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee phase17-tests.log
+
+      - name: Upload test failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase17-envelope-tests
+          path: phase17-tests.log
+          if-no-files-found: error
 
       - name: Commit verified implementation
         run: |
