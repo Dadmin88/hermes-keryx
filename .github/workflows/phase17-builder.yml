@@ -26,25 +26,47 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Apply store source slice once
+      - name: Install protobuf generator
+        run: python -m pip install grpcio-tools
+      - name: Apply durable store slice once
         run: |
           if [[ ! -f crates/keryx-store/src/results.rs ]]; then
             python scripts/apply_phase17_protocol_store.py
             python scripts/fix_phase17_store_build.py
-          else
-            echo 'Phase 17 durable store slice is already committed'
           fi
+      - name: Apply result transport slice once
+        run: |
+          if ! grep -q 'SubmitRemoteTask' proto/hermes/keryx/v1/daemon.proto; then
+            python scripts/apply_phase17_runtime.py
+          else
+            echo 'Phase 17 result runtime is already committed'
+          fi
+      - name: Regenerate Python protobuf stubs
+        run: |
+          python -m grpc_tools.protoc \
+            -I proto \
+            --python_out=sdk/python/keryx/proto \
+            --grpc_python_out=sdk/python/keryx/proto \
+            proto/hermes/keryx/v1/*.proto
       - name: Format
         run: cargo fmt --all
       - name: Check Rust workspace
+        id: verify
         shell: bash
         run: |
+          set +e
           set -o pipefail
           {
             cargo fmt --check
             cargo clippy --workspace --all-targets -- -D warnings
             cargo test --workspace
+            cd sdk/python
+            python -m pip install -e '.[dev]'
+            python -m pytest tests -q
           } 2>&1 | tee phase17-build.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Upload compiler diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -53,6 +75,7 @@ jobs:
           path: phase17-build.log
           if-no-files-found: error
       - name: Commit generated implementation
+        if: steps.verify.outputs.status == '0'
         run: |
           if git diff --quiet; then
             echo 'No generated changes'
@@ -60,6 +83,9 @@ jobs:
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add proto crates scripts
-          git commit -m 'feat(store): persist authenticated terminal results and outbox'
+          git add proto crates sdk scripts
+          git commit -m 'feat(phase17): route durable terminal results to origin'
           git push origin HEAD:${{ github.head_ref }}
+      - name: Fail unsuccessful verification
+        if: steps.verify.outputs.status != '0'
+        run: exit 1
