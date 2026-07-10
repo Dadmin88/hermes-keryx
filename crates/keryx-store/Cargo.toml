@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 keryx-core = { path = "../keryx-core" }
+libc.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
