@@ -180,6 +180,9 @@ def edge_env(
     key_path.parent.mkdir(parents=True, exist_ok=True)
     seed = 1 if peer_id == SENDER_PEER else 2
     key_path.write_bytes(bytes([seed]) + bytes(31))
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    seed = 1 if peer_id == SENDER_PEER else 2
+    key_path.write_bytes(bytes([seed]) + bytes(31))
     env = base_env()
     env.update(
         {
