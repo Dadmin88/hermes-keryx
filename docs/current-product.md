@@ -7,11 +7,11 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | Component | Implemented surface |
 |---|---|
 | `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
-| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
-| `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness when configured, dials bootstrap peers, and registers skills with the relay registry from environment variables. |
+| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
+| `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; AgentAnycast-compatible transition helpers. |
-| Ops scripts | `scripts/keryx-dual-run.sh` for local daemon+relay supervision; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; AgentAnycast-compatible transition helpers. Remote handler dispatch and terminal result return are not complete yet. |
+| Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
 
@@ -66,6 +66,8 @@ Important defaults:
 - artifact metadata plus inline bytes/blob references
 - deadline/cancellation fields
 
+The current task store does **not** durably retain the complete submitted `TaskEnvelope`. `SubmitTask` stores a lifecycle `TaskRecord`, so messages, origin identity, correlation metadata, and requested capability are not yet recoverable by an Agency worker after relay delivery.
+
 Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR` is unset. Operator dual-run uses `~/.hermes/.keryx/data`.
 
 ## Relay and registry
@@ -76,6 +78,31 @@ Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR
 - TOML config supports `[relay]`, `[security]`, and `[registry]` sections. TOML enables allowlist files, empty-allowlist policy, inline/external node tokens, and registry TTL/max-skills settings.
 
 Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC health, `127.0.0.1:8081` HTTP health, and `127.0.0.1:50053` registry. The dual-run script intentionally overrides these to loopback non-conflicting ports.
+
+## Cross-node delivery boundary
+
+Keryx currently proves this one-way transport path:
+
+```text
+sender keryxd SendTask
+  -> relay PublishTask
+  -> destination keryx-node stream
+  -> destination keryxd SubmitTask
+  -> destination lifecycle row
+```
+
+A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
+
+Missing today:
+
+- durable retention of the full incoming envelope
+- an atomic claim-next or pending-task delivery API for workers
+- Python `serve_forever()` dispatch into registered `on_task()` handlers
+- authenticated terminal result/artifact routing back to the origin
+- a remotely updated `TaskHandle.wait()`
+- a repeatable two-daemon/two-edge-node Agency E2E
+
+This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
 
 ## Operator CLI
 
@@ -110,11 +137,17 @@ The Python package is `keryx` and exports:
 
 Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
 
+Current compatibility limits:
+
+- `serve_forever()` keeps the SDK process alive but does not claim daemon tasks or invoke registered task handlers.
+- `send_task()` can submit through a configured daemon/relay route, but its compatibility `TaskHandle` is not attached to a remote terminal-status/result stream.
+- `IncomingTask.complete()` / `.fail()` are not yet wired to a durable relay result route.
+
 The SDK default daemon endpoint is `unix:///tmp/keryx-daemon.sock`; most repository examples override it to `127.0.0.1:50051` / `http://127.0.0.1:50051` for the current daemon binary and CLI.
 
 ## Dual-run defaults
 
-`scripts/keryx-dual-run.sh` starts a local daemon and relay without colliding with common AgentAnycast ports:
+`scripts/keryx-dual-run.sh` starts one local daemon and one relay without colliding with common AgentAnycast ports:
 
 | Component | Default |
 |---|---|
@@ -126,6 +159,8 @@ The SDK default daemon endpoint is `unix:///tmp/keryx-daemon.sock`; most reposit
 | relay libp2p QUIC | `/ip4/127.0.0.1/udp/4101/quic-v1` |
 | state root | `~/.hermes/.keryx` |
 
+Dual-run validates infrastructure health. It does not start two edge nodes or prove a remote Hermes Agency handler/result round trip.
+
 ## Environment variables
 
 Common variables:
@@ -136,7 +171,8 @@ Common variables:
 | `HERMES_KERYX_DAEMON_ADDR` | daemon, dual-run | daemon bind address (loopback-only in `keryxd`) |
 | `HERMES_KERYX_DAEMON_ENDPOINT` | CLI, SDK, node, scripts | daemon client endpoint |
 | `HERMES_KERYX_RELAY_CONFIG` | relay, node, scripts | relay JSON/TOML config path |
-| `HERMES_KERYX_RELAY_HEALTH_ENDPOINT` | CLI | relay health gRPC endpoint with scheme |
+| `HERMES_KERYX_RELAY_ENDPOINT` | daemon routing publisher, node stream | relay gRPC endpoint with scheme |
+| `HERMES_KERYX_RELAY_HEALTH_ENDPOINT` | CLI, daemon fallback alias, node fallback alias | relay health/control gRPC endpoint with scheme |
 | `HERMES_KERYX_RELAY_REGISTRY_ENDPOINT` | relay CLI, node CLI, daemon discovery, node binary | relay registry gRPC endpoint with scheme for clients |
 | `HERMES_KERYX_REGISTRY_ENDPOINT` | Python SDK, dual-run script | SDK/dual-run registry endpoint alias |
 | `HERMES_KERYX_DAEMON_SKILLS` | daemon discovery | comma-separated daemon skills to register |
