@@ -57,6 +57,13 @@ jobs:
           fi
       - name: Apply idempotent topology harness fixes
         run: python scripts/apply_phase17_e2e_fix.py
+      - name: Apply authenticated relay source binding once
+        run: |
+          if ! grep -q 'NODE_TOKEN_METADATA_KEY' crates/keryx-relay/src/health_server.rs; then
+            python scripts/apply_phase17_relay_auth.py
+          else
+            echo 'Authenticated relay source binding is already committed'
+          fi
       - name: Format
         run: cargo fmt --all
       - name: Check workspace
@@ -93,7 +100,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add proto crates sdk scripts
-          git commit -m 'test(phase17): harden the real two-node topology proof'
+          git commit -m 'feat(phase17): authenticate relay task and result sources'
           git push origin HEAD:${{ github.head_ref }}
       - name: Fail unsuccessful verification
         if: steps.verify.outputs.status != '0'
