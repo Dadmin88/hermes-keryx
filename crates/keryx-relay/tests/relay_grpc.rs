@@ -48,7 +48,9 @@ async fn connect_node_relays_node_frames_to_connected_target() {
 
     a_tx.send(NodeFrame {
         frame_id: "frame-a-to-b".to_string(),
+        target_node_id: "node-b".to_string(),
         task: Some(task("task-a-to-b", "node-b")),
+        result: None,
     })
     .await
     .expect("send node frame");
@@ -77,6 +79,8 @@ async fn publish_task_stores_offline_mailbox_and_delivers_on_reconnect() {
     let response = client
         .publish_task(PublishTaskRequest {
             task: Some(task("task-offline", "node-offline")),
+            target_node_id: "node-offline".to_string(),
+            source_node_id: "node-publisher".to_string(),
         })
         .await
         .expect("publish offline task")
@@ -124,6 +128,8 @@ async fn ack_task_removes_pending_offline_mailbox_entry() {
     client
         .publish_task(PublishTaskRequest {
             task: Some(task("task-pending", "node-pending")),
+            target_node_id: "node-pending".to_string(),
+            source_node_id: "node-publisher".to_string(),
         })
         .await
         .expect("publish pending task");
@@ -174,6 +180,8 @@ async fn publish_task_skill_metadata_is_discoverable_for_target_node() {
     client
         .publish_task(PublishTaskRequest {
             task: Some(task_with_skill("task-python", "node-python", "python")),
+            target_node_id: "node-python".to_string(),
+            source_node_id: "node-publisher".to_string(),
         })
         .await
         .expect("publish task with skill metadata");

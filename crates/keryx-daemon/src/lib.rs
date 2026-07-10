@@ -1897,6 +1897,7 @@ async fn return_peer_for_task(store: &SqliteStore, task_id: &TaskId) -> Option<P
         .and_then(|context| context.authenticated_sender_peer_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_terminal_result(
     store: &SqliteStore,
     executor: &PeerId,
