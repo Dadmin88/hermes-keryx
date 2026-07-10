@@ -84,4 +84,14 @@ if old_helpers not in text:
     raise SystemExit('expected original generator helpers were not found')
 text = text.replace(old_helpers, new_helpers, 1)
 
+unused_import = '''    "    LeaseRecord, PendingTaskEnvelope, RecoveryReport, SqliteStore, StoreError, StoreResult,\\n"
+    "    TaskEnvelopeRecord, TaskRecord, CURRENT_SCHEMA_VERSION,\\n",
+'''
+correct_import = '''    "    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,\\n"
+    "    TaskRecord, CURRENT_SCHEMA_VERSION,\\n",
+'''
+if unused_import not in text:
+    raise SystemExit('expected generated PendingTaskEnvelope import was not found')
+text = text.replace(unused_import, correct_import, 1)
+
 path.write_text(text, encoding='utf-8')
