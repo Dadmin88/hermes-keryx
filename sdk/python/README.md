@@ -63,6 +63,8 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+This quickstart exercises a local daemon lifecycle. It is not a remote Agent-to-Agent execution example.
+
 Native `KeryxNode` daemon methods:
 
 - connection/status: `connect()`, `close()`, async context manager, `status()`, `doctor()`
@@ -97,7 +99,9 @@ Compatibility notes:
 
 - `send_task(..., skill="...")` resolves the first registry match.
 - `send_task(..., url="...")` is not implemented.
-- `serve_forever()` is currently a lightweight keepalive loop; relay frame subscription/worker execution remains daemon/runtime integration work.
+- The returned compatibility `TaskHandle` currently represents submission only. It is not attached to a remote terminal-status/result stream, so `wait()` cannot yet receive remote completion or artifacts.
+- `serve_forever()` is currently a lightweight keepalive loop. It does not claim daemon tasks or invoke registered `on_task()` handlers.
+- Relay publication and destination-daemon submission exist, but complete daemon-to-Agent dispatch plus result return is tracked in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 
 ## Configuration
@@ -159,3 +163,4 @@ pytest
 - Agency imports should be direct: `from keryx import KeryxNode, AgentCard, Skill`
 - Prefer lazy imports inside Hermes plugin load paths so Hermes can still start if optional runtime pieces are missing
 - Keep card/task APIs stable unless Agency is updated in the same integration pass
+- Do not claim a completed remote Agency round trip until the Phase 17 cross-process E2E passes
