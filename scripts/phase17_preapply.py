@@ -67,6 +67,27 @@ if text.count(failure_timestamp) != 1:
     raise SystemExit("expected one failure payload timestamp")
 text = text.replace(failure_timestamp, failure_timestamp_fixed, 1)
 
+old_daemon_import_generator = '''replace_once(
+    DAEMON,
+    "    SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse, SubmitTaskRequest,\n    SubmitTaskResponse, TaskEnvelope, TaskId as ProtoTaskId,\n",
+    "    SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse, SubmitTaskRequest,\n"
+    "    SubmitTaskResponse, TaskEnvelope, TaskId as ProtoTaskId, TerminalTaskResult,\n",
+)
+'''
+new_daemon_import_generator = '''replace_once(
+    DAEMON,
+    "    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,\\n"
+    "    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskEnvelope,\\n"
+    "    TaskId as ProtoTaskId,\\n",
+    "    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,\\n"
+    "    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskEnvelope,\\n"
+    "    TaskId as ProtoTaskId, TerminalTaskResult,\\n",
+)
+'''
+if text.count(old_daemon_import_generator) != 1:
+    raise SystemExit("expected old daemon import generator exactly once")
+text = text.replace(old_daemon_import_generator, new_daemon_import_generator, 1)
+
 idempotency_marker = '''    #[tokio::test]
     async fn local_completion_persists_result_without_outbox() {
 '''
