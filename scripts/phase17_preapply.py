@@ -65,4 +65,17 @@ new_insert = '''def insert_before(path: str, marker: str, addition: str) -> None
 if old_insert not in text:
     raise SystemExit("expected insert_before helper was not found")
 text = text.replace(old_insert, new_insert, 1)
+
+newline_join = '                text = "\\n".join(part.text for part in artifact.parts if part.text)\n'
+escaped_newline_join = '                text = "\\\\n".join(part.text for part in artifact.parts if part.text)\n'
+if text.count(newline_join) != 1:
+    raise SystemExit("expected artifact newline join was not found exactly once")
+text = text.replace(newline_join, escaped_newline_join, 1)
+
+result_join = '                result_metadata["result_text"] = "\\n\\n".join(result_texts)[:65_536]\n'
+escaped_result_join = '                result_metadata["result_text"] = "\\\\n\\\\n".join(result_texts)[:65_536]\n'
+if text.count(result_join) != 1:
+    raise SystemExit("expected result newline join was not found exactly once")
+text = text.replace(result_join, escaped_result_join, 1)
+
 path.write_text(text, encoding="utf-8")
