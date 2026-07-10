@@ -75,3 +75,11 @@ if addition not in text:
         raise RuntimeError("daemon StoreError mapping anchor not found")
     text = text.replace(anchor, addition, 1)
 daemon.write_text(text)
+
+cli_test = ROOT / "crates/keryx-cli/tests/daemon_client.rs"
+text = cli_test.read_text()
+text = text.replace(
+    "store: ready sqlite schema_version=6 supported_schema_version=6",
+    "store: ready sqlite schema_version=7 supported_schema_version=7",
+)
+cli_test.write_text(text)
