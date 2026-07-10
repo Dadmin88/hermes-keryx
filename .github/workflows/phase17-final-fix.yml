@@ -1,0 +1,107 @@
+name: Phase 17 Final Fix
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase17-final-fix-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fix-and-verify:
+    if: github.head_ref == 'feat/phase17-complete-roundtrip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Update final schema-aware tests and lint contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          relay = Path('crates/keryx-relay/tests/relay_grpc.rs')
+          text = relay.read_text()
+          text = text.replace(
+              '''    a_tx.send(NodeFrame {
+                  frame_id: "frame-a-to-b".to_string(),
+                  task: Some(task("task-a-to-b", "node-b")),
+              })''',
+              '''    a_tx.send(NodeFrame {
+                  frame_id: "frame-a-to-b".to_string(),
+                  target_node_id: "node-b".to_string(),
+                  task: Some(task("task-a-to-b", "node-b")),
+                  result: None,
+              })''',
+          )
+          text = text.replace(
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task("task-offline", "node-offline")),
+                  })''',
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task("task-offline", "node-offline")),
+                      target_node_id: "node-offline".to_string(),
+                      source_node_id: "node-publisher".to_string(),
+                  })''',
+          )
+          text = text.replace(
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task("task-pending", "node-pending")),
+                  })''',
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task("task-pending", "node-pending")),
+                      target_node_id: "node-pending".to_string(),
+                      source_node_id: "node-publisher".to_string(),
+                  })''',
+          )
+          text = text.replace(
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task_with_skill("task-python", "node-python", "python")),
+                  })''',
+              '''        .publish_task(PublishTaskRequest {
+                      task: Some(task_with_skill("task-python", "node-python", "python")),
+                      target_node_id: "node-python".to_string(),
+                      source_node_id: "node-publisher".to_string(),
+                  })''',
+          )
+          relay.write_text(text)
+
+          daemon = Path('crates/keryx-daemon/src/lib.rs')
+          text = daemon.read_text()
+          anchor = 'async fn build_terminal_result('
+          if '#[allow(clippy::too_many_arguments)]\n' + anchor not in text:
+              if anchor not in text:
+                  raise SystemExit('build_terminal_result anchor missing')
+              text = text.replace(anchor, '#[allow(clippy::too_many_arguments)]\n' + anchor, 1)
+          daemon.write_text(text)
+          PY
+      - name: Verify Rust and Python SDK
+        run: |
+          cargo fmt --all
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          python -m pip install -e 'sdk/python[dev]'
+          python -m pytest sdk/python/tests -q
+      - name: Commit verified fixes
+        run: |
+          if git diff --quiet; then
+            echo 'No final source fixes required'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/keryx-relay/tests/relay_grpc.rs crates/keryx-daemon/src/lib.rs
+          git commit -m 'fix(phase17): finalize relay schema test coverage'
+          git push origin HEAD:${{ github.head_ref }}
