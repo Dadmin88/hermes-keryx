@@ -18,7 +18,9 @@ pub use artifact::{
     should_inline, validate_artifact_size, ArtifactId, ArtifactMeta, Digest, MediaType,
     MAX_BLOB_BYTES, MAX_INLINE_ARTIFACT_BYTES,
 };
-pub use error::{CoreResult, KeryxCoreError, ValidationError};
+pub use error::{
+    CoreResult, KeryxCoreError, ValidationError, ValidationError::CancelNotApplicable,
+};
 pub use legacy::{
     is_valid_operational_legacy, normalize_legacy_transition, CanonicalTransition, LegacyEventType,
 };
@@ -27,9 +29,12 @@ pub use limits::{
 };
 pub use peer_id::{NodeId, PeerId};
 pub use retry_policy::RetryPolicy;
+pub use task::TaskCancellationEventType::{
+    CancelRequested as CancelRequestedEventType, Canceled as CanceledEventType,
+};
 pub use task::{
     event_for_cancel_transition, event_for_transition, is_cancel_applicable, is_legal_transition,
-    validate_cancel_transition, validate_transition, KeryxEventType, Task,
-    TaskCancellationEventType, TaskId, TaskStatus, TaskTransition,
+    validate_cancel_transition, validate_transition, CancelRequested, Canceled, KeryxEventType,
+    Task, TaskCancellationEventType, TaskId, TaskStatus, TaskTransition,
 };
 pub use task_handle::{AttemptId, CorrelationId, IdempotencyKey, LeaseId, RouteId, TaskHandle};

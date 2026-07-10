@@ -90,6 +90,60 @@ impl TaskCancellationEventType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRequested {
+    pub task_id: TaskId,
+    pub status: TaskStatus,
+}
+
+impl CancelRequested {
+    pub fn new(task_id: TaskId, status: TaskStatus) -> Result<Self, KeryxCoreError> {
+        if is_cancel_applicable(status) {
+            Ok(Self { task_id, status })
+        } else {
+            Err(KeryxCoreError::Validation(
+                ValidationError::CancelNotApplicable { status },
+            ))
+        }
+    }
+
+    #[must_use]
+    pub const fn event_type(&self) -> TaskCancellationEventType {
+        TaskCancellationEventType::CancelRequested
+    }
+
+    #[must_use]
+    pub const fn lifecycle_event_type(&self) -> Option<KeryxEventType> {
+        self.event_type().lifecycle_event_type()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Canceled {
+    pub task_id: TaskId,
+    pub transition: TaskTransition,
+}
+
+impl Canceled {
+    pub fn new(task_id: TaskId, from: TaskStatus) -> Result<Self, KeryxCoreError> {
+        let transition = validate_cancel_transition(from)?;
+        Ok(Self {
+            task_id,
+            transition,
+        })
+    }
+
+    #[must_use]
+    pub const fn event_type(&self) -> TaskCancellationEventType {
+        TaskCancellationEventType::Canceled
+    }
+
+    #[must_use]
+    pub const fn lifecycle_event_type(&self) -> Option<KeryxEventType> {
+        self.event_type().lifecycle_event_type()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTransition {
     pub from: TaskStatus,
     pub to: TaskStatus,
@@ -179,10 +233,20 @@ impl Task {
         self.transition_to(TaskStatus::Failed)
     }
 
+    pub fn request_cancel(&self) -> Result<CancelRequested, KeryxCoreError> {
+        CancelRequested::new(self.id.clone(), self.status)
+    }
+
     pub fn mark_canceled(&mut self) -> Result<TaskTransition, KeryxCoreError> {
         let transition = validate_cancel_transition(self.status)?;
         self.status = transition.to;
         Ok(transition)
+    }
+
+    pub fn cancel(&mut self) -> Result<Canceled, KeryxCoreError> {
+        let canceled = Canceled::new(self.id.clone(), self.status)?;
+        self.status = canceled.transition.to;
+        Ok(canceled)
     }
 }
 

@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
 use keryx_core::{
-    validate_transition, AgentCard, AgentId, CapabilityId, KeryxCoreError, PeerId, Skill, Task,
-    TaskId, TaskStatus,
+    event_for_cancel_transition, validate_cancel_transition, validate_transition, AgentCard,
+    AgentId, CancelRequested, Canceled, CapabilityId, KeryxCoreError, KeryxEventType, PeerId,
+    Skill, Task, TaskCancellationEventType, TaskId, TaskStatus,
 };
 
 fn assert_terminal_transition_error(
@@ -125,6 +126,110 @@ fn failed_task_rejects_all_subsequent_transitions() {
         task.transition_to(TaskStatus::Pending),
         TaskStatus::Failed,
         TaskStatus::Pending,
+    );
+}
+
+#[test]
+fn cancellation_request_is_an_operational_event_for_pending_and_running_tasks() {
+    let task_id = TaskId::from_str("task-cancel-request").expect("valid task id");
+    let mut task = Task::new(task_id.clone());
+
+    let pending_request = task.request_cancel().expect("pending cancel request");
+    assert_eq!(
+        pending_request,
+        CancelRequested::new(task_id.clone(), TaskStatus::Pending).unwrap()
+    );
+    assert_eq!(pending_request.task_id, task_id);
+    assert_eq!(pending_request.status, TaskStatus::Pending);
+    assert_eq!(
+        pending_request.event_type(),
+        TaskCancellationEventType::CancelRequested
+    );
+    assert_eq!(pending_request.lifecycle_event_type(), None);
+
+    task.mark_running().expect("pending -> running");
+    let running_request = task.request_cancel().expect("running cancel request");
+    assert_eq!(running_request.status, TaskStatus::Running);
+    assert_eq!(running_request.lifecycle_event_type(), None);
+}
+
+#[test]
+fn cancellation_terminal_event_moves_pending_or_running_task_to_failed() {
+    let pending_id = TaskId::from_str("task-cancel-pending").expect("valid task id");
+    let mut pending = Task::new(pending_id.clone());
+    let pending_canceled = pending.cancel().expect("pending cancel");
+    assert_eq!(pending.status(), TaskStatus::Failed);
+    assert_eq!(
+        pending_canceled,
+        Canceled::new(pending_id.clone(), TaskStatus::Pending).unwrap()
+    );
+    assert_eq!(pending_canceled.task_id, pending_id);
+    assert_eq!(pending_canceled.transition.from, TaskStatus::Pending);
+    assert_eq!(pending_canceled.transition.to, TaskStatus::Failed);
+    assert_eq!(
+        pending_canceled.transition.event_type,
+        KeryxEventType::TaskCanceled
+    );
+    assert_eq!(
+        pending_canceled.event_type(),
+        TaskCancellationEventType::Canceled
+    );
+    assert_eq!(
+        pending_canceled.lifecycle_event_type(),
+        Some(KeryxEventType::TaskCanceled)
+    );
+
+    let running_id = TaskId::from_str("task-cancel-running").expect("valid task id");
+    let mut running = Task::new(running_id);
+    running.mark_running().expect("pending -> running");
+    let running_transition = running.mark_canceled().expect("running cancel");
+    assert_eq!(running.status(), TaskStatus::Failed);
+    assert_eq!(running_transition.from, TaskStatus::Running);
+    assert_eq!(running_transition.to, TaskStatus::Failed);
+    assert_eq!(running_transition.event_type, KeryxEventType::TaskCanceled);
+}
+
+#[test]
+fn cancellation_rejects_terminal_tasks() {
+    let mut completed =
+        Task::new(TaskId::from_str("task-cancel-completed").expect("valid task id"));
+    completed.mark_running().expect("pending -> running");
+    completed.mark_completed().expect("running -> completed");
+
+    let err = completed.request_cancel().unwrap_err();
+    assert_eq!(
+        err,
+        KeryxCoreError::Validation(keryx_core::ValidationError::CancelNotApplicable {
+            status: TaskStatus::Completed,
+        })
+    );
+
+    let err = completed.mark_canceled().unwrap_err();
+    assert_eq!(
+        err,
+        KeryxCoreError::Validation(keryx_core::ValidationError::CancelNotApplicable {
+            status: TaskStatus::Completed,
+        })
+    );
+}
+
+#[test]
+fn cancellation_transition_helpers_emit_task_canceled_event() {
+    assert_eq!(
+        event_for_cancel_transition(TaskStatus::Pending).expect("pending cancel event"),
+        KeryxEventType::TaskCanceled
+    );
+    let transition = validate_cancel_transition(TaskStatus::Running).expect("running cancel");
+    assert_eq!(transition.from, TaskStatus::Running);
+    assert_eq!(transition.to, TaskStatus::Failed);
+    assert_eq!(transition.event_type, KeryxEventType::TaskCanceled);
+
+    let err = event_for_cancel_transition(TaskStatus::Failed).unwrap_err();
+    assert_eq!(
+        err,
+        KeryxCoreError::Validation(keryx_core::ValidationError::CancelNotApplicable {
+            status: TaskStatus::Failed,
+        })
     );
 }
 
