@@ -1,0 +1,44 @@
+name: Phase 17 Branch Builder
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-phase17:
+    if: github.head_ref == 'feat/phase17-complete-roundtrip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply source slice
+        run: python scripts/apply_phase17_protocol_store.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Check Rust workspace
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Commit generated implementation
+        run: |
+          if git diff --quiet; then
+            echo 'No generated changes'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add proto crates scripts
+          git commit -m 'feat(store): persist authenticated terminal results and outbox'
+          git push origin HEAD:${{ github.head_ref }}
