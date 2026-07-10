@@ -96,13 +96,11 @@ sender keryxd SendTask
 
 A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
 
-Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`, with deterministic selection, exact skill/capability filters, bounded long polling, and lease-safe concurrent claims.
+Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`. Phase 17.3 makes Python `serve_forever()` a real worker runtime: it claims matching tasks, invokes registered handlers, maintains leases with heartbeats, and persists local completion or failure.
 
 Missing today:
 
-- Python `serve_forever()` consumption of the available `ClaimNextTask` worker API
 - transport-authenticated sender identity attached to the claimed envelope
-- Python `serve_forever()` dispatch into registered `on_task()` handlers
 - authenticated terminal result/artifact routing back to the origin
 - a remotely updated `TaskHandle.wait()`
 - a repeatable two-daemon/two-edge-node Agency E2E
@@ -144,11 +142,11 @@ Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, 
 
 Current compatibility limits:
 
-- `serve_forever()` keeps the SDK process alive but does not claim daemon tasks or invoke registered task handlers.
+- `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
 - `send_task()` can submit through a configured daemon/relay route, but its compatibility `TaskHandle` is not attached to a remote terminal-status/result stream.
 - `IncomingTask.complete()` / `.fail()` are not yet wired to a durable relay result route.
 
-The SDK default daemon endpoint is `unix:///tmp/keryx-daemon.sock`; most repository examples override it to `127.0.0.1:50051` / `http://127.0.0.1:50051` for the current daemon binary and CLI.
+The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
 
 ## Dual-run defaults
 
