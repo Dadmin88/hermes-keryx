@@ -177,6 +177,9 @@ def edge_env(
     key_path: Path,
     skills: str = "",
 ) -> dict[str, str]:
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    seed = 1 if peer_id == SENDER_PEER else 2
+    key_path.write_bytes(bytes([seed]) + bytes(31))
     env = base_env()
     env.update(
         {
@@ -252,8 +255,8 @@ async def wait_for_skill(node: KeryxNode, timeout: float = 20.0) -> None:
 
 async def send_and_assert(sender_port: int, registry_port: int) -> None:
     node = KeryxNode(
-        daemon_endpoint=f"http://127.0.0.1:{sender_port}",
-        registry_endpoint=f"http://127.0.0.1:{registry_port}",
+        daemon_endpoint=f"127.0.0.1:{sender_port}",
+        registry_endpoint=f"127.0.0.1:{registry_port}",
         worker_id="phase17-sender",
     )
     await node.start()
@@ -334,7 +337,7 @@ def supervisor(args: argparse.Namespace) -> int:
                 "listen_addresses": ["tcp:0"],
                 "bootstrap_peers": [],
                 "enable_mdns": False,
-                "keypair_path": str(work_dir / "relay.key"),
+                "keypair_path": None,
                 "max_circuits": 16,
                 "max_reservations": 16,
                 "max_reservations_per_peer": 4,
@@ -417,7 +420,7 @@ def supervisor(args: argparse.Namespace) -> int:
                 str(Path(__file__).resolve()),
                 "--worker",
                 "--daemon-endpoint",
-                f"http://127.0.0.1:{receiver_port}",
+                f"127.0.0.1:{receiver_port}",
                 "--signal-path",
                 str(worker_signal),
             ],
