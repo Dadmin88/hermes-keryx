@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make the two-node harness create deterministic test keypair seeds."""
+"""Harden deterministic identities and Python endpoints in the two-node harness."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,5 +18,17 @@ text = text.replace(
 text = text.replace(
     '                "keypair_path": str(work_dir / "relay.key"),',
     '                "keypair_path": None,',
+)
+text = text.replace(
+    '        daemon_endpoint=f"http://127.0.0.1:{sender_port}",',
+    '        daemon_endpoint=f"127.0.0.1:{sender_port}",',
+)
+text = text.replace(
+    '        registry_endpoint=f"http://127.0.0.1:{registry_port}",',
+    '        registry_endpoint=f"127.0.0.1:{registry_port}",',
+)
+text = text.replace(
+    '                f"http://127.0.0.1:{receiver_port}",',
+    '                f"127.0.0.1:{receiver_port}",',
 )
 path.write_text(text)
