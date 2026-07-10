@@ -69,6 +69,8 @@ jobs:
         run: python scripts/fix_phase17_relay_config.py
       - name: Update relay-frame tests for the result schema
         run: python scripts/fix_phase17_incoming_test.py
+      - name: Update authenticated relay publisher tests
+        run: python scripts/fix_phase17_routing_tests.py
       - name: Format
         run: cargo fmt --all
       - name: Check workspace
@@ -105,7 +107,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add proto crates sdk scripts
-          git commit -m 'fix(phase17): finalize clean-checkout verification'
+          git commit -m 'fix(phase17): finalize authenticated clean-checkout verification'
           git push origin HEAD:${{ github.head_ref }}
       - name: Fail unsuccessful verification
         if: steps.verify.outputs.status != '0'
