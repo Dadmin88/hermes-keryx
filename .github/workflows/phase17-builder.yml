@@ -60,6 +60,7 @@ jobs:
       - name: Apply authenticated relay source binding once
         run: |
           if ! grep -q 'NODE_TOKEN_METADATA_KEY' crates/keryx-relay/src/health_server.rs; then
+            python scripts/fix_phase17_auth_builder.py
             python scripts/apply_phase17_relay_auth.py
           else
             echo 'Authenticated relay source binding is already committed'
