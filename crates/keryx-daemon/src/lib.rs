@@ -634,6 +634,28 @@ impl KeryxDaemonRuntime {
         &self.store
     }
 
+    pub async fn accept_pending_task_with_backpressure(
+        &self,
+        record: TaskRecord,
+        envelope_bytes: u64,
+    ) -> StoreResult<TaskRecord> {
+        self.config
+            .limits()
+            .check_envelope_bytes(envelope_bytes)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let _submit_backpressure_guard = self.submit_backpressure_lock.lock().await;
+        let pending_count = self.count_pending_tasks_for_backpressure().await?;
+        self.config
+            .limits()
+            .check_pending_tasks(pending_count)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        self.store.accept_task(record).await
+    }
+
+    async fn count_pending_tasks_for_backpressure(&self) -> StoreResult<u64> {
+        self.store.count_tasks_by_status(TaskStatus::Pending).await
+    }
+
     #[must_use]
     pub const fn report(&self) -> &StartupReport {
         &self.report
@@ -795,11 +817,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task_id = parse_required_task_id(envelope.task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
+        let envelope_bytes = envelope.encoded_len() as u64;
         let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
         let accepted = self
             .runtime
-            .store()
-            .accept_task(record)
+            .accept_pending_task_with_backpressure(record, envelope_bytes)
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_submitted();
@@ -1125,6 +1147,28 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         }
         let target_peer_id =
             PeerId::new(trimmed).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.runtime
+            .config()
+            .limits()
+            .check_envelope_bytes(envelope.encoded_len() as u64)
+            .map_err(limit_exceeded_to_status)?;
+        let _submit_backpressure_guard = if target_peer_id == *self.runtime.config().local_peer_id()
+        {
+            let guard = self.runtime.submit_backpressure_lock.lock().await;
+            let pending_count = self
+                .runtime
+                .count_pending_tasks_for_backpressure()
+                .await
+                .map_err(store_error_to_status)?;
+            self.runtime
+                .config()
+                .limits()
+                .check_pending_tasks(pending_count)
+                .map_err(limit_exceeded_to_status)?;
+            Some(guard)
+        } else {
+            None
+        };
         let outcome = self
             .runtime
             .router()
