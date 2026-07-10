@@ -42,3 +42,9 @@ replace_once(
         )),
         StoreError::ArtifactNotFound(artifact_id) => {''',
 )
+
+replace_once(
+    "crates/keryx-cli/tests/daemon_client.rs",
+    "store: ready sqlite schema_version=5 supported_schema_version=5",
+    "store: ready sqlite schema_version=6 supported_schema_version=6",
+)
