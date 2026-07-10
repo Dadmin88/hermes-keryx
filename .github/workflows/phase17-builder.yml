@@ -23,7 +23,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Apply source slice
-        run: python scripts/apply_phase17_protocol_store.py
+        run: |
+          python scripts/apply_phase17_protocol_store.py
+          python scripts/fix_phase17_store_build.py
       - name: Format
         run: cargo fmt --all
       - name: Check Rust workspace
