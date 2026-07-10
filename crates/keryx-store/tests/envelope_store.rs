@@ -71,7 +71,7 @@ fn in_memory_rejects_mismatched_ids_without_accepting_task() {
 }
 
 #[tokio::test]
-async fn sqlite_envelope_survives_reopen_and_schema_is_v6() {
+async fn sqlite_envelope_survives_reopen_and_schema_is_v7() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("keryx.sqlite3");
     let task = task("sqlite-envelope", "sqlite-envelope-idem");
@@ -83,7 +83,7 @@ async fn sqlite_envelope_survives_reopen_and_schema_is_v6() {
         store.schema_version().await.unwrap(),
         CURRENT_SCHEMA_VERSION
     );
-    assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 7);
     store
         .accept_task_with_envelope(task.clone(), stored_envelope.clone())
         .await

@@ -1881,6 +1881,55 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             "task envelope conflicts with the stored envelope for task {}",
             task_id.as_str()
         )),
+        StoreError::TransportContextNotFound(task_id) => Status::not_found(format!(
+            "transport context not found for task {}",
+            task_id.as_str()
+        )),
+        StoreError::TransportContextConflict(task_id) => Status::already_exists(format!(
+            "transport context conflicts for task {}",
+            task_id.as_str()
+        )),
+        StoreError::TransportContextTaskMismatch {
+            task_id,
+            context_task_id,
+        } => Status::failed_precondition(format!(
+            "transport context task {} does not match task {}",
+            context_task_id.as_str(),
+            task_id.as_str()
+        )),
+        StoreError::TerminalResultNotFound(task_id) => Status::not_found(format!(
+            "terminal result not found for task {}",
+            task_id.as_str()
+        )),
+        StoreError::TerminalResultConflict(task_id) => Status::already_exists(format!(
+            "terminal result conflicts for task {}",
+            task_id.as_str()
+        )),
+        StoreError::TerminalResultTaskMismatch {
+            task_id,
+            result_task_id,
+        } => Status::failed_precondition(format!(
+            "terminal result task {} does not match task {}",
+            result_task_id.as_str(),
+            task_id.as_str()
+        )),
+        StoreError::TerminalResultNotTerminal(task_id) => Status::failed_precondition(format!(
+            "terminal result for task {} is not terminal",
+            task_id.as_str()
+        )),
+        StoreError::ResultDeliveryLeaseMismatch(delivery_id) => {
+            Status::permission_denied(format!("result delivery lease mismatch: {delivery_id}"))
+        }
+        StoreError::RemoteResultExecutorMismatch {
+            task_id,
+            expected,
+            actual,
+        } => Status::permission_denied(format!(
+            "remote result executor mismatch for task {}: expected {}, got {}",
+            task_id.as_str(),
+            expected.as_str(),
+            actual.as_str()
+        )),
         StoreError::ArtifactNotFound(artifact_id) => {
             Status::not_found(format!("artifact not found: {artifact_id}"))
         }
