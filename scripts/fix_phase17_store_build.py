@@ -76,10 +76,15 @@ if addition not in text:
     text = text.replace(anchor, addition, 1)
 daemon.write_text(text)
 
-cli_test = ROOT / "crates/keryx-cli/tests/daemon_client.rs"
-text = cli_test.read_text()
-text = text.replace(
-    "store: ready sqlite schema_version=6 supported_schema_version=6",
-    "store: ready sqlite schema_version=7 supported_schema_version=7",
-)
-cli_test.write_text(text)
+for relative in [
+    "crates/keryx-cli/tests/daemon_client.rs",
+    "crates/keryx-store/tests/artifact_store.rs",
+]:
+    path = ROOT / relative
+    text = path.read_text()
+    text = text.replace(
+        "store: ready sqlite schema_version=6 supported_schema_version=6",
+        "store: ready sqlite schema_version=7 supported_schema_version=7",
+    )
+    text = text.replace("schema_version().await.unwrap(), 6", "schema_version().await.unwrap(), 7")
+    path.write_text(text)
