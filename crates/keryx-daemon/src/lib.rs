@@ -8,6 +8,7 @@ mod incoming;
 mod lease_recovery_loop;
 mod routing;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,19 +23,20 @@ use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
     keryx_daemon_server::{KeryxDaemon, KeryxDaemonServer},
     AgentId as ProtoAgentId, ArtifactId as ProtoArtifactId, ArtifactSummary, CancelTaskRequest,
-    CancelTaskResponse, ClaimTaskRequest, ClaimTaskResponse, CompleteTaskRequest,
-    CompleteTaskResponse, DeleteArtifactRequest, DeleteArtifactResponse, DiscoverSkillsRequest,
-    DiscoverSkillsResponse, DoctorRequest, DoctorResponse, FailTaskRequest, FailTaskResponse,
-    GetArtifactRequest, GetArtifactResponse, HeartbeatRequest, HeartbeatResponse,
-    IdempotencyKey as ProtoIdempotencyKey, LeaseId as ProtoLeaseId, ListArtifactsRequest,
-    ListArtifactsResponse, ListPeersRequest, ListPeersResponse, LivenessRequest, LivenessResponse,
-    PeerDescriptor, PutArtifactRequest, PutArtifactResponse, ReadinessRequest, ReadinessResponse,
-    SendTaskRequest, SendTaskResponse, StatusRequest, StatusResponse, SubmitTaskRequest,
-    SubmitTaskResponse, TaskId as ProtoTaskId,
+    CancelTaskResponse, ClaimNextTaskRequest, ClaimNextTaskResponse, ClaimTaskRequest,
+    ClaimTaskResponse, CompleteTaskRequest, CompleteTaskResponse, DeleteArtifactRequest,
+    DeleteArtifactResponse, DiscoverSkillsRequest, DiscoverSkillsResponse, DoctorRequest,
+    DoctorResponse, FailTaskRequest, FailTaskResponse, GetArtifactRequest, GetArtifactResponse,
+    HeartbeatRequest, HeartbeatResponse, IdempotencyKey as ProtoIdempotencyKey,
+    LeaseId as ProtoLeaseId, ListArtifactsRequest, ListArtifactsResponse, ListPeersRequest,
+    ListPeersResponse, LivenessRequest, LivenessResponse, PeerDescriptor, PutArtifactRequest,
+    PutArtifactResponse, ReadinessRequest, ReadinessResponse, SendTaskRequest, SendTaskResponse,
+    StatusRequest, StatusResponse, SubmitTaskRequest, SubmitTaskResponse, TaskEnvelope,
+    TaskId as ProtoTaskId,
 };
 use prost::Message;
 use tokio::sync::watch;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
@@ -61,6 +63,9 @@ pub use routing::{
     PeerDirectory, PeerInfo, RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter,
     DEFAULT_SEND_TASK_TIMEOUT_MS,
 };
+
+const CLAIM_NEXT_SCAN_LIMIT: usize = 256;
+const MAX_CLAIM_NEXT_WAIT_MS: u64 = 30_000;
 
 /// Default background health probe interval.
 const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 60_000;
@@ -492,6 +497,7 @@ pub struct KeryxDaemonRuntime {
     discovery: Arc<RwLock<Option<Arc<DiscoveryHandle>>>>,
     submit_backpressure_lock: Arc<Mutex<()>>,
     cancellation: Arc<CancellationState>,
+    task_available: Arc<Notify>,
 }
 
 impl KeryxDaemonRuntime {
@@ -544,6 +550,7 @@ impl KeryxDaemonRuntime {
             discovery,
             submit_backpressure_lock: Arc::new(Mutex::new(())),
             cancellation: Arc::new(CancellationState::new()),
+            task_available: Arc::new(Notify::new()),
         };
         if let Some(settings) = runtime.config.discovery.clone() {
             runtime
@@ -774,7 +781,35 @@ impl KeryxDaemonRuntime {
             .limits()
             .check_pending_tasks(pending_count)
             .map_err(|error| StoreError::Validation(error.into()))?;
-        self.store.accept_task(record).await
+        let accepted = self.store.accept_task(record).await?;
+        self.task_available.notify_waiters();
+        Ok(accepted)
+    }
+
+    pub async fn accept_pending_task_with_envelope_backpressure(
+        &self,
+        record: TaskRecord,
+        envelope: TaskEnvelopeRecord,
+    ) -> StoreResult<TaskRecord> {
+        self.config
+            .limits()
+            .check_envelope_bytes(envelope.encoded_envelope.len() as u64)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let _submit_backpressure_guard = self.submit_backpressure_lock.lock().await;
+        let pending_count = self
+            .store
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await?;
+        self.config
+            .limits()
+            .check_pending_tasks(pending_count)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let accepted = self
+            .store
+            .accept_task_with_envelope(record, envelope)
+            .await?;
+        self.task_available.notify_waiters();
+        Ok(accepted)
     }
 
     #[must_use]
@@ -853,6 +888,79 @@ impl KeryxDaemonRpcService {
         Self {
             runtime: Arc::new(runtime),
         }
+    }
+
+    async fn try_claim_next_task(
+        &self,
+        worker_id: &AgentId,
+        accepted_skill_ids: &HashSet<String>,
+        accepted_capability_ids: &HashSet<String>,
+        lease_duration_ms: i64,
+    ) -> Result<Option<ClaimNextTaskResponse>, Status> {
+        let candidates = self
+            .runtime
+            .store()
+            .pending_task_envelopes(CLAIM_NEXT_SCAN_LIMIT)
+            .await
+            .map_err(store_error_to_status)?;
+        for candidate in candidates {
+            let envelope = TaskEnvelope::decode(candidate.envelope.encoded_envelope.as_slice())
+                .map_err(|error| {
+                    Status::data_loss(format!(
+                        "stored envelope for task {} is invalid: {error}",
+                        candidate.task.task_id().as_str()
+                    ))
+                })?;
+            if !envelope_matches_claim_filters(
+                &envelope,
+                accepted_skill_ids,
+                accepted_capability_ids,
+            ) {
+                continue;
+            }
+
+            let leased_at_ms = unix_ms_now();
+            let expires_at_ms = leased_at_ms.saturating_add(lease_duration_ms);
+            let lease_id = new_lease_id(candidate.task.task_id(), leased_at_ms);
+            let lease = LeaseRecord::new(
+                lease_id.clone(),
+                candidate.task.task_id().clone(),
+                worker_id.clone(),
+                leased_at_ms,
+                expires_at_ms,
+            );
+            match self
+                .runtime
+                .store()
+                .lease_task(candidate.task.task_id(), lease)
+                .await
+            {
+                Ok(task) => {
+                    self.runtime.metrics().increment_tasks_claimed();
+                    return Ok(Some(ClaimNextTaskResponse {
+                        has_task: true,
+                        envelope: Some(envelope),
+                        task_id: Some(proto_task_id(task.task_id())),
+                        lease_id: Some(proto_lease_id(&lease_id)),
+                        worker_id: Some(proto_agent_id(worker_id)),
+                        leased_at_ms,
+                        expires_at_ms,
+                        status: task_status_label(task.status).to_string(),
+                        retry_count: task.retry_count,
+                        dead_lettered: task.dead_lettered,
+                        sender_peer_id: String::new(),
+                    }));
+                }
+                Err(StoreError::LeaseConflict { .. } | StoreError::TaskNotFound(_)) => {
+                    continue;
+                }
+                Err(StoreError::Validation(ValidationError::InvalidTaskTransition { .. })) => {
+                    continue;
+                }
+                Err(error) => return Err(store_error_to_status(error)),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1003,22 +1111,9 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
         let envelope_record =
             TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
-        let _submit_backpressure_guard = self.runtime.submit_backpressure_lock.lock().await;
-        let pending_count = self
-            .runtime
-            .store()
-            .count_tasks_by_status(TaskStatus::Pending)
-            .await
-            .map_err(store_error_to_status)?;
-        self.runtime
-            .config()
-            .limits()
-            .check_pending_tasks(pending_count)
-            .map_err(limit_exceeded_to_status)?;
         let accepted = self
             .runtime
-            .store()
-            .accept_task_with_envelope(record, envelope_record)
+            .accept_pending_task_with_envelope_backpressure(record, envelope_record)
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_submitted();
@@ -1072,6 +1167,54 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             retry_count: task.retry_count,
             dead_lettered: task.dead_lettered,
         }))
+    }
+
+    #[instrument(
+        name = "keryx::rpc::claim_next_task",
+        skip(self, request),
+        fields(worker_id = tracing::field::Empty)
+    )]
+    async fn claim_next_task(
+        &self,
+        request: Request<ClaimNextTaskRequest>,
+    ) -> Result<Response<ClaimNextTaskResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        let inner = request.into_inner();
+        let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+        tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let accepted_skill_ids = normalized_filter_set(inner.accepted_skill_ids);
+        let accepted_capability_ids = normalized_filter_set(inner.accepted_capability_ids);
+        let lease_duration_ms =
+            normalize_lease_duration_ms(inner.lease_duration_ms, self.runtime.config());
+        let wait_timeout_ms = normalize_claim_wait_ms(inner.wait_timeout_ms);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_timeout_ms);
+
+        loop {
+            let notified = self.runtime.task_available.notified();
+            if let Some(response) = self
+                .try_claim_next_task(
+                    &worker_id,
+                    &accepted_skill_ids,
+                    &accepted_capability_ids,
+                    lease_duration_ms,
+                )
+                .await?
+            {
+                return Ok(Response::new(response));
+            }
+            if wait_timeout_ms == 0 || tokio::time::Instant::now() >= deadline {
+                return Ok(Response::new(empty_claim_next_response()));
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Ok(Response::new(empty_claim_next_response()));
+                }
+                _ = self.runtime.shutdown.grpc_shutdown_wait() => {
+                    return Err(Status::unavailable("daemon is shutting down"));
+                }
+            }
+        }
     }
 
     #[instrument(
@@ -1449,6 +1592,75 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         test_rpc_delay().await;
         let response = self.runtime.discover_skills(request.into_inner()).await?;
         Ok(Response::new(response))
+    }
+}
+
+fn normalized_filter_set(values: Vec<String>) -> HashSet<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn metadata_matches_any(
+    envelope: &TaskEnvelope,
+    keys: &[&str],
+    accepted: &HashSet<String>,
+) -> bool {
+    if accepted.is_empty() {
+        return true;
+    }
+    keys.iter()
+        .filter_map(|key| envelope.metadata.get(*key))
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| accepted.contains(value))
+}
+
+fn envelope_matches_claim_filters(
+    envelope: &TaskEnvelope,
+    accepted_skill_ids: &HashSet<String>,
+    accepted_capability_ids: &HashSet<String>,
+) -> bool {
+    metadata_matches_any(
+        envelope,
+        &["skill", "skill_id", "target_skill_id", "skills"],
+        accepted_skill_ids,
+    ) && metadata_matches_any(
+        envelope,
+        &[
+            "capability",
+            "capability_id",
+            "target_capability_id",
+            "capabilities",
+        ],
+        accepted_capability_ids,
+    )
+}
+
+fn normalize_claim_wait_ms(wait_timeout_ms: i64) -> u64 {
+    if wait_timeout_ms <= 0 {
+        0
+    } else {
+        (wait_timeout_ms as u64).min(MAX_CLAIM_NEXT_WAIT_MS)
+    }
+}
+
+fn empty_claim_next_response() -> ClaimNextTaskResponse {
+    ClaimNextTaskResponse {
+        has_task: false,
+        envelope: None,
+        task_id: None,
+        lease_id: None,
+        worker_id: None,
+        leased_at_ms: 0,
+        expires_at_ms: 0,
+        status: String::new(),
+        retry_count: 0,
+        dead_lettered: false,
+        sender_peer_id: String::new(),
     }
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use keryx_core::{AgentId, IdempotencyKey, LeaseId, TaskId, TaskStatus};
 use keryx_proto::v1::{RelayFrame, TaskEnvelope};
-use keryx_store::{LeaseRecord, StoreError, StoreResult, TaskRecord};
+use keryx_store::{LeaseRecord, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord};
 use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -163,11 +163,12 @@ pub async fn handle_incoming_task(
         Ok(key) => key,
         Err(message) => return IncomingHandleResult::InvalidEnvelope(message),
     };
-    let envelope_bytes = incoming.envelope.encoded_len() as u64;
+    let encoded_envelope = incoming.envelope.encode_to_vec();
 
     let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
     let accepted = match runtime
-        .accept_pending_task_with_backpressure(record, envelope_bytes)
+        .accept_pending_task_with_envelope_backpressure(record, envelope_record)
         .await
     {
         Ok(task) => task,

@@ -64,6 +64,11 @@ class KeryxDaemonStub:
                 request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskResponse.FromString,
                 _registered_method=True)
+        self.ClaimNextTask = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxDaemon/ClaimNextTask',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskResponse.FromString,
+                _registered_method=True)
         self.Heartbeat = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxDaemon/Heartbeat',
                 request_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.HeartbeatRequest.SerializeToString,
@@ -155,6 +160,12 @@ class KeryxDaemonServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ClaimTask(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ClaimNextTask(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -258,6 +269,11 @@ def add_KeryxDaemonServicer_to_server(servicer, server):
                     servicer.ClaimTask,
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskResponse.SerializeToString,
+            ),
+            'ClaimNextTask': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClaimNextTask,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskResponse.SerializeToString,
             ),
             'Heartbeat': grpc.unary_unary_rpc_method_handler(
                     servicer.Heartbeat,
@@ -477,6 +493,33 @@ class KeryxDaemon:
             '/hermes.keryx.v1.KeryxDaemon/ClaimTask',
             hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskRequest.SerializeToString,
             hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ClaimNextTask(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxDaemon/ClaimNextTask',
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_daemon__pb2.ClaimNextTaskResponse.FromString,
             options,
             channel_credentials,
             insecure,
