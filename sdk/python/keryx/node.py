@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from keryx.card import AgentCard
-from keryx.client import DaemonClient
+from keryx.client import DaemonClient, default_daemon_endpoint
 from keryx.task import IncomingTask, Message, Part, Task, TaskHandle, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ class KeryxNode:
         self._status_callback = status_callback
         default_daemon = os.environ.get(
             "HERMES_KERYX_DAEMON_ENDPOINT",
-            "unix:///tmp/keryx-daemon.sock",
+            default_daemon_endpoint(),
         )
         self._daemon_endpoint = daemon_endpoint or daemon_addr or default_daemon
         self._registry_endpoint = registry_endpoint or os.environ.get("HERMES_KERYX_REGISTRY_ENDPOINT")

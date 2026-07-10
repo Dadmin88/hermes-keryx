@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import socket
+import stat
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +25,68 @@ from hermes.keryx.v1 import (  # noqa: E402
     registry_pb2_grpc,
     task_pb2,
 )
+
+
+def default_daemon_endpoint() -> str:
+    socket_path = (
+        Path.home().expanduser() / ".hermes" / "keryx" / "run" / "keryx-daemon.sock"
+    )
+    return f"unix://{socket_path}"
+
+
+def _unix_socket_path(endpoint: str) -> Path | None:
+    if not endpoint.startswith("unix://"):
+        return None
+    return Path(endpoint.removeprefix("unix://")).expanduser()
+
+
+def _validate_unix_socket_endpoint(endpoint: str) -> None:
+    path = _unix_socket_path(endpoint)
+    if path is None:
+        return
+
+    try:
+        parent_stat = path.parent.stat()
+        socket_stat = path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"daemon socket does not exist: {path}") from exc
+
+    current_uid = os.getuid()
+    if parent_stat.st_uid != current_uid:
+        raise RuntimeError(
+            f"daemon socket directory is not owned by the current user: {path.parent}"
+        )
+    if parent_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError(
+            "daemon socket directory must not be accessible by group or other users: "
+            f"{path.parent}"
+        )
+    if socket_stat.st_uid != current_uid:
+        raise RuntimeError(f"daemon socket is not owned by the current user: {path}")
+    if not stat.S_ISSOCK(socket_stat.st_mode):
+        raise RuntimeError(f"daemon endpoint is not a Unix socket: {path}")
+    if socket_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(
+            f"daemon socket must not be writable by group or other users: {path}"
+        )
+
+
+def _assert_unix_peer_owned_by_current_user(endpoint: str) -> None:
+    path = _unix_socket_path(endpoint)
+    if path is None or not hasattr(socket, "SO_PEERCRED"):
+        return
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.connect(str(path))
+            credentials = probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    except OSError as exc:
+        raise RuntimeError(f"daemon socket peer could not be verified: {path}") from exc
+    _, peer_uid, _ = struct.unpack("3i", credentials)
+    if peer_uid != os.getuid():
+        raise RuntimeError(
+            f"daemon socket peer is not owned by the current user: {path}"
+        )
 
 
 def _grpc_target(endpoint: str) -> str:
@@ -51,7 +116,9 @@ class DaemonClient:
         registry_channel: grpc.aio.Channel | None = None,
     ) -> None:
         self._daemon_endpoint = daemon_endpoint
-        self._registry_endpoint = registry_endpoint or os.environ.get("HERMES_KERYX_REGISTRY_ENDPOINT")
+        self._registry_endpoint = registry_endpoint or os.environ.get(
+            "HERMES_KERYX_REGISTRY_ENDPOINT"
+        )
         self._channel = channel
         self._registry_channel = registry_channel
         self._daemon: daemon_pb2_grpc.KeryxDaemonStub | None = None
@@ -59,7 +126,11 @@ class DaemonClient:
 
     async def connect(self) -> None:
         if self._channel is None:
-            self._channel = grpc.aio.insecure_channel(_grpc_target(self._daemon_endpoint))
+            _validate_unix_socket_endpoint(self._daemon_endpoint)
+            _assert_unix_peer_owned_by_current_user(self._daemon_endpoint)
+            self._channel = grpc.aio.insecure_channel(
+                _grpc_target(self._daemon_endpoint)
+            )
         self._daemon = daemon_pb2_grpc.KeryxDaemonStub(self._channel)
         if self._registry_endpoint:
             if self._registry_channel is None:

@@ -50,7 +50,7 @@ asyncio.run(main())
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HERMES_KERYX_DAEMON_ENDPOINT` | `127.0.0.1:50051` | keryx-daemon gRPC |
+| `HERMES_KERYX_DAEMON_ENDPOINT` | `unix://~/.hermes/keryx/run/keryx-daemon.sock` | keryx-daemon gRPC |
 | `HERMES_KERYX_REGISTRY_ENDPOINT` | derived from relay / `127.0.0.1:50053` | relay skill registry |
 
 ## Tests
