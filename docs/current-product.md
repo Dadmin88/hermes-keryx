@@ -34,7 +34,7 @@ Operational outcomes are metadata/events rather than extra task status values:
 `proto/hermes/keryx/v1/daemon.proto` implements:
 
 - health/operator: `Status`, `Doctor`, `Liveness`, `Readiness`
-- worker lifecycle: `SubmitTask`, `ClaimTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
+- worker lifecycle: `SubmitTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
 - artifacts: `PutArtifact`, `GetArtifact`, `ListArtifacts`, `DeleteArtifact`
 - routing/discovery: `SendTask`, `ListPeers`, `DiscoverSkills`
 
@@ -96,11 +96,11 @@ sender keryxd SendTask
 
 A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
 
-Phase 17.1 is complete at the storage/daemon layer: relay-delivered envelopes can survive destination-daemon restart without losing their task messages or context.
+Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`, with deterministic selection, exact skill/capability filters, bounded long polling, and lease-safe concurrent claims.
 
 Missing today:
 
-- an atomic claim-next or pending-task delivery API for workers
+- Python `serve_forever()` consumption of the available `ClaimNextTask` worker API
 - transport-authenticated sender identity attached to the claimed envelope
 - Python `serve_forever()` dispatch into registered `on_task()` handlers
 - authenticated terminal result/artifact routing back to the origin
@@ -140,7 +140,7 @@ The Python package is `keryx` and exports:
 - `Task`, `IncomingTask`, `TaskHandle`, `TaskStatus`
 - `peer_id_to_did_key`, `register_agent`, `deregister_agent`
 
-Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
+Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `claim_next`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
 
 Current compatibility limits:
 

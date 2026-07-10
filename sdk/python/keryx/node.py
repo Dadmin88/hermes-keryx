@@ -17,7 +17,7 @@ import grpc
 from keryx.card import AgentCard
 from keryx.client import DaemonClient, default_daemon_endpoint
 from keryx.config import KeryxConfig, grpc_target, load_config
-from keryx.models import TaskArtifact, TaskResult, TaskState
+from keryx.models import ClaimedTask, TaskArtifact, TaskResult, TaskState
 from keryx.task import (
     IncomingTask,
     Message,
@@ -243,6 +243,36 @@ class KeryxNode:
 
     async def claim_task(self, *args: Any, **kwargs: Any) -> TaskState:
         return await self.claim(*args, **kwargs)
+
+
+    async def claim_next(
+        self,
+        *,
+        worker_id: str | None = None,
+        accepted_skill_ids: Sequence[str] | None = None,
+        accepted_capability_ids: Sequence[str] | None = None,
+        lease_duration_ms: int | None = None,
+        wait_timeout_ms: int = 0,
+    ) -> ClaimedTask:
+        daemon = await self._daemon()
+        worker = self._resolve_worker_id(worker_id)
+        response = await daemon.ClaimNextTask(
+            daemon_pb2.ClaimNextTaskRequest(
+                worker_id=common_pb2.AgentId(value=worker),
+                accepted_skill_ids=list(accepted_skill_ids or []),
+                accepted_capability_ids=list(accepted_capability_ids or []),
+                lease_duration_ms=(
+                    self._config.default_lease_duration_ms
+                    if lease_duration_ms is None
+                    else lease_duration_ms
+                ),
+                wait_timeout_ms=wait_timeout_ms,
+            )
+        )
+        return ClaimedTask.from_proto(response)
+
+    async def claim_next_task(self, **kwargs: Any) -> ClaimedTask:
+        return await self.claim_next(**kwargs)
 
     async def heartbeat(
         self,
