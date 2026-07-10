@@ -138,7 +138,20 @@ fixture_new = (
 fixture_count = fixture_text.count(fixture_old)
 if fixture_count != 3:
     raise SystemExit(f"{STORE}: expected 3 explicit InMemoryState fixtures, found {fixture_count}")
-fixture_path.write_text(fixture_text.replace(fixture_old, fixture_new), encoding="utf-8")
+fixture_text = fixture_text.replace(fixture_old, fixture_new)
+
+nested_old = "                envelopes: HashMap::new(),\\n            }),"
+nested_new = (
+    "                envelopes: HashMap::new(),\\n"
+    "                results: HashMap::new(),\\n"
+    "                result_outbox: HashMap::new(),\\n"
+    "            }),"
+)
+nested_count = fixture_text.count(nested_old)
+if nested_count != 1:
+    raise SystemExit(f"{STORE}: expected 1 nested InMemoryState fixture, found {nested_count}")
+fixture_text = fixture_text.replace(nested_old, nested_new)
+fixture_path.write_text(fixture_text, encoding="utf-8")
 
 '''
 text = text[:start] + fixture_patch + text[end:]
