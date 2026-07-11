@@ -206,15 +206,10 @@ impl RelayRuntime {
             return false;
         }
         let mut guard = self.lock_peers();
-        let mut matched = false;
         for mailbox in guard.mailboxes.values_mut() {
-            mailbox.retain(|frame| {
-                let remove = frame_task_id(frame).as_deref() == Some(task_id);
-                matched |= remove;
-                !remove
-            });
+            mailbox.retain(|frame| frame_task_id(frame).as_deref() != Some(task_id));
         }
-        matched || true
+        true
     }
 
     #[must_use]
