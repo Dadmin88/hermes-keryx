@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,15 @@ def _bind_socket(path: Path) -> socket.socket:
     return sock
 
 
+@pytest.fixture
+def short_socket_dir() -> Iterator[Path]:
+    # Linux limits AF_UNIX path names to roughly 108 bytes. Keep the bind path
+    # short even when pytest itself runs below a deeply nested temporary root.
+    temp_root = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+    with tempfile.TemporaryDirectory(prefix="kx-sock-", dir=temp_root) as directory:
+        yield Path(directory)
+
+
 def test_default_daemon_endpoint_uses_owner_run_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -29,21 +40,21 @@ def test_default_daemon_endpoint_uses_owner_run_directory(
     assert node._daemon_endpoint == endpoint
 
 
-def test_validate_unix_socket_rejects_world_writable_parent(tmp_path: Path) -> None:
-    socket_path = tmp_path / "keryx-daemon.sock"
+def test_validate_unix_socket_rejects_world_writable_parent(short_socket_dir: Path) -> None:
+    socket_path = short_socket_dir / "keryx-daemon.sock"
     sock = _bind_socket(socket_path)
     try:
-        tmp_path.chmod(0o777)
+        short_socket_dir.chmod(0o777)
         with pytest.raises(RuntimeError, match="directory must not be accessible"):
             _validate_unix_socket_endpoint(f"unix://{socket_path}")
     finally:
-        tmp_path.chmod(0o700)
+        short_socket_dir.chmod(0o700)
         sock.close()
 
 
-def test_validate_unix_socket_rejects_world_writable_socket(tmp_path: Path) -> None:
-    tmp_path.chmod(0o700)
-    socket_path = tmp_path / "keryx-daemon.sock"
+def test_validate_unix_socket_rejects_world_writable_socket(short_socket_dir: Path) -> None:
+    short_socket_dir.chmod(0o700)
+    socket_path = short_socket_dir / "keryx-daemon.sock"
     sock = _bind_socket(socket_path)
     try:
         socket_path.chmod(0o777)
@@ -53,9 +64,9 @@ def test_validate_unix_socket_rejects_world_writable_socket(tmp_path: Path) -> N
         sock.close()
 
 
-def test_validate_unix_socket_accepts_owner_only_socket(tmp_path: Path) -> None:
-    tmp_path.chmod(0o700)
-    socket_path = tmp_path / "keryx-daemon.sock"
+def test_validate_unix_socket_accepts_owner_only_socket(short_socket_dir: Path) -> None:
+    short_socket_dir.chmod(0o700)
+    socket_path = short_socket_dir / "keryx-daemon.sock"
     sock = _bind_socket(socket_path)
     try:
         socket_path.chmod(0o600)
