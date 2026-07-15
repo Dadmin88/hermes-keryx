@@ -1,7 +1,7 @@
 use anyhow::Result;
 use keryx_daemon::{
-    discovery_settings_from_env, relay_endpoint_from_env, serve_daemon_rpc, KeryxDaemonConfig,
-    KeryxDaemonRuntime,
+    daemon_rpc_token_from_env, discovery_settings_from_env, relay_endpoint_from_env,
+    serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +18,9 @@ async fn main() -> Result<()> {
     if let Some(relay_endpoint) = relay_endpoint_from_env() {
         config = config.with_relay_endpoint(Some(relay_endpoint));
     }
+    if let Some(token) = daemon_rpc_token_from_env() {
+        config = config.with_daemon_rpc_token(Some(token));
+    }
     let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await?);
     tracing::info!(
         component = "keryxd",
@@ -30,6 +33,10 @@ async fn main() -> Result<()> {
     );
 
     if let Some(addr) = daemon_addr()? {
+        anyhow::ensure!(
+            runtime.config().daemon_rpc_token().is_some(),
+            "HERMES_KERYX_DAEMON_TOKEN is required when HERMES_KERYX_DAEMON_ADDR enables RPC serving"
+        );
         let lease_recovery_loop = runtime.spawn_lease_recovery_loop();
         let deadline_enforcement_loop = runtime.spawn_deadline_enforcement_loop();
         let health_loop = runtime.spawn_health_loop();

@@ -114,6 +114,7 @@ Runtime files live under `~/.hermes/.keryx/` (`logs/`, `run/`, `data/`, `relay.j
 ```bash
 export HERMES_KERYX_DATA_DIR="${PWD}/.keryx-data"
 export HERMES_KERYX_DAEMON_ADDR=127.0.0.1:50051
+export HERMES_KERYX_DAEMON_TOKEN='<local-daemon-token>'
 ./target/release/keryxd
 ```
 
@@ -121,6 +122,7 @@ export HERMES_KERYX_DAEMON_ADDR=127.0.0.1:50051
 
 ```bash
 export HERMES_KERYX_DAEMON_ENDPOINT=http://127.0.0.1:50051
+export HERMES_KERYX_DAEMON_TOKEN='<local-daemon-token>'
 
 cargo run -p keryx-cli --bin keryx -- task submit my-task-id
 cargo run -p keryx-cli --bin keryx -- task claim my-task-id \
@@ -165,6 +167,7 @@ Environment:
 |----------|---------|
 | `HERMES_KERYX_DAEMON_ADDR` | Daemon bind address (`127.0.0.1:50051`) |
 | `HERMES_KERYX_DAEMON_ENDPOINT` | Client endpoint (`http://127.0.0.1:50051`) |
+| `HERMES_KERYX_DAEMON_TOKEN` | Bearer token required by daemon state-changing RPCs and sent by CLI task/artifact commands |
 | `HERMES_KERYX_REGISTRY_ENDPOINT` | Skill registry (`127.0.0.1:51053` dual-run default) |
 | `HERMES_KERYX_RELAY_CONFIG` | Path to relay config JSON/TOML |
 | `HERMES_KERYX_DATA_DIR` | SQLite/data root |

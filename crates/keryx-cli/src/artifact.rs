@@ -8,7 +8,7 @@ use keryx_proto::v1::{
     PutArtifactRequest, TaskId,
 };
 
-use crate::{connect_daemon, require_daemon_endpoint};
+use crate::{authorized_request, connect_daemon, require_daemon_endpoint};
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
@@ -50,14 +50,14 @@ pub async fn run(command: ArtifactCommand) -> Result<()> {
             })?;
             let media_type = media_type.unwrap_or_else(|| infer_media_type(&file_path));
             let response = client
-                .put_artifact(PutArtifactRequest {
+                .put_artifact(authorized_request(PutArtifactRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
                     artifact_id: id.map(|value| ArtifactId { value }),
                     media_type: media_type.clone(),
                     content,
-                })
+                }))
                 .await
                 .with_context(|| {
                     format!(
@@ -88,12 +88,12 @@ pub async fn run(command: ArtifactCommand) -> Result<()> {
             metadata_only,
         } => {
             let response = client
-                .get_artifact(GetArtifactRequest {
+                .get_artifact(authorized_request(GetArtifactRequest {
                     artifact_id: Some(ArtifactId {
                         value: artifact_id.clone(),
                     }),
                     metadata_only,
-                })
+                }))
                 .await
                 .with_context(|| {
                     format!("keryx artifact get: RPC failed for artifact {artifact_id}")
@@ -165,11 +165,11 @@ pub async fn run(command: ArtifactCommand) -> Result<()> {
         }
         ArtifactCommand::Ls { task_id } => {
             let response = client
-                .list_artifacts(ListArtifactsRequest {
+                .list_artifacts(authorized_request(ListArtifactsRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx artifact ls: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -192,11 +192,11 @@ pub async fn run(command: ArtifactCommand) -> Result<()> {
         }
         ArtifactCommand::Rm { artifact_id } => {
             let response = client
-                .delete_artifact(DeleteArtifactRequest {
+                .delete_artifact(authorized_request(DeleteArtifactRequest {
                     artifact_id: Some(ArtifactId {
                         value: artifact_id.clone(),
                     }),
-                })
+                }))
                 .await
                 .with_context(|| {
                     format!("keryx artifact rm: RPC failed for artifact {artifact_id}")

@@ -36,6 +36,7 @@ use prost::Message;
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
 
@@ -180,6 +181,7 @@ pub struct KeryxDaemonConfig {
     send_task_timeout_ms: u64,
     discovery: Option<DiscoverySettings>,
     relay_endpoint: Option<String>,
+    daemon_rpc_token: Option<String>,
 }
 
 impl KeryxDaemonConfig {
@@ -201,6 +203,7 @@ impl KeryxDaemonConfig {
             send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
             discovery: None,
             relay_endpoint: None,
+            daemon_rpc_token: None,
         }
     }
 
@@ -349,6 +352,19 @@ impl KeryxDaemonConfig {
     pub fn relay_endpoint(&self) -> Option<&str> {
         self.relay_endpoint.as_deref()
     }
+
+    #[must_use]
+    pub fn with_daemon_rpc_token(mut self, token: Option<String>) -> Self {
+        self.daemon_rpc_token = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn daemon_rpc_token(&self) -> Option<&str> {
+        self.daemon_rpc_token.as_deref()
+    }
 }
 
 const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
@@ -358,6 +374,17 @@ const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
 const DAEMON_REGISTRATION_TTL_ENV: &str = "HERMES_KERYX_DAEMON_REGISTRATION_TTL_SECONDS";
+const DAEMON_RPC_TOKEN_ENV: &str = "HERMES_KERYX_DAEMON_TOKEN";
+const DAEMON_AUTHORIZATION_HEADER: &str = "authorization";
+
+/// Build daemon RPC bearer-token authentication material from environment.
+#[must_use]
+pub fn daemon_rpc_token_from_env() -> Option<String> {
+    std::env::var(DAEMON_RPC_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 /// Build relay task publishing endpoint from environment when configured.
 #[must_use]
@@ -965,6 +992,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<SubmitTaskRequest>,
     ) -> Result<Response<SubmitTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let envelope = request
             .into_inner()
             .envelope
@@ -1014,6 +1042,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<ClaimTaskRequest>,
     ) -> Result<Response<ClaimTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
@@ -1064,6 +1093,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
@@ -1102,6 +1132,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<CompleteTaskRequest>,
     ) -> Result<Response<CompleteTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
@@ -1140,6 +1171,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<FailTaskRequest>,
     ) -> Result<Response<FailTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let lease_id = parse_required_lease_id(inner.lease_id.as_ref())?;
@@ -1181,6 +1213,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let reason = normalized_cancel_reason(&inner.reason);
@@ -1213,6 +1246,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<PutArtifactRequest>,
     ) -> Result<Response<PutArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
@@ -1258,6 +1292,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<GetArtifactRequest>,
     ) -> Result<Response<GetArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let inner = request.into_inner();
         let artifact_id = parse_required_artifact_id(inner.artifact_id.as_ref())?;
         tracing::Span::current()
@@ -1294,6 +1329,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<ListArtifactsRequest>,
     ) -> Result<Response<ListArtifactsResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let task_id = parse_required_task_id(request.into_inner().task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let artifacts = self
@@ -1318,6 +1354,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<DeleteArtifactRequest>,
     ) -> Result<Response<DeleteArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         let artifact_id = parse_required_artifact_id(request.into_inner().artifact_id.as_ref())?;
         tracing::Span::current()
             .record("artifact_id", tracing::field::display(artifact_id.as_str()));
@@ -1341,6 +1378,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<SendTaskRequest>,
     ) -> Result<Response<SendTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        authorize_daemon_mutation(&self.runtime, &request)?;
         test_rpc_delay().await;
         let inner = request.into_inner();
         let envelope = inner
@@ -1402,6 +1440,23 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         test_rpc_delay().await;
         let response = self.runtime.discover_skills(request.into_inner()).await?;
         Ok(Response::new(response))
+    }
+}
+
+fn authorize_daemon_mutation<T>(
+    runtime: &KeryxDaemonRuntime,
+    request: &Request<T>,
+) -> Result<(), Status> {
+    let Some(expected_token) = runtime.config().daemon_rpc_token() else {
+        return Ok(());
+    };
+    let expected = MetadataValue::try_from(format!("Bearer {expected_token}"))
+        .map_err(|_| Status::internal("configured daemon RPC token is invalid"))?;
+    match request.metadata().get(DAEMON_AUTHORIZATION_HEADER) {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(Status::unauthenticated(
+            "daemon RPC authorization is required",
+        )),
     }
 }
 

@@ -13,14 +13,16 @@ Minimum for a listening daemon:
 ```bash
 export HERMES_KERYX_DATA_DIR="${PWD}/.keryx-data"   # optional; default .keryx
 export HERMES_KERYX_DAEMON_ADDR=127.0.0.1:50051      # loopback only
+export HERMES_KERYX_DAEMON_TOKEN='<local-daemon-token>'
 ```
 
-`HERMES_KERYX_DAEMON_ADDR` must parse to a **loopback** address (`127.0.0.1` or `[::1]`). Wildcard or public IPs are rejected at startup.
+`HERMES_KERYX_DAEMON_ADDR` must parse to a **loopback** address (`127.0.0.1` or `[::1]`). Wildcard or public IPs are rejected at startup. When the daemon binds a gRPC listener, `HERMES_KERYX_DAEMON_TOKEN` must also be set; state-changing RPCs require `authorization: Bearer <token>`.
 
 Clients (CLI task commands, remote status):
 
 ```bash
 export HERMES_KERYX_DAEMON_ENDPOINT=http://127.0.0.1:50051
+export HERMES_KERYX_DAEMON_TOKEN='<local-daemon-token>'
 ```
 
 ### 2. Process bootstrap (`keryxd`)
@@ -192,6 +194,7 @@ See structured `rpc store error` logs for `grpc_code` and message.
 | `HERMES_KERYX_DATA_DIR` | `keryxd`, `keryx` CLI | SQLite directory (default `.keryx`). DB file: `{dir}/keryx.db`. |
 | `HERMES_KERYX_DAEMON_ADDR` | `keryxd` | Optional `host:port` to bind gRPC (loopback only). Unset = no listener. |
 | `HERMES_KERYX_DAEMON_ENDPOINT` | `keryx` CLI | Optional `http://host:port` for status, doctor, and `task` subcommands. |
+| `HERMES_KERYX_DAEMON_TOKEN` | `keryxd`, `keryx` CLI | Required when `keryxd` serves gRPC; CLI task/artifact commands send it as a bearer token. |
 | `RUST_LOG` | (not wired in stock `keryxd`) | Standard tracing filter when subscriber uses `EnvFilter::from_default_env()`. See [observability.md](observability.md). |
 | `KERYX_TEST_RPC_DELAY_MS` | Integration tests only | Artificial RPC delay for graceful shutdown drain tests. |
 

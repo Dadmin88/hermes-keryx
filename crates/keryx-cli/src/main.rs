@@ -16,6 +16,7 @@ use node::NodeCommand;
 use relay::RelayCommand;
 
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const DAEMON_TOKEN_ENV: &str = "HERMES_KERYX_DAEMON_TOKEN";
 const ARTIFACT_RPC_MAX_BYTES: usize = MAX_BLOB_BYTES + (1024 * 1024);
 
 #[derive(Debug, Parser)]
@@ -118,7 +119,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
     match command {
         TaskCommand::Submit { task_id } => {
             let response = client
-                .submit_task(SubmitTaskRequest {
+                .submit_task(authorized_request(SubmitTaskRequest {
                     envelope: Some(TaskEnvelope {
                         task_id: Some(TaskId {
                             value: task_id.clone(),
@@ -129,7 +130,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                         messages: vec![],
                         metadata: Default::default(),
                     }),
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx task submit: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -145,7 +146,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
             lease_duration_ms,
         } => {
             let response = client
-                .claim_task(ClaimTaskRequest {
+                .claim_task(authorized_request(ClaimTaskRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
@@ -153,7 +154,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                         value: worker.clone(),
                     }),
                     lease_duration_ms: lease_duration_ms.unwrap_or(0),
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx task claim: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -173,7 +174,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
             duration_ms,
         } => {
             let response = client
-                .complete_task(CompleteTaskRequest {
+                .complete_task(authorized_request(CompleteTaskRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
@@ -184,7 +185,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                     duration_ms,
                     result_metadata: Default::default(),
                     output_artifacts: vec![],
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx task complete: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -203,7 +204,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
             duration_ms,
         } => {
             let response = client
-                .fail_task(FailTaskRequest {
+                .fail_task(authorized_request(FailTaskRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
@@ -214,7 +215,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                     duration_ms,
                     error_reason: reason.clone(),
                     failure_metadata: Default::default(),
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx task fail: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -233,7 +234,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
             lease_duration_ms,
         } => {
             let response = client
-                .heartbeat(HeartbeatRequest {
+                .heartbeat(authorized_request(HeartbeatRequest {
                     task_id: Some(TaskId {
                         value: task_id.clone(),
                     }),
@@ -242,7 +243,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                         value: worker.clone(),
                     }),
                     lease_duration_ms: lease_duration_ms.unwrap_or(0),
-                })
+                }))
                 .await
                 .with_context(|| format!("keryx task heartbeat: RPC failed for task {task_id}"))?
                 .into_inner();
@@ -254,6 +255,23 @@ async fn run_task(command: TaskCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn authorized_request<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(token) = daemon_token() {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            request.metadata_mut().insert("authorization", value);
+        }
+    }
+    request
+}
+
+fn daemon_token() -> Option<String> {
+    std::env::var(DAEMON_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn require_daemon_endpoint() -> Result<String> {
