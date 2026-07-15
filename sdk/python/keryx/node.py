@@ -445,6 +445,7 @@ class KeryxNode:
         self._ensure_running()
         if not self._task_handlers:
             raise RuntimeError("serve_forever requires at least one on_task handler")
+        self._accepted_worker_skill_ids()
         if not self._serve_done.is_set():
             raise RuntimeError("serve_forever is already running")
         self._serve_stop.clear()
@@ -475,8 +476,18 @@ class KeryxNode:
             self._serve_done.set()
 
 
+    def _accepted_worker_skill_ids(self) -> list[str]:
+        accepted_skills = [
+            skill.id for skill in (self._card.skills if self._card else []) if skill.id
+        ]
+        if not accepted_skills:
+            raise RuntimeError(
+                "serve_forever requires an AgentCard with at least one skill"
+            )
+        return accepted_skills
+
     async def _worker_loop(self, worker_index: int) -> None:
-        accepted_skills = [skill.id for skill in (self._card.skills if self._card else [])]
+        accepted_skills = self._accepted_worker_skill_ids()
         while not self._serve_stop.is_set():
             try:
                 claimed = await self.claim_next(
