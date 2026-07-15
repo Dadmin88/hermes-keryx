@@ -1750,6 +1750,15 @@ impl SqliteStore {
         Ok(row.get::<i64, _>("count") as u64)
     }
 
+    pub async fn retained_task_envelope_bytes(&self) -> StoreResult<u64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(LENGTH(encoded_envelope)), 0) AS retained_bytes FROM task_envelopes",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("retained_bytes") as u64)
+    }
+
     pub async fn accept_legacy_event(
         &self,
         task_id: &TaskId,

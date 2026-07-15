@@ -7,7 +7,8 @@ use keryx_daemon::{
     KeryxDaemonConfig, StaticSenderAllowlist,
 };
 use keryx_proto::v1::{
-    DoctorRequest, SendTaskRequest, StatusRequest, SubmitTaskRequest, TaskEnvelope, TaskId,
+    AgentId, ClaimTaskRequest, CompleteTaskRequest, DoctorRequest, SendTaskRequest, StatusRequest,
+    SubmitTaskRequest, TaskEnvelope, TaskId, TaskMessage, TaskMessagePart,
 };
 use tonic::Code;
 
@@ -20,6 +21,27 @@ fn envelope(task_id: &str) -> TaskEnvelope {
         idempotency_key: None,
         status: 0,
         messages: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+fn sized_envelope(task_id: &str, raw_len: usize) -> TaskEnvelope {
+    TaskEnvelope {
+        task_id: Some(TaskId {
+            value: task_id.to_string(),
+        }),
+        correlation_id: None,
+        idempotency_key: None,
+        status: 0,
+        messages: vec![TaskMessage {
+            parts: vec![TaskMessagePart {
+                media_type: "application/octet-stream".to_string(),
+                text: String::new(),
+                raw: vec![b'x'; raw_len],
+                metadata: Default::default(),
+            }],
+            metadata: Default::default(),
+        }],
         metadata: Default::default(),
     }
 }
@@ -38,6 +60,7 @@ async fn submit_rejects_when_pending_queue_is_full() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 1,
         max_envelope_bytes: 0,
+        ..LimitsConfig::unlimited()
     })
     .await;
 
@@ -65,6 +88,7 @@ async fn concurrent_submits_do_not_overshoot_pending_queue_limit() {
     let harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 1,
         max_envelope_bytes: 0,
+        ..LimitsConfig::unlimited()
     })
     .await;
 
@@ -110,6 +134,7 @@ async fn submit_rejects_when_envelope_is_too_large() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 0,
         max_envelope_bytes: 1,
+        ..LimitsConfig::unlimited()
     })
     .await;
 
@@ -126,10 +151,81 @@ async fn submit_rejects_when_envelope_is_too_large() {
 }
 
 #[tokio::test]
+async fn submit_rejects_when_retained_envelope_bytes_are_full_after_completion() {
+    let mut harness = harness_with_limits(LimitsConfig {
+        max_pending_tasks: 1,
+        max_envelope_bytes: 1024,
+        max_retained_envelope_bytes: 700,
+    })
+    .await;
+
+    for task_id in ["retained-full-1", "retained-full-2"] {
+        harness
+            .client
+            .submit_task(SubmitTaskRequest {
+                envelope: Some(sized_envelope(task_id, 256)),
+            })
+            .await
+            .unwrap();
+        let claim = harness
+            .client
+            .claim_task(ClaimTaskRequest {
+                task_id: Some(TaskId {
+                    value: task_id.to_string(),
+                }),
+                worker_id: Some(AgentId {
+                    value: "worker-retained".to_string(),
+                }),
+                lease_duration_ms: 60_000,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        harness
+            .client
+            .complete_task(CompleteTaskRequest {
+                task_id: Some(TaskId {
+                    value: task_id.to_string(),
+                }),
+                lease_id: claim.lease_id,
+                worker_id: Some(AgentId {
+                    value: "worker-retained".to_string(),
+                }),
+                duration_ms: 0,
+                result_metadata: Default::default(),
+                output_artifacts: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .count_tasks_by_status(TaskStatus::Pending)
+            .await
+            .unwrap(),
+        0
+    );
+    let error = harness
+        .client
+        .submit_task(SubmitTaskRequest {
+            envelope: Some(sized_envelope("retained-full-3", 256)),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.message().contains("retained_envelope_bytes"));
+}
+
+#[tokio::test]
 async fn local_send_task_respects_pending_queue_limit() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 1,
         max_envelope_bytes: 0,
+        ..LimitsConfig::unlimited()
     })
     .await;
     let local_peer = harness.runtime.config().local_peer_id().to_string();
@@ -169,6 +265,7 @@ async fn local_send_task_respects_envelope_size_limit() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 0,
         max_envelope_bytes: 1,
+        ..LimitsConfig::unlimited()
     })
     .await;
     let local_peer = harness.runtime.config().local_peer_id().to_string();
@@ -192,6 +289,7 @@ async fn incoming_relay_task_respects_pending_queue_limit() {
     let harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 1,
         max_envelope_bytes: 0,
+        ..LimitsConfig::unlimited()
     })
     .await;
     let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
@@ -234,6 +332,7 @@ async fn incoming_relay_task_respects_envelope_size_limit() {
     let harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 0,
         max_envelope_bytes: 1,
+        ..LimitsConfig::unlimited()
     })
     .await;
     let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
@@ -258,6 +357,7 @@ async fn status_reports_configured_limits_and_current_pending_count() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 2,
         max_envelope_bytes: 512,
+        ..LimitsConfig::unlimited()
     })
     .await;
     harness
@@ -286,6 +386,7 @@ async fn doctor_reports_limit_usage_and_fails_when_at_capacity() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 1,
         max_envelope_bytes: 1024,
+        ..LimitsConfig::unlimited()
     })
     .await;
     harness
@@ -316,6 +417,7 @@ async fn status_and_doctor_report_unknown_pending_count_after_count_failure() {
     let mut harness = harness_with_limits(LimitsConfig {
         max_pending_tasks: 2,
         max_envelope_bytes: 512,
+        ..LimitsConfig::unlimited()
     })
     .await;
     harness.runtime.store().close().await;

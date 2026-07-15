@@ -93,6 +93,7 @@ Metrics live in `keryx-observe` (`KeryxMetrics`) and cancellation state in `kery
 | `dead_letters` | failures ending with `dead_lettered=true` |
 | `max_pending_tasks` | pending queue limit (`0` = unlimited) |
 | `max_envelope_bytes` | submit envelope byte limit (`0` = unlimited) |
+| retained envelope byte limit | default 256 MiB retained durable submit envelopes (`0` = unlimited in embedded config) |
 | `current_pending_tasks` | pending task count when available |
 | `cancel_requests` | `CancelTask` calls accepted by daemon layer |
 | `tasks_canceled` | cancellation requests that transitioned a task |

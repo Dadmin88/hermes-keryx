@@ -50,6 +50,7 @@ Important defaults:
 | shutdown drain timeout | `30_000 ms` |
 | pending task limit | `10_000` (`0` means unlimited) |
 | submit envelope limit | `4 MiB` (`0` means unlimited) |
+| retained submit envelope limit | `256 MiB` (`0` means unlimited) |
 | inline artifact threshold | `64 KiB` |
 | max artifact/blob size | `256 MiB` |
 | default local peer id | `node-local` |
@@ -67,7 +68,7 @@ Important defaults:
 - artifact metadata plus inline bytes/blob references
 - deadline/cancellation fields
 
-Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart.
+Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart. The daemon enforces both a per-envelope submit limit and an aggregate retained-envelope byte limit before accepting durable envelopes.
 
 The store intentionally treats the encoded envelope as opaque bytes and does not depend on `keryx-proto`; protobuf encoding and decoding remain daemon/SDK concerns. Idempotent retries must match both the lifecycle record and the stored envelope. Conflicting envelope bytes fail closed.
 
