@@ -142,7 +142,7 @@ Restart=always
 # ~/.config/systemd/user/keryx-relay.service
 [Service]
 WorkingDirectory=%h/.hermes/.keryx
-Environment=HERMES_KERYX_RELAY_CONFIG=%h/.hermes/.keryx/relay.json
+Environment=HERMES_KERYX_RELAY_CONFIG=%h/.hermes/.keryx/relay.toml
 ExecStart=/path/to/keryx-relay
 Restart=always
 ```
