@@ -4,7 +4,7 @@ Hermes Agency replaces the legacy AgentAnycast transport (`agentanycastd`, libp2
 
 - Rust daemon: `keryxd`
 - Rust relay: `keryx-relay` (libp2p + skill registry + health)
-- SQLite-backed task lifecycle (schema v5)
+- SQLite-backed task lifecycle and durable result routing (schema v7)
 - Python package/import: `keryx` (`KeryxNode`)
 
 This guide is for operators migrating an existing Hermes home from AgentAnycast defaults to Keryx.

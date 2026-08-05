@@ -99,9 +99,10 @@ Compatibility notes:
 
 - `send_task(..., skill="...")` resolves the first registry match.
 - `send_task(..., url="...")` is not implemented.
-- The returned compatibility `TaskHandle` currently represents submission only. It is not attached to a remote terminal-status/result stream, so `wait()` cannot yet receive remote completion or artifacts.
-- `serve_forever()` is currently a lightweight keepalive loop. It does not claim daemon tasks or invoke registered `on_task()` handlers.
-- Relay publication and destination-daemon submission exist, but complete daemon-to-Agent dispatch plus result return is tracked in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
+- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and returned artifact descriptors/bounded text previews. Artifact bytes remain destination-local; general cross-node artifact-content retrieval is not implemented.
+- `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
+- Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
+- Registry tags exist in the protocol, but `Skill` and the high-level `register_skills()` helper do not yet propagate them.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 
 ## Configuration
@@ -163,4 +164,4 @@ pytest
 - Agency imports should be direct: `from keryx import KeryxNode, AgentCard, Skill`
 - Prefer lazy imports inside Hermes plugin load paths so Hermes can still start if optional runtime pieces are missing
 - Keep card/task APIs stable unless Agency is updated in the same integration pass
-- Do not claim a completed remote Agency round trip until the Phase 17 cross-process E2E passes
+- Run the Phase 17 cross-process E2E before claiming the remote round trip on a changed runtime/SDK revision

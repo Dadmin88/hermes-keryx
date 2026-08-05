@@ -174,7 +174,7 @@ message ClaimNextTaskResponse {
   string status = 8;
   uint32 retry_count = 9;
   bool dead_lettered = 10;
-  // Empty until the relay/edge authenticated identity contract is persisted.
+  // Authenticated sender identity persisted by SubmitRemoteTask.
   string sender_peer_id = 11;
 }
 

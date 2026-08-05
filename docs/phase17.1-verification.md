@@ -9,4 +9,4 @@ The verified boundary is durable envelope retention only:
 - nested messages, binary parts, maps, and correlation data survive daemon restart
 - format, Clippy with warnings denied, and the complete Rust workspace pass
 
-Worker dequeue, handler execution, result routing, sender observation, and the real two-node E2E remain subsequent Phase 17 slices.
+At the Phase 17.1 checkpoint, worker dequeue, handler execution, result routing, sender observation, and the real two-node E2E remained for later slices. Those slices were subsequently completed by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).

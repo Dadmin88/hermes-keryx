@@ -35,7 +35,7 @@ See [docs/current-product.md](docs/current-product.md) for the canonical current
 ```text
 crates/keryx-core      Pure domain model, identifiers, lifecycle, limits, artifacts
 crates/keryx-proto     Protocol-facing Rust types / gRPC bindings
-crates/keryx-store     Persistence traits + SQLite store (schema v5)
+crates/keryx-store     Persistence traits + SQLite store (schema v7)
 crates/keryx-daemon    Local daemon runtime + `keryxd`
 crates/keryx-relay     Relay, health, registry, security + `keryx-relay` / `keryx-node`
 crates/keryx-cli       Operator CLI + `keryx`
@@ -59,12 +59,12 @@ proto/                 Protobuf definitions
 | 9 | Artifact storage + artifact RPC/CLI | Implemented |
 | 10 | Backpressure + configurable limits | Implemented |
 | 11 | Cancellation + deadline fields, store APIs, daemon `CancelTask`, deadline loop | Implemented |
-| 12 | Relay publication, node identity, offline mailbox, daemon `SendTask`/peers | Transport primitives implemented; full Agent round trip pending Phase 17 |
+| 12 | Relay publication, node identity, offline mailbox, daemon `SendTask`/peers | Implemented |
 | 13 | Peer discovery + skill registry with TTL and registry gossip | Implemented |
 | 14 | Security model + routing policy, relay allowlist and node-token auth primitives | Implemented |
-| 15 | Python SDK (`KeryxNode`) | Local lifecycle/submission helpers implemented; remote handler/result loop pending Phase 17 |
+| 15 | Python SDK (`KeryxNode`) | Local lifecycle, remote worker loop, durable result observation, and compatibility helpers implemented |
 | 16 | Migration script + dual-run infrastructure | Implemented |
-| 17 | Durable daemon-to-Agent dispatch and terminal result/artifact return | Planned and tracked in issue #10 |
+| 17 | Authenticated daemon-to-Agent dispatch and durable terminal result/artifact-descriptor return | Implemented in [#29](https://github.com/DeployFaith/hermes-keryx/pull/29) |
 
 Primary references:
 
@@ -82,6 +82,9 @@ Primary references:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+# After `cargo build --workspace --bins` and installing `sdk/python[dev]`:
+python scripts/e2e_two_node.py --bin-dir target/debug
 ```
 
 Release binaries:
@@ -117,7 +120,7 @@ Dual-run defaults (loopback only; avoids common legacy AgentAnycast ports 4001/5
 
 Runtime files live under `~/.hermes/.keryx/` (`logs/`, `run/`, `data/`, relay config).
 
-This quickstart validates daemon/relay infrastructure health. It does **not** start two edge nodes or prove a complete remote Hermes Agency handler and result/artifact round trip. That work is Phase 17.
+This quickstart validates one local daemon/relay pair. The authenticated two-node proof is `scripts/e2e_two_node.py`; it starts a relay/registry, two daemons, two edge nodes, and a real Python worker with isolated state.
 
 ### Manual daemon
 
@@ -189,7 +192,7 @@ finally:
     await node.close()
 ```
 
-This example proves local daemon submission. The AgentAnycast-compatible `serve_forever()` and `TaskHandle.wait()` surfaces do not yet complete a remote Agency execution/result loop. See [Phase 17](docs/phase17-cross-node-agent-delivery.md).
+This example proves local daemon submission. For the implemented remote worker/result loop, see [Phase 17](docs/phase17-cross-node-agent-delivery.md) and `scripts/e2e_two_node.py`.
 
 Details: [sdk/python/README.md](sdk/python/README.md).
 
@@ -214,7 +217,7 @@ Hermes Agency treats Keryx as its primary transport:
 - Node/pool modules import `from keryx import ...` directly
 - AgentAnycast remains a legacy fallback only
 
-The current integration supports local lifecycle, registry discovery, relay publication, and destination daemon submission. Complete remote Agent handler execution and terminal result/artifact return remain Phase 17 work and should not be presented as shipped until the cross-process E2E passes.
+The current integration supports local lifecycle, registry discovery, authenticated relay publication, remote worker execution, durable terminal result/artifact-descriptor return, and `TaskHandle.wait()`. Returned artifacts contain descriptors and bounded text previews; artifact bytes remain destination-local. The permanent cross-process proof lives in `scripts/e2e_two_node.py` and `.github/workflows/phase17-e2e.yml`.
 
 This repo stays independent so Keryx can be PR'd upstream without the full Agency product surface.
 

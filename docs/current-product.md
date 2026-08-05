@@ -10,7 +10,7 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; AgentAnycast-compatible transition helpers. Remote handler dispatch and terminal result return are not complete yet. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; AgentAnycast-compatible transition helpers. |
 | Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
@@ -34,7 +34,8 @@ Operational outcomes are metadata/events rather than extra task status values:
 `proto/hermes/keryx/v1/daemon.proto` implements:
 
 - health/operator: `Status`, `Doctor`, `Liveness`, `Readiness`
-- worker lifecycle: `SubmitTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
+- worker lifecycle: `SubmitTask`, `SubmitRemoteTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
+- remote results: `GetTaskResult`, `ClaimNextResultDelivery`, `AckResultDelivery`, `FailResultDelivery`, `IngestRemoteResult`
 - artifacts: `PutArtifact`, `GetArtifact`, `ListArtifacts`, `DeleteArtifact`
 - routing/discovery: `SendTask`, `ListPeers`, `DiscoverSkills`
 
@@ -42,7 +43,7 @@ Important defaults:
 
 | Setting | Default |
 |---|---:|
-| schema version | `6` |
+| schema version | `7` |
 | lease TTL when omitted | `300_000 ms` |
 | lease recovery interval | `30_000 ms` |
 | deadline enforcement interval | `30_000 ms` |
@@ -67,7 +68,7 @@ Important defaults:
 - artifact metadata plus inline bytes/blob references
 - deadline/cancellation fields
 
-Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart.
+Schema v6 added `task_envelopes`. `SubmitTask` persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart. Schema v7 adds authenticated transport context, durable terminal results, and retryable result-delivery outbox records.
 
 The store intentionally treats the encoded envelope as opaque bytes and does not depend on `keryx-proto`; protobuf encoding and decoding remain daemon/SDK concerns. Idempotent retries must match both the lifecycle record and the stored envelope. Conflicting envelope bytes fail closed.
 
@@ -84,28 +85,24 @@ Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC healt
 
 ## Cross-node delivery boundary
 
-Keryx currently proves this one-way transport path:
+Keryx proves the authenticated round trip:
 
 ```text
 sender keryxd SendTask
   -> relay PublishTask
   -> destination keryx-node stream
-  -> destination keryxd SubmitTask
+  -> destination keryxd SubmitRemoteTask
   -> destination lifecycle row + durable full envelope
+  -> Python worker ClaimNextTask + handler
+  -> destination durable terminal result/outbox
+  -> relay result frame
+  -> origin keryxd IngestRemoteResult
+  -> Python TaskHandle.wait()
 ```
 
-A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
+Phase 17 was completed in [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29). The permanent proof starts a relay/registry, two daemons, two edge nodes, and a real Python worker, then verifies discovery, authenticated sender/executor identity, remote handler execution, durable result return, artifact descriptors/bounded text previews, and clean shutdown. Artifact bytes remain destination-local; general cross-node artifact-content retrieval is not implemented.
 
-Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`. Phase 17.3 makes Python `serve_forever()` a real worker runtime: it claims matching tasks, invokes registered handlers, maintains leases with heartbeats, and persists local completion or failure.
-
-Missing today:
-
-- transport-authenticated sender identity attached to the claimed envelope
-- authenticated terminal result/artifact routing back to the origin
-- a remotely updated `TaskHandle.wait()`
-- a repeatable two-daemon/two-edge-node Agency E2E
-
-This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, durable envelope retention, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
+The relay's offline mailbox is currently in-memory. It delivers frames when a node reconnects to the same running relay process, but it is not a relay-restart-durable queue.
 
 ## Operator CLI
 
@@ -140,11 +137,12 @@ The Python package is `keryx` and exports:
 
 Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `claim_next`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
 
-Current compatibility limits:
+Current compatibility behavior:
 
 - `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
-- `send_task()` can submit through a configured daemon/relay route, but its compatibility `TaskHandle` is not attached to a remote terminal-status/result stream.
-- `IncomingTask.complete()` / `.fail()` are not yet wired to a durable relay result route.
+- `send_task()` submits through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results.
+- `IncomingTask.complete()` / `.fail()` persist terminal state and feed the authenticated relay result route.
+- Registry tags exist in the protocol, but the high-level Python `Skill`/`register_skills()` helper does not yet propagate them.
 
 The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
 
@@ -162,7 +160,7 @@ The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/r
 | relay libp2p QUIC | `/ip4/127.0.0.1/udp/4101/quic-v1` |
 | state root | `~/.hermes/.keryx` |
 
-Dual-run validates infrastructure health. It does not start two edge nodes or prove a remote Hermes Agency handler/result round trip.
+Dual-run validates one local infrastructure pair. Use `scripts/e2e_two_node.py` for the complete authenticated remote round trip.
 
 ## Environment variables
 

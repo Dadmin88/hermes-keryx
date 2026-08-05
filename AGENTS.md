@@ -28,7 +28,7 @@ Hermes Agency consumes Keryx as primary transport. Agency may vendor a copy of t
 - Keep `keryx-core` pure: no daemon, network, database, or filesystem dependencies.
 - Write tests for lifecycle and persistence semantics before implementation where practical.
 - Every accepted task must eventually map to a durable event-log contract.
-- Schema changes must bump store schema version and update tests (current: **v5**).
+- Schema changes must bump store schema version and update tests (current: **v7**).
 - Dual-run ports must not collide with common legacy AgentAnycast defaults (4001 / 50052).
 - Do not commit secrets, real peer IDs, private hostnames, maintainer-local absolute paths, or private multiaddrs.
 - Do not claim CI green without running the relevant validation commands.
@@ -37,7 +37,7 @@ Hermes Agency consumes Keryx as primary transport. Agency may vendor a copy of t
 
 | Area | Notes |
 |------|-------|
-| Lifecycle store | Four-state lifecycle, leases, recovery, artifacts, cancel/deadlines, schema v5 |
+| Lifecycle store | Four-state lifecycle, durable envelopes/results, leases, recovery, artifacts, cancel/deadlines, schema v7 |
 | Daemon RPCs | Status/doctor/liveness/readiness, submit/claim/heartbeat/complete/fail/cancel, artifacts, send/list/discover |
 | Relay | Transport, offline mailbox, registry/gossip, health, security allowlist |
 | Policy | Node keys/tokens, permissions, routing policy/audit |
