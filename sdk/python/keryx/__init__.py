@@ -12,7 +12,7 @@ from keryx.models import (
 )
 from keryx.node import KeryxNode
 from keryx.registration import deregister_agent, register_agent
-from keryx.task import IncomingTask, Task, TaskHandle, TaskStatus
+from keryx.task import IncomingTask, SubmissionReceipt, Task, TaskHandle, TaskStatus
 
 __all__ = [
     "KeryxNode",
@@ -28,6 +28,7 @@ __all__ = [
     "Task",
     "IncomingTask",
     "TaskHandle",
+    "SubmissionReceipt",
     "TaskStatus",
     "peer_id_to_did_key",
     "register_agent",

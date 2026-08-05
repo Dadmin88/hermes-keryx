@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock
 
 import grpc
@@ -7,7 +8,7 @@ import pytest
 
 from hermes.keryx.v1 import common_pb2, daemon_pb2
 
-from keryx import AgentCard, KeryxNode, Skill
+from keryx import AgentCard, KeryxNode, Skill, SubmissionReceipt
 from keryx.client import DaemonClient
 
 
@@ -32,16 +33,30 @@ def started_node(monkeypatch: pytest.MonkeyPatch) -> tuple[KeryxNode, AsyncMock]
 
 
 @pytest.mark.asyncio
-async def test_send_task_to_mock_daemon(started_node: tuple[KeryxNode, AsyncMock]) -> None:
+async def test_send_task_to_mock_daemon(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
     node, client = started_node
     await node.start()
-    handle = await node.send_task({"role": "user", "parts": [{"text": "hi"}]}, peer_id="peer-remote")
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "hi"}]}, peer_id="peer-remote"
+    )
     assert handle.task_id == "task-abc"
+    expected_receipt = SubmissionReceipt(
+        task_id="task-abc",
+        status="submitted",
+        routed_to="peer-remote",
+        delivery_route="local",
+    )
+    assert handle.receipt == expected_receipt
+    with pytest.raises(FrozenInstanceError):
+        expected_receipt.status = "mutated"  # type: ignore[misc]
     client.send_task.assert_awaited_once()
     kwargs = client.send_task.await_args.kwargs
     assert kwargs["target_peer_id"] == "peer-remote"
     assert kwargs["message_text"] == "hi"
     await node.stop()
+
 
 class _UnknownPeerRpcError(Exception):
     def code(self):
@@ -69,5 +84,7 @@ async def test_skill_send_reports_keryx_cross_node_capability_gap(
 
     await node.start()
     with pytest.raises(NotImplementedError, match="registry-discovered peers"):
-        await node.send_task({"role": "user", "parts": [{"text": "hi"}]}, skill="remote-skill")
+        await node.send_task(
+            {"role": "user", "parts": [{"text": "hi"}]}, skill="remote-skill"
+        )
     await node.stop()

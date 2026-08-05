@@ -94,7 +94,7 @@ async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endp
         peer_id=agents[0]["peer_id"],
         deadline_ms=1_800_000_000_000,
     )
-    print(handle.task_id)
+    print(handle.receipt)  # immutable task_id/status/routed_to/delivery_route acknowledgement
     await node.stop()
 ```
 
@@ -107,6 +107,7 @@ Compatibility notes:
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - `Skill.tags` round-trips through card dictionaries, registry publication, and discovery.
+- `send_task()` retains the daemon's exact `status`, `routed_to`, and `delivery_route` fields in an immutable `SubmissionReceipt` on the returned handle.
 - `register_skills()` remains a one-shot primitive. `start_registration()` registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` reports lifecycle health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutations use finite RPC deadlines. One stop budget spans refresh cancellation acknowledgement and deregistration. Work exceeding that budget continues as tracked cleanup, blocks restart, and preserves refresh-before-deregister ordering. During node shutdown, ownership of the registry client transfers to pending cleanup so accepted deregistration and client close can finish in order.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 

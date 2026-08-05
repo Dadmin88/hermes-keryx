@@ -37,6 +37,7 @@ from keryx.task import (
     IncomingTask,
     Message,
     Part,
+    SubmissionReceipt,
     Task,
     TaskHandle,
     TaskStatus as LegacyTaskStatus,
@@ -831,6 +832,12 @@ class KeryxNode:
 
         return TaskHandle(
             task=task,
+            receipt=SubmissionReceipt(
+                task_id=task.task_id,
+                status=response.status,
+                routed_to=response.routed_to,
+                delivery_route=response.delivery_route,
+            ),
             refresh_fn=refresh_remote,
             cancel_fn=cancel_remote,
         )
