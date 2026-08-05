@@ -103,6 +103,7 @@ Compatibility notes:
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - Registry tags exist in the protocol, but `Skill` and the high-level `register_skills()` helper do not yet propagate them.
+- Registration is one-shot; the SDK does not automatically refresh before TTL expiry or deregister on shutdown.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 
 ## Configuration

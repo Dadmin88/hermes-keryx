@@ -26,7 +26,7 @@ Operational outcomes are metadata/events rather than extra task status values:
 - retry requeue: `running -> pending`, increments `retry_count`, appends `RecoveryAction`
 - dead-letter: `running -> failed`, sets `dead_lettered` and `dead_letter_reason`
 - cancel: `pending` or `running` -> `failed`, marks cancellation counters and reason metadata
-- deadline expiry: expired `deadline_ms` on `pending`/`running` -> `failed`
+- deadline expiry: expired local `TaskRecord.deadline_ms` on `pending`/`running` -> `failed`; the current remote `TaskEnvelope` does not carry a deadline, so `SendTask` does not yet propagate this guarantee cross-node
 - routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
 
 ## Daemon gRPC API
@@ -82,6 +82,12 @@ Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR
 - TOML config supports `[relay]`, `[security]`, and `[registry]` sections. TOML enables allowlist files, empty-allowlist policy, inline/external node tokens, and registry TTL/max-skills settings.
 
 Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC health, `127.0.0.1:8081` HTTP health, and `127.0.0.1:50053` registry. The dual-run script intentionally overrides these to loopback non-conflicting ports.
+
+Current registry limits:
+
+- The separate registry gRPC surface does not authenticate registration ownership. A reachable client can register, replace, or unregister another peer's skill record. Protect it with a private network/ACL; authenticated peer-owned mutation is not yet implemented.
+- `max_skills_per_peer` is parsed from relay configuration but is not currently enforced.
+- Registry state is in-memory and TTL-based.
 
 ## Cross-node delivery boundary
 
@@ -143,6 +149,7 @@ Current compatibility behavior:
 - `send_task()` submits through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results.
 - `IncomingTask.complete()` / `.fail()` persist terminal state and feed the authenticated relay result route.
 - Registry tags exist in the protocol, but the high-level Python `Skill`/`register_skills()` helper does not yet propagate them.
+- Python/edge registration is one-shot; neither path automatically refreshes before the default 300-second TTL expires. Long-running integrations must explicitly renew or use a supervised restart loop until a lifecycle helper exists.
 
 The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
 
