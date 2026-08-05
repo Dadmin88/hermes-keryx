@@ -789,7 +789,33 @@ class KeryxNode:
                     "delivery requires a relay-backed daemon route / task publisher."
                 ) from exc
             raise
-        task = Task(task_id=response.task_id.value or task_id, status=LegacyTaskStatus.SUBMITTED)
+        task = Task(
+            task_id=response.task_id.value or task_id,
+            status=LegacyTaskStatus.SUBMITTED,
+        )
+        return self._remote_task_handle(
+            task,
+            receipt=SubmissionReceipt(
+                task_id=task.task_id,
+                status=response.status,
+                routed_to=response.routed_to,
+                delivery_route=response.delivery_route,
+            ),
+        )
+
+    def task_handle(self, task_id: str) -> TaskHandle:
+        """Reopen one daemon-backed task by ID for refresh, wait, or cancel."""
+        self._ensure_running()
+        task_id = _validate_task_id(task_id)
+        return self._remote_task_handle(Task(task_id=task_id))
+
+    def _remote_task_handle(
+        self,
+        task: Task,
+        *,
+        receipt: SubmissionReceipt | None = None,
+    ) -> TaskHandle:
+        self._ensure_running()
 
         async def refresh_remote() -> Task:
             assert self._client is not None
@@ -802,7 +828,11 @@ class KeryxNode:
                 result_text = result.result_metadata.get("result_text", "")
                 for item in result.output_artifacts:
                     preview = item.metadata.get("text_preview", "")
-                    parts = [Part(text=preview, media_type=item.media_type or "text/plain")] if preview else []
+                    parts = (
+                        [Part(text=preview, media_type=item.media_type or "text/plain")]
+                        if preview
+                        else []
+                    )
                     artifacts.append(
                         Artifact(
                             artifact_id=(
@@ -824,7 +854,10 @@ class KeryxNode:
                 task.artifacts = artifacts
                 task.metadata = {
                     **dict(task.metadata or {}),
-                    **{str(key): str(value) for key, value in result.result_metadata.items()},
+                    **{
+                        str(key): str(value)
+                        for key, value in result.result_metadata.items()
+                    },
                     "executor_peer_id": result.executor_peer_id,
                     "duration_ms": str(result.duration_ms),
                     "error_reason": result.error_reason,
@@ -833,16 +866,14 @@ class KeryxNode:
 
         async def cancel_remote() -> None:
             assert self._client is not None
-            await self._client.cancel_task(task.task_id, reason="canceled by TaskHandle")
+            await self._client.cancel_task(
+                task.task_id,
+                reason="canceled by TaskHandle",
+            )
 
         return TaskHandle(
             task=task,
-            receipt=SubmissionReceipt(
-                task_id=task.task_id,
-                status=response.status,
-                routed_to=response.routed_to,
-                delivery_route=response.delivery_route,
-            ),
+            receipt=receipt,
             refresh_fn=refresh_remote,
             cancel_fn=cancel_remote,
         )
@@ -1308,6 +1339,19 @@ def _completion_payload(
     if result_texts:
         result_metadata["result_text"] = "\n\n".join(result_texts)[:65_536]
     return result_metadata, descriptors
+
+
+def _validate_task_id(task_id: str) -> str:
+    if (
+        type(task_id) is not str
+        or not task_id
+        or len(task_id) > 512
+        or task_id != task_id.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in task_id)
+    ):
+        raise ValueError("task_id must be a bounded nonempty string")
+    return task_id
+
 
 def _task_envelope(
     *,

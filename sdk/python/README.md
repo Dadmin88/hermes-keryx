@@ -103,7 +103,7 @@ Compatibility notes:
 - `send_task(..., skill="...")` resolves the first registry match.
 - `send_task(..., deadline_ms=...)` accepts `0` for no execution deadline or a positive signed 64-bit absolute Unix epoch timestamp. It is not the relay delivery `timeout_ms`.
 - `send_task(..., url="...")` is not implemented.
-- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. Bounded artifact bytes traverse the authenticated result route and can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact()`.
+- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. `node.task_handle(task_id)` reopens the same durable result/cancellation view after controller restart; reopened handles intentionally have no submission receipt. Bounded artifact bytes traverse the authenticated result route and can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact()`.
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - `Skill.tags` round-trips through card dictionaries, registry publication, and discovery.

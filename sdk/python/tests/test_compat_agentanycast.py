@@ -24,6 +24,7 @@ class _FakeDaemonStub:
     def __init__(self, local_peer_id: str) -> None:
         self._local_peer_id = local_peer_id
         self.sent: list[daemon_pb2.SendTaskRequest] = []
+        self.canceled: list[daemon_pb2.CancelTaskRequest] = []
         self.result_response = daemon_pb2.GetTaskResultResponse(status="submitted")
 
     async def ListPeers(self, _request: Any) -> daemon_pb2.ListPeersResponse:
@@ -47,6 +48,18 @@ class _FakeDaemonStub:
         self, _request: daemon_pb2.GetTaskResultRequest
     ) -> daemon_pb2.GetTaskResultResponse:
         return self.result_response
+
+    async def CancelTask(
+        self, request: daemon_pb2.CancelTaskRequest
+    ) -> daemon_pb2.CancelTaskResponse:
+        self.canceled.append(request)
+        self.result_response = daemon_pb2.GetTaskResultResponse(status="canceled")
+        return daemon_pb2.CancelTaskResponse(
+            task_id=request.task_id,
+            status="canceled",
+            reason=request.reason,
+            canceled=True,
+        )
 
 
 class _FakeRegistryStub:
@@ -215,6 +228,46 @@ async def test_task_handle_preserves_origin_artifact_id(sample_card: AgentCard) 
 
     assert result.artifacts[0].artifact_id == "origin-artifact-1"
     assert result.artifacts[0].name == "../../display-only.bin"
+
+
+@pytest.mark.asyncio
+async def test_node_reopens_existing_task_result_by_id(sample_card: AgentCard) -> None:
+    peer_id = _make_peer_id(bytes(range(32)))
+    fake_client = FakeDaemonClient(local_peer_id=peer_id)
+    node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
+    await node.start()
+    fake_client._fake_daemon.result_response = daemon_pb2.GetTaskResultResponse(
+        found=True,
+        status="completed",
+        result=result_pb2.TaskResultEnvelope(
+            protocol_version=2,
+            task_id=common_pb2.TaskId(value="task-existing"),
+            outcome=result_pb2.TERMINAL_OUTCOME_COMPLETED,
+            result_metadata={"result_text": "done"},
+        ),
+    )
+
+    handle = node.task_handle("task-existing")
+    result = await handle.wait(timeout=1)
+
+    assert handle.receipt is None
+    assert result.status.value == "completed"
+    assert result.metadata["result_text"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_node_cancels_reopened_task_by_id(sample_card: AgentCard) -> None:
+    peer_id = _make_peer_id(bytes(range(32)))
+    fake_client = FakeDaemonClient(local_peer_id=peer_id)
+    node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
+    await node.start()
+
+    handle = node.task_handle("task-cancel")
+    await handle.cancel()
+
+    request = fake_client._fake_daemon.canceled[0]
+    assert request.task_id.value == "task-cancel"
+    assert handle.status.value == "canceled"
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; authenticated terminal-result publication; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; public task reattachment by ID for refresh/wait/cancel; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
 | Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
