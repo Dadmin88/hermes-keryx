@@ -8,8 +8,7 @@ use async_trait::async_trait;
 use keryx_core::{IdempotencyKey, PeerId, TaskId, TaskStatus};
 use keryx_proto::v1::{keryx_relay_client::KeryxRelayClient, PublishTaskRequest, TaskEnvelope};
 use keryx_store::{
-    SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord,
-    TaskTransportContextRecord,
+    SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
 };
 use prost::Message;
 use thiserror::Error;
@@ -70,6 +69,8 @@ pub enum RoutingError {
     RelayFailed { peer_id: String, reason: String },
     #[error("routing policy denied task: {reason}")]
     PolicyDenied { reason: String },
+    #[error("invalid task envelope: {reason}")]
+    InvalidEnvelope { reason: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -526,6 +527,7 @@ impl TaskRouter {
     ) -> Result<SendTaskOutcome, RoutingError> {
         let task_id = parse_envelope_task_id(&envelope)?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        let deadline_ms = deadline_from_envelope(&envelope)?;
 
         let policy_decision = self.policy.read().await.evaluate(&envelope);
         let audit_event =
@@ -599,7 +601,8 @@ impl TaskRouter {
 
         let encoded_envelope = envelope.encode_to_vec();
         let idempotency_key = parse_envelope_idempotency_key(&envelope)?;
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_ms;
         let now_ms = unix_ms_now();
         let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, now_ms);
         let context = TaskTransportContextRecord {
@@ -656,15 +659,11 @@ struct LocalAcceptOutcome {
 async fn accept_local_task(
     store: &SqliteStore,
     envelope: TaskEnvelope,
-) -> StoreResult<LocalAcceptOutcome> {
-    let task_id = parse_envelope_task_id(&envelope).map_err(|error| {
-        StoreError::Validation(keryx_core::ValidationError::InvalidIdValue {
-            kind: "TaskId",
-            value: error.to_string(),
-        })
-    })?;
+) -> Result<LocalAcceptOutcome, RoutingError> {
+    let task_id = parse_envelope_task_id(&envelope)?;
     let idempotency_key = parse_envelope_idempotency_key(&envelope)?;
-    let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    record.deadline_ms = deadline_from_envelope(&envelope)?;
     let accepted = store.accept_task(record).await?;
     Ok(LocalAcceptOutcome {
         task_id,
@@ -774,6 +773,7 @@ pub fn routing_error_to_status(error: RoutingError) -> Status {
             }
         }
         RoutingError::PolicyDenied { reason } => Status::permission_denied(redact_secrets(&reason)),
+        RoutingError::InvalidEnvelope { reason } => Status::invalid_argument(reason),
         RoutingError::Store(store_error) => super::store_error_to_status(store_error),
         RoutingError::Validation(validation_error) => {
             Status::invalid_argument(validation_error.to_string())
@@ -792,6 +792,7 @@ mod tests {
             task_id: Some(ProtoTaskId {
                 value: "task:deploy".to_string(),
             }),
+            deadline_ms: 0,
             ..TaskEnvelope::default()
         };
         envelope
@@ -807,6 +808,48 @@ mod tests {
             RoutingPolicyPermission::ApprovalRequired
         );
         assert_eq!(decision.capability_id.as_deref(), Some("cap:deploy"));
+    }
+
+    #[tokio::test]
+    async fn send_task_rejects_negative_deadline_before_approval_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::connect(&dir.path().join("keryx.sqlite3"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let local_peer = PeerId::new("node-policy-deadline").unwrap();
+        let router = TaskRouter::new(
+            Arc::new(PeerDirectory::new(local_peer.clone())),
+            Arc::new(NoopRelayPublisher),
+            DEFAULT_SEND_TASK_TIMEOUT_MS,
+        );
+        let mut policy = RoutingPolicy::default();
+        policy.set_permission(
+            "cap:approval-required",
+            RoutingPolicyPermission::ApprovalRequired,
+        );
+        router.set_policy(policy).await;
+        let mut envelope = TaskEnvelope {
+            task_id: Some(ProtoTaskId {
+                value: "route-invalid-before-policy".to_string(),
+            }),
+            deadline_ms: -1,
+            ..TaskEnvelope::default()
+        };
+        envelope.metadata.insert(
+            "capability_id".to_string(),
+            "cap:approval-required".to_string(),
+        );
+
+        let error = router
+            .send_task(&store, local_peer, envelope, 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RoutingError::InvalidEnvelope { .. }));
+        let task_id = TaskId::new("route-invalid-before-policy").unwrap();
+        assert!(store.get_task(&task_id).await.is_err());
+        assert!(router.audit_events().await.is_empty());
     }
 }
 
@@ -883,6 +926,15 @@ pub mod test_support {
             Ok(())
         }
     }
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, RoutingError> {
+    if envelope.deadline_ms < 0 {
+        return Err(RoutingError::InvalidEnvelope {
+            reason: "deadline_ms must be zero or a positive Unix epoch timestamp".to_string(),
+        });
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn unix_ms_now() -> i64 {

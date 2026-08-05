@@ -15,9 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keryx_core::{
-    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, KeryxEventType,
-    LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
-    ValidationError, MAX_BLOB_BYTES,
+    origin_result_artifact_id, should_inline, AgentId, ArtifactId, ArtifactMeta, Digest,
+    IdempotencyKey, KeryxEventType, LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId,
+    RetryPolicy, TaskId, TaskStatus, ValidationError, MAX_BLOB_BYTES,
+    MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
@@ -49,8 +50,9 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
 
 use keryx_store::{
-    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,
-    TaskRecord, TaskTransportContextRecord, TerminalResultRecord, CURRENT_SCHEMA_VERSION,
+    LeaseRecord, OriginResultArtifact, RecoveryReport, SqliteStore, StoreError, StoreResult,
+    TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
+    CURRENT_SCHEMA_VERSION,
 };
 
 pub use cancellation::{CancellationSnapshot, CancellationState};
@@ -934,6 +936,11 @@ impl KeryxDaemonRpcService {
         accepted_capability_ids: &HashSet<String>,
         lease_duration_ms: i64,
     ) -> Result<Option<ClaimNextTaskResponse>, Status> {
+        self.runtime
+            .store()
+            .fail_expired_deadlines(unix_ms_now(), None)
+            .await
+            .map_err(store_error_to_status)?;
         let candidates = self
             .runtime
             .store()
@@ -1154,7 +1161,8 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             .limits()
             .check_envelope_bytes(envelope_bytes)
             .map_err(limit_exceeded_to_status)?;
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_from_envelope(&envelope)?;
         let envelope_record =
             TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
         let accepted = self
@@ -1192,7 +1200,8 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
         let encoded = envelope.encode_to_vec();
         let now_ms = unix_ms_now();
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_from_envelope(&envelope)?;
         let accepted = self
             .runtime
             .accept_pending_remote_task_with_backpressure(
@@ -1233,6 +1242,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
         let lease_duration_ms =
             normalize_lease_duration_ms(inner.lease_duration_ms, self.runtime.config());
+        self.runtime
+            .store()
+            .fail_expired_deadlines(unix_ms_now(), None)
+            .await
+            .map_err(store_error_to_status)?;
         let leased_at_ms = unix_ms_now();
         let expires_at_ms = leased_at_ms.saturating_add(lease_duration_ms);
         let lease_id = new_lease_id(&task_id, leased_at_ms);
@@ -1764,7 +1778,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<IngestRemoteResultRequest>,
     ) -> Result<Response<IngestRemoteResultResponse>, Status> {
         let inner = request.into_inner();
-        let result = inner
+        let mut result = inner
             .result
             .ok_or_else(|| Status::invalid_argument("result is required"))?;
         let task_id = parse_required_task_id(result.task_id.as_ref())?;
@@ -1775,7 +1789,15 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 "result destination does not match local peer",
             ));
         }
+        let envelope_executor = PeerId::new(result.executor_peer_id.trim())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if envelope_executor != executor {
+            return Err(Status::permission_denied(
+                "result executor does not match authenticated executor",
+            ));
+        }
         let terminal_status = terminal_outcome_status(result.outcome)?;
+        let artifacts = canonicalize_origin_result_artifacts(&task_id, &mut result)?;
         let record = TerminalResultRecord {
             task_id: task_id.clone(),
             encoded_result: result.encode_to_vec(),
@@ -1787,7 +1809,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task = self
             .runtime
             .store()
-            .apply_remote_result(record, &executor)
+            .apply_remote_result_with_artifacts(
+                record,
+                &artifacts,
+                &executor,
+                self.runtime.config().blob_dir(),
+            )
             .await
             .map_err(store_error_to_status)?;
         Ok(Response::new(IngestRemoteResultResponse {
@@ -1914,8 +1941,9 @@ async fn build_terminal_result(
         .ok()
         .and_then(|record| TaskEnvelope::decode(record.encoded_envelope.as_slice()).ok())
         .and_then(|envelope| envelope.correlation_id);
+    let (output_artifacts, has_content) = validate_worker_result_artifacts(artifacts)?;
     Ok(TaskResultEnvelope {
-        protocol_version: 1,
+        protocol_version: if has_content { 2 } else { 1 },
         task_id: Some(proto_task_id(task_id)),
         correlation_id,
         outcome: outcome as i32,
@@ -1924,15 +1952,156 @@ async fn build_terminal_result(
         completed_at_ms: unix_ms_now(),
         error_reason,
         result_metadata,
-        output_artifacts: artifacts
-            .into_iter()
-            .map(|artifact| ResultArtifact {
+        output_artifacts,
+    })
+}
+
+fn validate_worker_result_artifacts(
+    artifacts: Vec<keryx_proto::v1::TaskArtifact>,
+) -> Result<(Vec<ResultArtifact>, bool), Status> {
+    let mut aggregate_len = 0_u64;
+    let mut has_content = false;
+    let mut result = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if artifact.content_present {
+            let declared_digest = parse_lowercase_digest(&artifact.sha256)?;
+            let actual_len = artifact.content.len() as u64;
+            if artifact.byte_len != actual_len {
+                return Err(Status::invalid_argument(
+                    "artifact byte_len does not match content length",
+                ));
+            }
+            let actual_digest = Digest::compute(&artifact.content);
+            if declared_digest != actual_digest {
+                return Err(Status::invalid_argument(
+                    "artifact sha256 does not match content",
+                ));
+            }
+            aggregate_len = aggregate_len.checked_add(actual_len).ok_or_else(|| {
+                Status::resource_exhausted("result artifact bytes exceed cross-node limit")
+            })?;
+            if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+                return Err(Status::resource_exhausted(
+                    "result artifact bytes exceed cross-node limit",
+                ));
+            }
+            has_content = true;
+            result.push(ResultArtifact {
                 path: artifact.path,
                 media_type: artifact.media_type,
                 metadata: artifact.metadata,
-            })
-            .collect(),
-    })
+                artifact_id: None,
+                sha256: declared_digest.as_str().to_string(),
+                byte_len: actual_len,
+                content: artifact.content,
+                content_present: true,
+            });
+        } else {
+            if !artifact.content.is_empty() || !artifact.sha256.is_empty() || artifact.byte_len != 0
+            {
+                return Err(Status::invalid_argument(
+                    "descriptor-only artifact must not include content, sha256, or byte_len",
+                ));
+            }
+            result.push(ResultArtifact {
+                path: artifact.path,
+                media_type: artifact.media_type,
+                metadata: artifact.metadata,
+                artifact_id: None,
+                sha256: String::new(),
+                byte_len: 0,
+                content: Vec::new(),
+                content_present: false,
+            });
+        }
+    }
+    Ok((result, has_content))
+}
+
+fn parse_lowercase_digest(value: &str) -> Result<Digest, Status> {
+    let digest = Digest::new(value).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if value != digest.as_str() {
+        return Err(Status::invalid_argument(
+            "artifact sha256 must be lowercase hexadecimal without surrounding whitespace",
+        ));
+    }
+    Ok(digest)
+}
+
+fn canonicalize_origin_result_artifacts(
+    task_id: &TaskId,
+    result: &mut TaskResultEnvelope,
+) -> Result<Vec<OriginResultArtifact>, Status> {
+    let has_content = result
+        .output_artifacts
+        .iter()
+        .any(|artifact| artifact.content_present);
+    if has_content && result.protocol_version < 2 {
+        return Err(Status::failed_precondition(
+            "byte-bearing result artifacts require protocol_version >= 2",
+        ));
+    }
+    let mut aggregate_len = 0_u64;
+    let mut stored = Vec::new();
+    for (index, artifact) in result.output_artifacts.iter_mut().enumerate() {
+        if artifact.artifact_id.is_some() {
+            return Err(Status::invalid_argument(
+                "result artifact_id is origin-assigned and must be absent on ingest",
+            ));
+        }
+        let ordinal = u32::try_from(index)
+            .map_err(|_| Status::invalid_argument("result artifact ordinal exceeds u32 range"))?;
+        let artifact_id = origin_result_artifact_id(task_id, ordinal);
+        artifact.artifact_id = Some(proto_artifact_id(&artifact_id));
+        if !artifact.content_present {
+            if !artifact.content.is_empty() || !artifact.sha256.is_empty() || artifact.byte_len != 0
+            {
+                return Err(Status::invalid_argument(
+                    "descriptor-only artifact must not include content, sha256, or byte_len",
+                ));
+            }
+            artifact.content.clear();
+            continue;
+        }
+        let digest = parse_lowercase_digest(&artifact.sha256)?;
+        let actual_len = artifact.content.len() as u64;
+        if artifact.byte_len != actual_len {
+            return Err(Status::invalid_argument(
+                "artifact byte_len does not match content length",
+            ));
+        }
+        if digest != Digest::compute(&artifact.content) {
+            return Err(Status::invalid_argument(
+                "artifact sha256 does not match content",
+            ));
+        }
+        aggregate_len = aggregate_len.checked_add(actual_len).ok_or_else(|| {
+            Status::resource_exhausted("result artifact bytes exceed cross-node limit")
+        })?;
+        if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+            return Err(Status::resource_exhausted(
+                "result artifact bytes exceed cross-node limit",
+            ));
+        }
+        let content = std::mem::take(&mut artifact.content);
+        artifact.sha256 = digest.as_str().to_string();
+        artifact.byte_len = actual_len;
+        artifact.content_present = false;
+        stored.push(OriginResultArtifact {
+            ordinal,
+            meta: ArtifactMeta {
+                artifact_id,
+                task_id: task_id.clone(),
+                digest,
+                media_type: MediaType::new(&artifact.media_type),
+                byte_len: actual_len,
+                inline: should_inline(actual_len),
+                created_at: result.completed_at_ms.to_string(),
+            },
+            content,
+        });
+    }
+    Ok(stored)
 }
 
 fn terminal_outcome_status(outcome: i32) -> Result<TaskStatus, Status> {
@@ -1991,6 +2160,15 @@ fn envelope_matches_claim_filters(
         ],
         accepted_capability_ids,
     )
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, Status> {
+    if envelope.deadline_ms < 0 {
+        return Err(Status::invalid_argument(
+            "deadline_ms must be zero or a positive Unix epoch timestamp",
+        ));
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn normalize_claim_wait_ms(wait_timeout_ms: i64) -> u64 {
@@ -2307,6 +2485,7 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         StoreError::LeaseConflict { task_id } => {
             Status::aborted(format!("task {task_id} already has an active lease"))
         }
+        StoreError::TaskDeadlineExpired { .. } => Status::failed_precondition(error_detail.clone()),
         StoreError::LeaseMismatch { task_id, lease_id } => Status::permission_denied(format!(
             "lease {} does not own task {}",
             lease_id.as_str(),
@@ -2327,7 +2506,14 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             ))
         }
         StoreError::ArtifactTooLarge { .. } => Status::resource_exhausted(error_detail.clone()),
-        StoreError::DigestMismatch { .. } => Status::data_loss(error_detail.clone()),
+        StoreError::ArtifactLengthMismatch { .. }
+        | StoreError::DigestMismatch { .. }
+        | StoreError::OriginResultArtifactIdMismatch { .. }
+        | StoreError::OriginResultArtifactOrdinalMismatch { .. }
+        | StoreError::OriginResultArtifactTaskMismatch { .. } => {
+            Status::invalid_argument(error_detail.clone())
+        }
+        StoreError::OriginResultArtifactConflict(_) => Status::already_exists(error_detail.clone()),
         StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
         StoreError::UnsupportedSchema { .. }
         | StoreError::MigrationFailed(_)

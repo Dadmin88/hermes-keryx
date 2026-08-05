@@ -21,7 +21,7 @@ use crate::health::RelayHealthReport;
 use crate::registry::{SkillRegistry, StoredSkill};
 use crate::runtime::RelayRuntime;
 use crate::security::NodeTokenAuth;
-use keryx_core::PeerId;
+use keryx_core::{PeerId, RESULT_ARTIFACT_FRAME_MAX_BYTES};
 
 /// gRPC metadata key used by `ConnectNode` to identify the streaming node.
 pub const NODE_ID_METADATA_KEY: &str = "x-keryx-node-id";
@@ -280,6 +280,11 @@ impl KeryxRelay for RelayHealthService {
         &self,
         request: Request<PublishResultRequest>,
     ) -> Result<Response<PublishResultResponse>, Status> {
+        if self.node_auth.is_none() {
+            return Err(Status::unauthenticated(
+                "terminal results require configured node authentication",
+            ));
+        }
         let claimed_source = request.get_ref().source_node_id.clone();
         let authenticated_source = self.authenticate_request(&request, &claimed_source)?;
         let inner = request.into_inner();
@@ -499,7 +504,11 @@ pub async fn serve_grpc_health(
         None => RelayHealthService::new(runtime),
     };
     tonic::transport::Server::builder()
-        .add_service(KeryxRelayServer::new(service))
+        .add_service(
+            KeryxRelayServer::new(service)
+                .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES),
+        )
         .serve_with_incoming(incoming)
         .await
 }
@@ -514,7 +523,11 @@ pub async fn serve_grpc_health_with_auth(
     let incoming = TcpListenerStream::new(listener);
     let service = RelayHealthService::with_registry_and_auth(runtime, registry, node_auth);
     tonic::transport::Server::builder()
-        .add_service(KeryxRelayServer::new(service))
+        .add_service(
+            KeryxRelayServer::new(service)
+                .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES),
+        )
         .serve_with_incoming(incoming)
         .await
 }

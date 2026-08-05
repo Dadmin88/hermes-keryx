@@ -22,4 +22,5 @@ enum TaskStatus {
 
 message TaskMessagePart { string media_type = 1; string text = 2; bytes raw = 3; map<string, string> metadata = 4; }
 message TaskMessage { repeated TaskMessagePart parts = 1; map<string, string> metadata = 2; }
-message TaskEnvelope { TaskId task_id = 1; CorrelationId correlation_id = 2; IdempotencyKey idempotency_key = 3; TaskStatus status = 4; repeated TaskMessage messages = 5; map<string, string> metadata = 6; }
+message TaskEnvelope { TaskId task_id = 1; CorrelationId correlation_id = 2; IdempotencyKey idempotency_key = 3; TaskStatus status = 4; repeated TaskMessage messages = 5; map<string, string> metadata = 6; // Absolute Unix epoch execution deadline; zero means no deadline.
+int64 deadline_ms = 7; }

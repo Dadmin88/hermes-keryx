@@ -4,20 +4,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use keryx_core::PeerId;
+use keryx_core::{
+    Digest, PeerId, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES, RESULT_ARTIFACT_FRAME_MAX_BYTES,
+};
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::{
-    AckTaskRequest, NodeFrame, NodeId, PublishTaskRequest, RegisterNodeRequest, TaskEnvelope,
-    TaskId, TaskStatus,
+    AckTaskRequest, ArtifactId, NodeFrame, NodeId, PublishResultRequest, PublishTaskRequest,
+    RegisterNodeRequest, ResultArtifact, TaskEnvelope, TaskId, TaskResultEnvelope, TaskStatus,
+    TerminalOutcome,
 };
-use keryx_relay::health_server::{serve_grpc_health, NODE_ID_METADATA_KEY};
+use keryx_relay::health_server::{
+    serve_grpc_health, serve_grpc_health_with_auth, NODE_ID_METADATA_KEY, NODE_TOKEN_METADATA_KEY,
+};
 use keryx_relay::registry::SkillRegistry;
 use keryx_relay::runtime::RelayRuntime;
+use keryx_relay::security::NodeTokenAuth;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
-use tonic::Request;
+use tonic::{Code, Request};
 
 #[tokio::test]
 async fn connect_node_relays_node_frames_to_connected_target() {
@@ -114,6 +120,225 @@ async fn publish_task_stores_offline_mailbox_and_delivers_on_reconnect() {
         .expect("ack task")
         .into_inner();
     assert!(acked.accepted);
+}
+
+#[tokio::test]
+async fn descriptor_only_publish_result_requires_configured_authentication() {
+    let runtime = RelayRuntime::new("relay-grpc-result-auth-required");
+    runtime.mark_transport_listening();
+    let addr = spawn_relay(Arc::clone(&runtime)).await;
+    let channel = connect_grpc(addr).await;
+    let mut publisher = result_frame_client(channel);
+
+    let error = publisher
+        .publish_result(PublishResultRequest {
+            result: Some(TaskResultEnvelope {
+                protocol_version: 1,
+                task_id: Some(TaskId {
+                    value: "result-auth-required".to_string(),
+                }),
+                correlation_id: None,
+                outcome: TerminalOutcome::Completed as i32,
+                executor_peer_id: "executor-node".to_string(),
+                duration_ms: 0,
+                completed_at_ms: 0,
+                error_reason: String::new(),
+                result_metadata: HashMap::new(),
+                output_artifacts: vec![ResultArtifact {
+                    path: "result.bin".to_string(),
+                    media_type: "application/octet-stream".to_string(),
+                    metadata: HashMap::new(),
+                    artifact_id: None,
+                    sha256: String::new(),
+                    byte_len: 0,
+                    content: Vec::new(),
+                    content_present: false,
+                }],
+            }),
+            target_node_id: "origin-node".to_string(),
+            source_node_id: "executor-node".to_string(),
+            frame_id: "result-auth-required".to_string(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::Unauthenticated);
+    assert_eq!(runtime.mailbox_depth("origin-node"), 0);
+}
+
+#[tokio::test]
+async fn authenticated_publish_result_delivers_four_mib_artifact_payload_unchanged() {
+    let runtime = RelayRuntime::new("relay-grpc-result-frame-limit-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_authenticated_relay(Arc::clone(&runtime)).await;
+    let channel = connect_grpc(addr).await;
+
+    let (_origin_tx, origin_rx) = mpsc::channel(4);
+    let mut origin = result_frame_client(channel.clone());
+    let mut origin_stream = origin
+        .connect_node(authenticated_connect_request("origin-node", origin_rx))
+        .await
+        .expect("connect authenticated origin node")
+        .into_inner();
+
+    let content = vec![0xA5; MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES];
+    let digest = Digest::compute(&content).to_string();
+    let result = TaskResultEnvelope {
+        protocol_version: 2,
+        task_id: Some(TaskId {
+            value: "result-frame-limit-task".to_string(),
+        }),
+        correlation_id: None,
+        outcome: TerminalOutcome::Completed as i32,
+        executor_peer_id: "executor-node".to_string(),
+        duration_ms: 42,
+        completed_at_ms: 1_800_000_000_000,
+        error_reason: String::new(),
+        result_metadata: HashMap::from([(String::from("summary"), String::from("4 MiB payload"))]),
+        output_artifacts: vec![ResultArtifact {
+            path: "outputs/final.bin".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            metadata: HashMap::from([(String::from("role"), String::from("final"))]),
+            artifact_id: Some(ArtifactId {
+                value: "remote-artifact-id".to_string(),
+            }),
+            sha256: digest.clone(),
+            byte_len: content.len() as u64,
+            content: content.clone(),
+            content_present: true,
+        }],
+    };
+
+    let mut publisher = result_frame_client(channel);
+    let mut request = Request::new(PublishResultRequest {
+        result: Some(result),
+        target_node_id: "origin-node".to_string(),
+        source_node_id: "executor-node".to_string(),
+        frame_id: "result-frame-limit".to_string(),
+    });
+    add_auth_metadata(&mut request, "executor-node");
+    publisher
+        .publish_result(request)
+        .await
+        .expect("publish authenticated four MiB result");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(3), origin_stream.next())
+        .await
+        .expect("result relay frame timeout")
+        .expect("origin stream ended")
+        .expect("result relay frame status");
+    let delivered_result = delivered.result.expect("result frame");
+    let delivered_artifact = delivered_result
+        .output_artifacts
+        .first()
+        .expect("result artifact");
+    assert_eq!(delivered_result.protocol_version, 2);
+    assert!(delivered_artifact.content_present);
+    assert_eq!(delivered_artifact.content, content);
+    assert_eq!(delivered_artifact.sha256, digest);
+    assert_eq!(
+        delivered_artifact.byte_len,
+        MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64
+    );
+}
+
+#[tokio::test]
+async fn relay_rejects_result_frame_larger_than_transport_cap_without_delivery() {
+    let runtime = RelayRuntime::new("relay-grpc-result-frame-overflow-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_authenticated_relay(Arc::clone(&runtime)).await;
+    let channel = connect_grpc(addr).await;
+
+    let (_origin_tx, origin_rx) = mpsc::channel(4);
+    let mut origin = result_frame_client(channel.clone());
+    let mut origin_stream = origin
+        .connect_node(authenticated_connect_request("origin-node", origin_rx))
+        .await
+        .expect("connect authenticated origin node");
+    let content = vec![0x5A; RESULT_ARTIFACT_FRAME_MAX_BYTES];
+    let mut publisher =
+        result_frame_client_with_limit(channel, RESULT_ARTIFACT_FRAME_MAX_BYTES + 1024);
+    let mut request = Request::new(PublishResultRequest {
+        result: Some(TaskResultEnvelope {
+            protocol_version: 2,
+            task_id: Some(TaskId {
+                value: "result-frame-overflow-task".to_string(),
+            }),
+            correlation_id: None,
+            outcome: TerminalOutcome::Completed as i32,
+            executor_peer_id: "executor-node".to_string(),
+            duration_ms: 0,
+            completed_at_ms: 0,
+            error_reason: String::new(),
+            result_metadata: HashMap::new(),
+            output_artifacts: vec![ResultArtifact {
+                path: "outputs/overflow.bin".to_string(),
+                media_type: "application/octet-stream".to_string(),
+                metadata: HashMap::new(),
+                artifact_id: None,
+                sha256: String::new(),
+                byte_len: content.len() as u64,
+                content,
+                content_present: true,
+            }],
+        }),
+        target_node_id: "origin-node".to_string(),
+        source_node_id: "executor-node".to_string(),
+        frame_id: "result-frame-overflow".to_string(),
+    });
+    add_auth_metadata(&mut request, "executor-node");
+    let error = publisher
+        .publish_result(request)
+        .await
+        .expect_err("frame larger than relay transport cap must be rejected");
+    // tonic maps configured gRPC message-size violations to OutOfRange.
+    assert_eq!(error.code(), tonic::Code::OutOfRange);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            origin_stream.get_mut().message()
+        )
+        .await
+        .is_err(),
+        "oversized result frame must not be delivered"
+    );
+}
+
+#[tokio::test]
+async fn publish_task_preserves_execution_deadline_through_offline_mailbox() {
+    let runtime = RelayRuntime::new("relay-grpc-deadline-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_relay(Arc::clone(&runtime)).await;
+    let channel = connect_grpc(addr).await;
+
+    let mut client = KeryxRelayClient::new(channel.clone());
+    register(&mut client, "node-deadline-offline").await;
+    let deadline_ms = 1_800_000_000_000;
+    let mut outbound = task("task-deadline-offline", "node-deadline-offline");
+    outbound.deadline_ms = deadline_ms;
+    client
+        .publish_task(PublishTaskRequest {
+            task: Some(outbound),
+            target_node_id: "node-deadline-offline".to_string(),
+            source_node_id: "node-deadline-publisher".to_string(),
+        })
+        .await
+        .expect("publish offline task");
+
+    let (_node_tx, node_rx) = mpsc::channel(4);
+    let mut node_client = KeryxRelayClient::new(channel);
+    let mut stream = node_client
+        .connect_node(connect_request("node-deadline-offline", node_rx))
+        .await
+        .expect("connect offline node")
+        .into_inner();
+    let delivered = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("offline delivery timeout")
+        .expect("relay stream ended")
+        .expect("relay frame status");
+
+    assert_eq!(delivered.task.unwrap().deadline_ms, deadline_ms);
 }
 
 #[tokio::test]
@@ -231,6 +456,62 @@ async fn spawn_relay_with_registry(
     addr
 }
 
+async fn spawn_authenticated_relay(runtime: Arc<RelayRuntime>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let auth = Arc::new(NodeTokenAuth::new(
+        HashMap::from([
+            (
+                "origin-node".parse().unwrap(),
+                "origin-node-test-token".to_string(),
+            ),
+            (
+                "executor-node".parse().unwrap(),
+                "executor-node-test-token".to_string(),
+            ),
+        ]),
+        Default::default(),
+    ));
+    tokio::spawn(async move {
+        let _ =
+            serve_grpc_health_with_auth(runtime, Arc::new(SkillRegistry::new()), auth, addr).await;
+    });
+    addr
+}
+
+fn result_frame_client(channel: Channel) -> KeryxRelayClient<Channel> {
+    result_frame_client_with_limit(channel, RESULT_ARTIFACT_FRAME_MAX_BYTES)
+}
+
+fn result_frame_client_with_limit(
+    channel: Channel,
+    max_message_size: usize,
+) -> KeryxRelayClient<Channel> {
+    KeryxRelayClient::new(channel)
+        .max_encoding_message_size(max_message_size)
+        .max_decoding_message_size(max_message_size)
+}
+
+fn authenticated_connect_request(
+    node_id: &str,
+    rx: mpsc::Receiver<NodeFrame>,
+) -> Request<ReceiverStream<NodeFrame>> {
+    let mut request = connect_request(node_id, rx);
+    add_auth_metadata(&mut request, node_id);
+    request
+}
+
+fn add_auth_metadata<T>(request: &mut Request<T>, node_id: &str) {
+    request
+        .metadata_mut()
+        .insert(NODE_ID_METADATA_KEY, node_id.parse().unwrap());
+    request.metadata_mut().insert(
+        NODE_TOKEN_METADATA_KEY,
+        format!("{node_id}-test-token").parse().unwrap(),
+    );
+}
+
 async fn connect_grpc(addr: SocketAddr) -> Channel {
     let uri = format!("http://{addr}");
     for _ in 0..40 {
@@ -279,6 +560,7 @@ fn task(task_id: &str, target_node_id: &str) -> TaskEnvelope {
         status: TaskStatus::Created as i32,
         messages: vec![],
         metadata,
+        deadline_ms: 0,
     }
 }
 

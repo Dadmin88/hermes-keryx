@@ -48,6 +48,7 @@ impl IncomingRelayTask {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         }
     }
@@ -163,9 +164,14 @@ pub async fn handle_incoming_task(
         Ok(key) => key,
         Err(message) => return IncomingHandleResult::InvalidEnvelope(message),
     };
+    let deadline_ms = match deadline_from_envelope(&incoming.envelope) {
+        Ok(deadline_ms) => deadline_ms,
+        Err(message) => return IncomingHandleResult::InvalidEnvelope(message),
+    };
     let encoded_envelope = incoming.envelope.encode_to_vec();
 
-    let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    record.deadline_ms = deadline_ms;
     let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
     let accepted = match runtime
         .accept_pending_task_with_envelope_backpressure(record, envelope_record)
@@ -193,6 +199,7 @@ pub async fn handle_incoming_task(
                 lease_id = Some(lease);
                 runtime.metrics().increment_tasks_claimed();
             }
+            Err(StoreError::TaskDeadlineExpired { .. }) => {}
             Err(error) => return IncomingHandleResult::Store(error),
         }
     }
@@ -262,6 +269,13 @@ fn parse_envelope_idempotency_key(
     IdempotencyKey::new(trimmed)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, String> {
+    if envelope.deadline_ms < 0 {
+        return Err("deadline_ms must be zero or a positive Unix epoch timestamp".to_string());
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn new_lease_id(task_id: &TaskId, leased_at_ms: i64) -> LeaseId {
@@ -350,6 +364,7 @@ mod tests {
             status: 0,
             messages: vec![],
             metadata: Default::default(),
+            deadline_ms: 0,
         }
     }
 

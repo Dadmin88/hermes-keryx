@@ -22,6 +22,7 @@ async fn complete_or_fail_on_pending_task_without_lease_is_rejected() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

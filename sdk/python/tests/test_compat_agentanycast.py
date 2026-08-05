@@ -11,7 +11,7 @@ import pytest
 from keryx.card import AgentCard, Skill
 from keryx.client import DaemonClient, PeerInfo
 from keryx.node import KeryxNode
-from hermes.keryx.v1 import daemon_pb2, registry_pb2
+from hermes.keryx.v1 import common_pb2, daemon_pb2, registry_pb2, result_pb2
 
 
 def _make_peer_id(pubkey_bytes: bytes) -> str:
@@ -24,6 +24,7 @@ class _FakeDaemonStub:
     def __init__(self, local_peer_id: str) -> None:
         self._local_peer_id = local_peer_id
         self.sent: list[daemon_pb2.SendTaskRequest] = []
+        self.result_response = daemon_pb2.GetTaskResultResponse(status="submitted")
 
     async def ListPeers(self, _request: Any) -> daemon_pb2.ListPeersResponse:
         return daemon_pb2.ListPeersResponse(
@@ -41,6 +42,11 @@ class _FakeDaemonStub:
             routed_to=request.target_peer_id,
             delivery_route="local",
         )
+
+    async def GetTaskResult(
+        self, _request: daemon_pb2.GetTaskResultRequest
+    ) -> daemon_pb2.GetTaskResultResponse:
+        return self.result_response
 
 
 class _FakeRegistryStub:
@@ -155,10 +161,83 @@ async def test_send_task_maps_to_daemon_rpc(sample_card: AgentCard) -> None:
     node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
     await node.start()
 
-    handle = await node.send_task({"role": "user", "parts": [{"text": "hello"}]}, peer_id="12D3KooWRemote")
+    deadline_ms = 1_800_000_000_000
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "hello"}]},
+        peer_id="12D3KooWRemote",
+        deadline_ms=deadline_ms,
+    )
     assert handle.task_id
     assert fake_client._fake_daemon.sent[0].target_peer_id == "12D3KooWRemote"
     assert fake_client._fake_daemon.sent[0].envelope.messages[0].parts[0].text == "hello"
+    assert fake_client._fake_daemon.sent[0].envelope.deadline_ms == deadline_ms
+
+
+@pytest.mark.asyncio
+async def test_task_handle_preserves_origin_artifact_id(sample_card: AgentCard) -> None:
+    peer_id = _make_peer_id(bytes(range(32)))
+    fake_client = FakeDaemonClient(local_peer_id=peer_id)
+    node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
+    await node.start()
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "hello"}]},
+        peer_id="12D3KooWRemote",
+    )
+    fake_client._fake_daemon.result_response = daemon_pb2.GetTaskResultResponse(
+        found=True,
+        status="completed",
+        result=result_pb2.TaskResultEnvelope(
+            protocol_version=2,
+            task_id=common_pb2.TaskId(value=handle.task_id),
+            outcome=result_pb2.TERMINAL_OUTCOME_COMPLETED,
+            output_artifacts=[
+                result_pb2.ResultArtifact(
+                    path="../../display-only.bin",
+                    artifact_id=common_pb2.ArtifactId(value="origin-artifact-1"),
+                    sha256="0" * 64,
+                    byte_len=4,
+                )
+            ],
+        ),
+    )
+
+    result = await handle.wait(timeout=1)
+
+    assert result.artifacts[0].artifact_id == "origin-artifact-1"
+    assert result.artifacts[0].name == "../../display-only.bin"
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_keeps_execution_deadline_distinct_from_delivery_timeout() -> None:
+    client = FakeDaemonClient(local_peer_id="peer-local")
+    await client.connect()
+
+    await client.send_task(
+        target_peer_id="peer-remote",
+        task_id="task-deadline",
+        message_text="hello",
+        deadline_ms=1_800_000_000_000,
+        timeout_ms=4_321,
+    )
+
+    request = client._fake_daemon.sent[0]
+    assert request.envelope.deadline_ms == 1_800_000_000_000
+    assert request.timeout_ms == 4_321
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_ms", [True, -1, 2**63])
+async def test_daemon_client_rejects_invalid_execution_deadline(deadline_ms: int) -> None:
+    client = FakeDaemonClient(local_peer_id="peer-local")
+    await client.connect()
+
+    with pytest.raises(ValueError, match="deadline_ms"):
+        await client.send_task(
+            target_peer_id="peer-remote",
+            task_id="task-deadline",
+            message_text="hello",
+            deadline_ms=deadline_ms,
+        )
 
 
 @pytest.mark.asyncio

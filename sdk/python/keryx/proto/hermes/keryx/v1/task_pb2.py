@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from hermes.keryx.v1 import common_pb2 as hermes_dot_keryx_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1ahermes/keryx/v1/task.proto\x12\x0fhermes.keryx.v1\x1a\x1chermes/keryx/v1/common.proto\"\xb3\x01\n\x0fTaskMessagePart\x12\x12\n\nmedia_type\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0b\n\x03raw\x18\x03 \x01(\x0c\x12@\n\x08metadata\x18\x04 \x03(\x0b\x32..hermes.keryx.v1.TaskMessagePart.MetadataEntry\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xad\x01\n\x0bTaskMessage\x12/\n\x05parts\x18\x01 \x03(\x0b\x32 .hermes.keryx.v1.TaskMessagePart\x12<\n\x08metadata\x18\x02 \x03(\x0b\x32*.hermes.keryx.v1.TaskMessage.MetadataEntry\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xf7\x02\n\x0cTaskEnvelope\x12(\n\x07task_id\x18\x01 \x01(\x0b\x32\x17.hermes.keryx.v1.TaskId\x12\x36\n\x0e\x63orrelation_id\x18\x02 \x01(\x0b\x32\x1e.hermes.keryx.v1.CorrelationId\x12\x38\n\x0fidempotency_key\x18\x03 \x01(\x0b\x32\x1f.hermes.keryx.v1.IdempotencyKey\x12+\n\x06status\x18\x04 \x01(\x0e\x32\x1b.hermes.keryx.v1.TaskStatus\x12.\n\x08messages\x18\x05 \x03(\x0b\x32\x1c.hermes.keryx.v1.TaskMessage\x12=\n\x08metadata\x18\x06 \x03(\x0b\x32+.hermes.keryx.v1.TaskEnvelope.MetadataEntry\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01*\x89\x03\n\nTaskStatus\x12\x1b\n\x17TASK_STATUS_UNSPECIFIED\x10\x00\x12\x17\n\x13TASK_STATUS_CREATED\x10\x01\x12\x18\n\x14TASK_STATUS_ACCEPTED\x10\x02\x12\x16\n\x12TASK_STATUS_QUEUED\x10\x03\x12!\n\x1dTASK_STATUS_AWAITING_APPROVAL\x10\x04\x12\x16\n\x12TASK_STATUS_LEASED\x10\x05\x12\x17\n\x13TASK_STATUS_RUNNING\x10\x06\x12\x1e\n\x1aTASK_STATUS_AWAITING_INPUT\x10\x07\x12\x19\n\x15TASK_STATUS_COMPLETED\x10\x08\x12\x16\n\x12TASK_STATUS_FAILED\x10\t\x12\x18\n\x14TASK_STATUS_CANCELED\x10\n\x12\x19\n\x15TASK_STATUS_TIMED_OUT\x10\x0b\x12\x18\n\x14TASK_STATUS_REJECTED\x10\x0c\x12\x1d\n\x19TASK_STATUS_DEAD_LETTERED\x10\rb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1ahermes/keryx/v1/task.proto\x12\x0fhermes.keryx.v1\x1a\x1chermes/keryx/v1/common.proto\"\xb3\x01\n\x0fTaskMessagePart\x12\x12\n\nmedia_type\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0b\n\x03raw\x18\x03 \x01(\x0c\x12@\n\x08metadata\x18\x04 \x03(\x0b\x32..hermes.keryx.v1.TaskMessagePart.MetadataEntry\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xad\x01\n\x0bTaskMessage\x12/\n\x05parts\x18\x01 \x03(\x0b\x32 .hermes.keryx.v1.TaskMessagePart\x12<\n\x08metadata\x18\x02 \x03(\x0b\x32*.hermes.keryx.v1.TaskMessage.MetadataEntry\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x8c\x03\n\x0cTaskEnvelope\x12(\n\x07task_id\x18\x01 \x01(\x0b\x32\x17.hermes.keryx.v1.TaskId\x12\x36\n\x0e\x63orrelation_id\x18\x02 \x01(\x0b\x32\x1e.hermes.keryx.v1.CorrelationId\x12\x38\n\x0fidempotency_key\x18\x03 \x01(\x0b\x32\x1f.hermes.keryx.v1.IdempotencyKey\x12+\n\x06status\x18\x04 \x01(\x0e\x32\x1b.hermes.keryx.v1.TaskStatus\x12.\n\x08messages\x18\x05 \x03(\x0b\x32\x1c.hermes.keryx.v1.TaskMessage\x12=\n\x08metadata\x18\x06 \x03(\x0b\x32+.hermes.keryx.v1.TaskEnvelope.MetadataEntry\x12\x13\n\x0b\x64\x65\x61\x64line_ms\x18\x07 \x01(\x03\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01*\x89\x03\n\nTaskStatus\x12\x1b\n\x17TASK_STATUS_UNSPECIFIED\x10\x00\x12\x17\n\x13TASK_STATUS_CREATED\x10\x01\x12\x18\n\x14TASK_STATUS_ACCEPTED\x10\x02\x12\x16\n\x12TASK_STATUS_QUEUED\x10\x03\x12!\n\x1dTASK_STATUS_AWAITING_APPROVAL\x10\x04\x12\x16\n\x12TASK_STATUS_LEASED\x10\x05\x12\x17\n\x13TASK_STATUS_RUNNING\x10\x06\x12\x1e\n\x1aTASK_STATUS_AWAITING_INPUT\x10\x07\x12\x19\n\x15TASK_STATUS_COMPLETED\x10\x08\x12\x16\n\x12TASK_STATUS_FAILED\x10\t\x12\x18\n\x14TASK_STATUS_CANCELED\x10\n\x12\x19\n\x15TASK_STATUS_TIMED_OUT\x10\x0b\x12\x18\n\x14TASK_STATUS_REJECTED\x10\x0c\x12\x1d\n\x19TASK_STATUS_DEAD_LETTERED\x10\rb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -38,8 +38,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TASKMESSAGE_METADATAENTRY']._serialized_options = b'8\001'
   _globals['_TASKENVELOPE_METADATAENTRY']._loaded_options = None
   _globals['_TASKENVELOPE_METADATAENTRY']._serialized_options = b'8\001'
-  _globals['_TASKSTATUS']._serialized_start=814
-  _globals['_TASKSTATUS']._serialized_end=1207
+  _globals['_TASKSTATUS']._serialized_start=835
+  _globals['_TASKSTATUS']._serialized_end=1228
   _globals['_TASKMESSAGEPART']._serialized_start=78
   _globals['_TASKMESSAGEPART']._serialized_end=257
   _globals['_TASKMESSAGEPART_METADATAENTRY']._serialized_start=210
@@ -49,7 +49,7 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TASKMESSAGE_METADATAENTRY']._serialized_start=210
   _globals['_TASKMESSAGE_METADATAENTRY']._serialized_end=257
   _globals['_TASKENVELOPE']._serialized_start=436
-  _globals['_TASKENVELOPE']._serialized_end=811
+  _globals['_TASKENVELOPE']._serialized_end=832
   _globals['_TASKENVELOPE_METADATAENTRY']._serialized_start=210
   _globals['_TASKENVELOPE_METADATAENTRY']._serialized_end=257
 # @@protoc_insertion_point(module_scope)

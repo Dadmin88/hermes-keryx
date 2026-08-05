@@ -16,9 +16,20 @@ from typing import Any
 import grpc
 
 from keryx.card import AgentCard
-from keryx.client import DaemonClient, default_daemon_endpoint
+from keryx.client import (
+    RESULT_ARTIFACT_GRPC_OPTIONS,
+    DaemonClient,
+    _verified_artifact_content,
+    _write_artifact_download,
+)
 from keryx.config import KeryxConfig, grpc_target, load_config
-from keryx.models import ClaimedTask, TaskArtifact, TaskResult, TaskState
+from keryx.models import (
+    ArtifactContent,
+    ClaimedTask,
+    TaskArtifact,
+    TaskResult,
+    TaskState,
+)
 from keryx.task import (
     Artifact,
     IncomingTask,
@@ -145,7 +156,9 @@ class KeryxNode:
         if self._status_callback:
             self._status_callback("Connecting to Keryx daemon")
         if self._channel is None:
-            self._channel = grpc.aio.insecure_channel(grpc_target(self._daemon_endpoint))
+            self._channel = grpc.aio.insecure_channel(
+                grpc_target(self._daemon_endpoint), options=RESULT_ARTIFACT_GRPC_OPTIONS
+            )
             self._owns_channel = True
         if wait_ready and hasattr(self._channel, "channel_ready"):
             await self._channel.channel_ready()
@@ -346,6 +359,33 @@ class KeryxNode:
 
     async def complete_task(self, *args: Any, **kwargs: Any) -> TaskResult:
         return await self.complete(*args, **kwargs)
+
+    async def get_artifact(
+        self, artifact_id: str, *, metadata_only: bool = False
+    ) -> ArtifactContent:
+        daemon = await self._daemon()
+        response = await daemon.GetArtifact(
+            daemon_pb2.GetArtifactRequest(
+                artifact_id=common_pb2.ArtifactId(value=artifact_id),
+                metadata_only=metadata_only,
+            )
+        )
+        return _verified_artifact_content(
+            response,
+            requested_artifact_id=artifact_id,
+            metadata_only=metadata_only,
+        )
+
+    async def download_artifact(
+        self,
+        artifact_id: str,
+        destination: str | Path,
+        *,
+        overwrite: bool = False,
+    ) -> ArtifactContent:
+        artifact = await self.get_artifact(artifact_id)
+        _write_artifact_download(artifact, destination, overwrite=overwrite)
+        return artifact
 
     async def fail(
         self,
@@ -665,6 +705,7 @@ class KeryxNode:
         skill: str | None = None,
         url: str | None = None,
         metadata: dict[str, str] | None = None,
+        deadline_ms: int = 0,
     ) -> TaskHandle:
         self._ensure_running()
         assert self._client is not None
@@ -688,6 +729,7 @@ class KeryxNode:
                 task_id=task_id,
                 message_text=text,
                 metadata=metadata,
+                deadline_ms=deadline_ms,
             )
         except Exception as exc:
             if resolved_skill is not None and _is_unknown_peer_error(exc):
@@ -712,7 +754,17 @@ class KeryxNode:
                 for item in result.output_artifacts:
                     preview = item.metadata.get("text_preview", "")
                     parts = [Part(text=preview, media_type=item.media_type or "text/plain")] if preview else []
-                    artifacts.append(Artifact(name=item.path, parts=parts))
+                    artifacts.append(
+                        Artifact(
+                            artifact_id=(
+                                item.artifact_id.value
+                                if item.HasField("artifact_id")
+                                else ""
+                            ),
+                            name=item.path,
+                            parts=parts,
+                        )
+                    )
                 if result_text and not artifacts:
                     artifacts.append(
                         Artifact(
@@ -877,6 +929,10 @@ def _completion_payload(
     result_texts: list[str] = []
     for index, artifact in enumerate(artifacts or [], start=1):
         text = "\n".join(part.text for part in artifact.parts if part.text)
+        raw_parts = [part for part in artifact.parts if part.raw]
+        if len(raw_parts) > 1:
+            raise ValueError("artifact contains multiple raw parts")
+        content = raw_parts[0].raw if raw_parts else None
         metadata: dict[str, str] = {}
         if artifact.artifact_id:
             metadata["artifact_id"] = artifact.artifact_id
@@ -886,8 +942,13 @@ def _completion_payload(
         descriptors.append(
             TaskArtifact(
                 path=artifact.name or artifact.artifact_id or f"artifact-{index}",
-                media_type="text/plain" if text else "application/octet-stream",
+                media_type=(
+                    raw_parts[0].media_type
+                    if raw_parts
+                    else "text/plain" if text else "application/octet-stream"
+                ),
                 metadata=metadata,
+                content=content,
             )
         )
     result_metadata: dict[str, str] = {}

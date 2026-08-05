@@ -1,6 +1,11 @@
 //! Durable authenticated task context, terminal results, and result-delivery outbox.
 
-use keryx_core::{AgentId, KeryxEventType, LeaseId, PeerId, RetryPolicy, TaskId, TaskStatus};
+use std::{collections::HashSet, path::Path};
+
+use keryx_core::{
+    origin_result_artifact_id, AgentId, ArtifactMeta, Digest, KeryxEventType, LeaseId, PeerId,
+    RetryPolicy, TaskId, TaskStatus, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
+};
 use sqlx::Row;
 
 use super::*;
@@ -33,6 +38,17 @@ pub struct TerminalResultRecord {
     pub return_peer_id: Option<PeerId>,
     pub executor_peer_id: PeerId,
     pub created_at_ms: i64,
+}
+
+/// Store-level artifact ingress record. This intentionally has no protobuf dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginResultArtifact {
+    /// The result-list ordinal assigned by the origin protocol boundary.
+    pub ordinal: u32,
+    /// Canonical descriptor that will be persisted after byte validation.
+    pub meta: ArtifactMeta,
+    /// Transport bytes; zero bytes are valid when this record exists.
+    pub content: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +127,74 @@ fn make_outbox(result: &TerminalResultRecord) -> Option<ResultOutboxRecord> {
             created_at_ms: result.created_at_ms,
             updated_at_ms: result.created_at_ms,
         })
+}
+
+fn validate_origin_result_artifacts(
+    task_id: &TaskId,
+    artifacts: &[OriginResultArtifact],
+) -> StoreResult<Vec<ArtifactRecord>> {
+    let mut aggregate_len = 0_u64;
+    let mut records = Vec::with_capacity(artifacts.len());
+    let mut next_minimum_ordinal = 0_u32;
+    for artifact in artifacts {
+        if artifact.ordinal < next_minimum_ordinal {
+            return Err(StoreError::OriginResultArtifactOrdinalMismatch {
+                expected: next_minimum_ordinal,
+                actual: artifact.ordinal,
+            });
+        }
+        next_minimum_ordinal = artifact.ordinal.checked_add(1).ok_or(
+            StoreError::OriginResultArtifactOrdinalMismatch {
+                expected: artifact.ordinal,
+                actual: artifact.ordinal,
+            },
+        )?;
+        if artifact.meta.task_id != *task_id {
+            return Err(StoreError::OriginResultArtifactTaskMismatch {
+                task_id: task_id.clone(),
+                artifact_task_id: artifact.meta.task_id.clone(),
+            });
+        }
+        if artifact.meta.artifact_id != origin_result_artifact_id(task_id, artifact.ordinal) {
+            return Err(StoreError::OriginResultArtifactIdMismatch {
+                task_id: task_id.clone(),
+                ordinal: artifact.ordinal,
+            });
+        }
+        let actual_len = artifact.content.len() as u64;
+        if artifact.meta.byte_len != actual_len {
+            return Err(StoreError::ArtifactLengthMismatch {
+                declared: artifact.meta.byte_len,
+                actual: actual_len,
+            });
+        }
+        let actual_digest = Digest::compute(&artifact.content);
+        if artifact.meta.digest != actual_digest {
+            return Err(StoreError::DigestMismatch {
+                expected: artifact.meta.digest.as_str().to_owned(),
+                actual: actual_digest.as_str().to_owned(),
+            });
+        }
+        aggregate_len =
+            aggregate_len
+                .checked_add(actual_len)
+                .ok_or(StoreError::ArtifactTooLarge {
+                    byte_len: u64::MAX,
+                    limit_bytes: MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64,
+                })?;
+        if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+            return Err(StoreError::ArtifactTooLarge {
+                byte_len: aggregate_len,
+                limit_bytes: MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64,
+            });
+        }
+        records.push(artifact_record_from_meta(
+            &artifact.meta,
+            actual_digest,
+            actual_len,
+        ));
+    }
+    Ok(records)
 }
 
 fn ensure_result_task(result: &TerminalResultRecord, task_id: &TaskId) -> StoreResult<()> {
@@ -598,6 +682,26 @@ impl SqliteStore {
         result: TerminalResultRecord,
         authenticated_executor_peer_id: &PeerId,
     ) -> StoreResult<TaskRecord> {
+        self.apply_remote_result_with_artifacts(
+            result,
+            &[],
+            authenticated_executor_peer_id,
+            Path::new(""),
+        )
+        .await
+    }
+
+    /// Atomically applies an authenticated remote terminal result and its origin-owned artifacts.
+    ///
+    /// The caller supplies a descriptor-only result record; this store intentionally has no
+    /// protocol dependency and persists that exact record only after all payload checks pass.
+    pub async fn apply_remote_result_with_artifacts(
+        &self,
+        result: TerminalResultRecord,
+        artifacts: &[OriginResultArtifact],
+        authenticated_executor_peer_id: &PeerId,
+        blob_dir: impl AsRef<Path>,
+    ) -> StoreResult<TaskRecord> {
         result.validate()?;
         if &result.executor_peer_id != authenticated_executor_peer_id {
             return Err(StoreError::RemoteResultExecutorMismatch {
@@ -606,15 +710,9 @@ impl SqliteStore {
                 actual: result.executor_peer_id.clone(),
             });
         }
+        let records = validate_origin_result_artifacts(&result.task_id, artifacts)?;
+        let blob_dir = blob_dir.as_ref().to_path_buf();
         let mut tx = self.pool.begin().await?;
-        if let Some(existing) = fetch_terminal_result_optional(&mut tx, &result.task_id).await? {
-            if existing == result {
-                let task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
-                tx.commit().await?;
-                return Ok(task);
-            }
-            return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
-        }
         let context = fetch_transport_context_optional(&mut tx, &result.task_id)
             .await?
             .ok_or_else(|| StoreError::TransportContextNotFound(result.task_id.clone()))?;
@@ -627,35 +725,117 @@ impl SqliteStore {
                 actual: authenticated_executor_peer_id.clone(),
             });
         }
-        let mut task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
-        if task.status == TaskStatus::Pending {
+
+        if let Some(existing) = fetch_terminal_result_optional(&mut tx, &result.task_id).await? {
+            if existing != result {
+                return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
+            }
+            let stored = fetch_artifacts_for_task_with_executor(&mut tx, &result.task_id).await?;
+            if stored.len() != records.len() || stored.iter().any(|row| !records.contains(row)) {
+                return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
+            }
+            tx.commit().await?;
+            for artifact in artifacts {
+                let (_, persisted) = self
+                    .get_artifact(&artifact.meta.artifact_id, &blob_dir)
+                    .await?;
+                if persisted != artifact.content {
+                    return Err(StoreError::OriginResultArtifactConflict(
+                        artifact.meta.artifact_id.clone(),
+                    ));
+                }
+            }
+            return self.get_task(&result.task_id).await;
+        }
+
+        for record in &records {
+            if fetch_artifact_optional_with_executor(&mut tx, &record.artifact_id)
+                .await?
+                .is_some()
+            {
+                return Err(StoreError::OriginResultArtifactConflict(
+                    record.artifact_id.clone(),
+                ));
+            }
+        }
+
+        let mut prepared = Vec::new();
+        let mut prepared_digests = HashSet::new();
+        for (artifact, record) in artifacts.iter().zip(&records) {
+            if !record.inline && prepared_digests.insert(record.digest.clone()) {
+                match prepare_blob_write_with_executor(
+                    &mut tx,
+                    &record.digest,
+                    &artifact.content,
+                    &blob_dir,
+                )
+                .await
+                {
+                    Ok(prepared_blob) => prepared.push(prepared_blob),
+                    Err(error) => {
+                        tx.rollback().await.ok();
+                        for prepared_blob in &prepared {
+                            rollback_prepared_blob_write(Some(prepared_blob))?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let apply_result = async {
+            let mut task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
+            if task.status == TaskStatus::Pending {
+                let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
+                update_task_status_with_executor(&mut tx, &result.task_id, TaskStatus::Running)
+                    .await?;
+                insert_event(
+                    &mut tx,
+                    &result.task_id,
+                    sequence,
+                    KeryxEventType::TaskStarted,
+                    Some(TaskStatus::Pending),
+                    TaskStatus::Running,
+                )
+                .await?;
+                task.status = TaskStatus::Running;
+            }
+            let transition = validate_transition(task.status, result.terminal_status)?;
             let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
-            update_task_status_with_executor(&mut tx, &result.task_id, TaskStatus::Running).await?;
+            update_task_status_with_executor(&mut tx, &result.task_id, result.terminal_status)
+                .await?;
             insert_event(
                 &mut tx,
                 &result.task_id,
                 sequence,
-                KeryxEventType::TaskStarted,
-                Some(TaskStatus::Pending),
-                TaskStatus::Running,
+                transition.event_type,
+                Some(transition.from),
+                transition.to,
             )
             .await?;
-            task.status = TaskStatus::Running;
+            for (artifact, record) in artifacts.iter().zip(&records) {
+                if !record.inline {
+                    increment_blob_ref_with_executor(&mut tx, &record.digest, record.byte_len)
+                        .await?;
+                }
+                insert_origin_artifact(&mut tx, record, &artifact.content).await?;
+            }
+            insert_terminal_result_only(&mut tx, &result).await
         }
-        let transition = validate_transition(task.status, result.terminal_status)?;
-        let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
-        update_task_status_with_executor(&mut tx, &result.task_id, result.terminal_status).await?;
-        insert_event(
-            &mut tx,
-            &result.task_id,
-            sequence,
-            transition.event_type,
-            Some(transition.from),
-            transition.to,
-        )
-        .await?;
-        insert_terminal_result_only(&mut tx, &result).await?;
-        tx.commit().await?;
+        .await;
+        if let Err(error) = apply_result {
+            tx.rollback().await.ok();
+            for prepared_blob in &prepared {
+                rollback_prepared_blob_write(Some(prepared_blob))?;
+            }
+            return Err(error);
+        }
+        if let Err(error) = tx.commit().await {
+            for prepared_blob in &prepared {
+                rollback_prepared_blob_write(Some(prepared_blob))?;
+            }
+            return Err(error.into());
+        }
         self.get_task(&result.task_id).await
     }
 }
@@ -755,6 +935,40 @@ async fn fetch_terminal_result_optional(
         .fetch_optional(&mut **tx)
         .await?;
     row.map(row_to_terminal_result).transpose()
+}
+
+async fn fetch_artifacts_for_task_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+) -> StoreResult<Vec<ArtifactRecord>> {
+    let rows = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE task_id = ?",
+    )
+    .bind(task_id.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(row_to_artifact).collect()
+}
+
+async fn insert_origin_artifact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &ArtifactRecord,
+    content: &[u8],
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO artifacts (artifact_id, task_id, digest, media_type, byte_len, inline, inline_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(record.artifact_id.as_str())
+    .bind(record.task_id.as_str())
+    .bind(record.digest.as_str())
+    .bind(record.media_type.as_str())
+    .bind(record.byte_len as i64)
+    .bind(i64::from(record.inline))
+    .bind(record.inline.then_some(content))
+    .bind(&record.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn row_to_terminal_result(row: sqlx::sqlite::SqliteRow) -> StoreResult<TerminalResultRecord> {

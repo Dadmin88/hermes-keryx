@@ -3,7 +3,13 @@
 from keryx.card import AgentCard, Skill
 from keryx.config import KeryxConfig, load_config
 from keryx.did import peer_id_to_did_key
-from keryx.models import ClaimedTask, TaskArtifact, TaskResult, TaskState
+from keryx.models import (
+    ArtifactContent,
+    ClaimedTask,
+    TaskArtifact,
+    TaskResult,
+    TaskState,
+)
 from keryx.node import KeryxNode
 from keryx.registration import deregister_agent, register_agent
 from keryx.task import IncomingTask, Task, TaskHandle, TaskStatus
@@ -16,6 +22,7 @@ __all__ = [
     "ClaimedTask",
     "TaskResult",
     "TaskArtifact",
+    "ArtifactContent",
     "AgentCard",
     "Skill",
     "Task",

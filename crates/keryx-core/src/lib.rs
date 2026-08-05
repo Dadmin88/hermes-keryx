@@ -15,8 +15,9 @@ pub mod task_handle;
 
 pub use agent_card::{AgentCard, AgentId, CapabilityId, Skill};
 pub use artifact::{
-    should_inline, validate_artifact_size, ArtifactId, ArtifactMeta, Digest, MediaType,
-    MAX_BLOB_BYTES, MAX_INLINE_ARTIFACT_BYTES,
+    origin_result_artifact_id, should_inline, validate_artifact_size, ArtifactId, ArtifactMeta,
+    Digest, MediaType, MAX_BLOB_BYTES, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
+    MAX_INLINE_ARTIFACT_BYTES, RESULT_ARTIFACT_FRAME_MAX_BYTES,
 };
 pub use error::{
     CoreResult, KeryxCoreError, ValidationError, ValidationError::CancelNotApplicable,

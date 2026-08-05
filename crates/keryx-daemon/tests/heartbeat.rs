@@ -21,6 +21,7 @@ async fn heartbeat_via_rpc_renews_active_lease() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

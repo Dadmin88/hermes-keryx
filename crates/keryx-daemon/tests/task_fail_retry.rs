@@ -43,6 +43,7 @@ async fn fail_task_via_rpc_requeues_with_retry_count_until_dead_lettered() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

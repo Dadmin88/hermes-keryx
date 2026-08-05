@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use keryx_core::RESULT_ARTIFACT_FRAME_MAX_BYTES;
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
@@ -186,7 +187,9 @@ async fn run_relay_stream(
 ) -> Result<()> {
     let mut relay = KeryxRelayClient::connect(relay_endpoint.clone())
         .await
-        .with_context(|| format!("keryx node stream: relay unavailable at {relay_endpoint}"))?;
+        .with_context(|| format!("keryx node stream: relay unavailable at {relay_endpoint}"))?
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
     let (_tx, rx) = mpsc::channel::<NodeFrame>(8);
     let mut request = Request::new(ReceiverStream::new(rx));
     add_node_auth_metadata(&mut request, &registry_peer_id, node_token.as_deref())?;
@@ -206,7 +209,9 @@ async fn run_relay_stream(
                 let frame = frame.context("keryx node stream: relay frame failed")?;
                 let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
                     .await
-                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?;
+                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?
+                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
                 if let Some(task) = frame.task {
                     daemon
                         .submit_remote_task(SubmitRemoteTaskRequest {
@@ -244,7 +249,10 @@ async fn run_relay_stream(
                     .context("keryx node stream: relay AckFrame failed")?;
             }
             _ = delivery_tick.tick() => {
-                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone()).await?;
+                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
+                    .await?
+                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
                 let delivery = daemon
                     .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
                         worker_id: delivery_worker.clone(),

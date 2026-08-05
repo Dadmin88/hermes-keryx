@@ -32,7 +32,7 @@ The implementation includes:
 - authenticated sender and executor identities;
 - durable terminal results and retryable result delivery;
 - `TaskHandle.wait()` result observation and cancellation;
-- returned artifact descriptors/text previews;
+- canonical origin-assigned artifact descriptors and bounded result bytes;
 - idempotent result ingestion and acknowledgement;
 - a real two-daemon/two-edge-node process harness.
 
@@ -51,7 +51,7 @@ python -m pytest sdk/python/tests -q
 python scripts/e2e_two_node.py --bin-dir target/debug
 ```
 
-The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node identities/tokens, a real Python receiver worker, and preserved logs on failure. It verifies skill discovery, authenticated sender identity, remote handler execution, terminal result return, authenticated executor identity, and returned artifact descriptors/bounded text previews. It does not transport artifact bytes; daemon artifact CRUD remains node-local.
+The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node identities/tokens, a real Python receiver worker, and preserved logs on failure. It verifies skill discovery, authenticated sender identity, remote handler execution, terminal result return, authenticated executor identity, canonical origin-assigned descriptors, exact binary artifact retrieval, and explicit-path atomic download. Remote logical names are retained only as display metadata and cannot choose the local download path.
 
 ## Definition of done
 
@@ -59,7 +59,9 @@ The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node
 - [x] A receiver worker atomically claims the next compatible task.
 - [x] Python `serve_forever()` invokes the registered handler.
 - [x] Completion/failure results propagate to the origin.
-- [x] Sender `TaskHandle.wait()` receives terminal status and artifact descriptors/bounded text previews.
+- [x] Sender `TaskHandle.wait()` receives terminal status and canonical artifact descriptors.
+- [x] Bounded artifact bytes traverse the authenticated result route and verify at origin.
+- [x] Python retrieval and explicit-path download return the exact stored bytes.
 - [x] Sender and executor identities are transport-authenticated.
 - [x] Two-daemon/two-edge-node harness is repeatable.
 - [x] Rust workspace gates pass at the merged checkpoint.

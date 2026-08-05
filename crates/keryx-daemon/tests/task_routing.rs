@@ -3,12 +3,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keryx_core::PeerId;
-use keryx_daemon::{GrpcRelayTaskPublisher, RelayTaskPublisher};
-use keryx_proto::v1::{ClaimTaskRequest, ListPeersRequest, SendTaskRequest, TaskEnvelope, TaskId};
-use keryx_relay::health_server::serve_grpc_health;
+use keryx_daemon::{GrpcRelayTaskPublisher, KeryxDaemonConfig, RelayTaskPublisher};
+use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
+use keryx_proto::v1::{
+    AgentId, ClaimNextTaskRequest, ClaimTaskRequest, ListPeersRequest, NodeFrame, SendTaskRequest,
+    SubmitRemoteTaskRequest, TaskEnvelope, TaskId,
+};
+use keryx_relay::health_server::{serve_grpc_health, NODE_ID_METADATA_KEY};
 use keryx_relay::RelayRuntime;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::Code;
+use tonic::Request;
 
 mod common;
 
@@ -24,6 +32,7 @@ fn envelope(task_id: &str) -> TaskEnvelope {
         status: 0,
         messages: vec![],
         metadata: Default::default(),
+        deadline_ms: 0,
     }
 }
 
@@ -117,6 +126,210 @@ async fn send_task_routes_to_relay_peer() {
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].0, remote.to_string());
     assert_eq!(deliveries[0].1, "route-relay-1");
+}
+
+#[tokio::test]
+async fn remote_task_deadline_survives_relay_delivery_into_destination_claim_response() {
+    let relay = RelayRuntime::new("relay-deadline-propagation-test");
+    relay.mark_transport_listening();
+    let relay_addr = spawn_relay(Arc::clone(&relay)).await;
+    let relay_endpoint = format!("http://{relay_addr}");
+    let source_peer = PeerId::new("node-deadline-source").unwrap();
+    let destination_peer = PeerId::new("node-deadline-destination").unwrap();
+    let source = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
+            .with_local_peer_id(source_peer.clone())
+            .with_relay_endpoint(Some(relay_endpoint.clone())),
+    )
+    .await;
+    let mut destination = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
+            .with_local_peer_id(destination_peer.clone()),
+    )
+    .await;
+
+    let (_node_tx, node_rx) = mpsc::channel::<NodeFrame>(1);
+    let mut relay_client = KeryxRelayClient::connect(relay_endpoint).await.unwrap();
+    let mut connect_request = Request::new(ReceiverStream::new(node_rx));
+    connect_request.metadata_mut().insert(
+        NODE_ID_METADATA_KEY,
+        destination_peer.as_str().parse().unwrap(),
+    );
+    let mut relay_stream = relay_client
+        .connect_node(connect_request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let deadline_ms = unix_ms_now() + 60_000;
+    let mut outbound = envelope("route-deadline-relay");
+    outbound.deadline_ms = deadline_ms;
+    source
+        .runtime
+        .router()
+        .set_peer_connected(&destination_peer, true)
+        .await;
+    let mut source_client = source.client.clone();
+    source_client
+        .send_task(SendTaskRequest {
+            target_peer_id: destination_peer.to_string(),
+            envelope: Some(outbound),
+            timeout_ms: 5_000,
+        })
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), relay_stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.task.as_ref().unwrap().deadline_ms, deadline_ms);
+    destination
+        .client
+        .submit_remote_task(SubmitRemoteTaskRequest {
+            envelope: frame.task,
+            authenticated_sender_peer_id: frame.authenticated_source_node_id,
+            destination_peer_id: frame.destination_node_id,
+            relay_frame_id: frame.frame_id,
+        })
+        .await
+        .unwrap();
+
+    let stored = destination
+        .runtime
+        .store()
+        .get_task(&keryx_core::TaskId::new("route-deadline-relay").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.deadline_ms, Some(deadline_ms));
+    let claim = destination
+        .client
+        .claim_next_task(ClaimNextTaskRequest {
+            worker_id: Some(AgentId {
+                value: "deadline-worker".to_string(),
+            }),
+            accepted_skill_ids: vec![],
+            accepted_capability_ids: vec![],
+            lease_duration_ms: 60_000,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(claim.has_task);
+    assert_eq!(claim.envelope.unwrap().deadline_ms, deadline_ms);
+}
+
+#[tokio::test]
+async fn already_expired_remote_task_is_timed_out_before_claim() {
+    let destination_peer = PeerId::new("node-expired-destination").unwrap();
+    let mut destination = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
+            .with_local_peer_id(destination_peer.clone()),
+    )
+    .await;
+    let mut expired = envelope("route-expired-remote");
+    expired.deadline_ms = unix_ms_now() - 1;
+
+    destination
+        .client
+        .submit_remote_task(SubmitRemoteTaskRequest {
+            envelope: Some(expired),
+            authenticated_sender_peer_id: "node-expired-source".to_string(),
+            destination_peer_id: destination_peer.to_string(),
+            relay_frame_id: "relay-expired".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let claim = destination
+        .client
+        .claim_next_task(ClaimNextTaskRequest {
+            worker_id: Some(AgentId {
+                value: "expired-worker".to_string(),
+            }),
+            accepted_skill_ids: vec![],
+            accepted_capability_ids: vec![],
+            lease_duration_ms: 60_000,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!claim.has_task);
+    let stored = destination
+        .runtime
+        .store()
+        .get_task(&keryx_core::TaskId::new("route-expired-remote").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.status, keryx_core::TaskStatus::Failed);
+
+    let mut direct_expired = envelope("route-expired-direct-claim");
+    direct_expired.deadline_ms = unix_ms_now() - 1;
+    destination
+        .client
+        .submit_remote_task(SubmitRemoteTaskRequest {
+            envelope: Some(direct_expired),
+            authenticated_sender_peer_id: "node-expired-source".to_string(),
+            destination_peer_id: destination_peer.to_string(),
+            relay_frame_id: "relay-expired-direct".to_string(),
+        })
+        .await
+        .unwrap();
+    let direct_error = destination
+        .client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: "route-expired-direct-claim".to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: "expired-direct-worker".to_string(),
+            }),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(direct_error.code(), Code::FailedPrecondition);
+    let directly_claimed = destination
+        .runtime
+        .store()
+        .get_task(&keryx_core::TaskId::new("route-expired-direct-claim").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(directly_claimed.status, keryx_core::TaskStatus::Failed);
+}
+
+#[tokio::test]
+async fn negative_remote_deadline_is_rejected_at_ingress() {
+    let destination_peer = PeerId::new("node-invalid-deadline-destination").unwrap();
+    let mut destination = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
+            .with_local_peer_id(destination_peer.clone()),
+    )
+    .await;
+    let mut invalid = envelope("route-invalid-deadline");
+    invalid.deadline_ms = -1;
+
+    let error = destination
+        .client
+        .submit_remote_task(SubmitRemoteTaskRequest {
+            envelope: Some(invalid),
+            authenticated_sender_peer_id: "node-invalid-deadline-source".to_string(),
+            destination_peer_id: destination_peer.to_string(),
+            relay_frame_id: "relay-invalid-deadline".to_string(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(destination
+        .runtime
+        .store()
+        .get_task(&keryx_core::TaskId::new("route-invalid-deadline").unwrap())
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -331,4 +544,12 @@ async fn spawn_relay(runtime: Arc<RelayRuntime>) -> SocketAddr {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("failed to connect gRPC relay at http://{addr}");
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }

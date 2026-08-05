@@ -34,6 +34,19 @@ pub enum StoreError {
     ArtifactTooLarge { byte_len: u64, limit_bytes: u64 },
     #[error("digest mismatch: expected {expected}, computed {actual}")]
     DigestMismatch { expected: String, actual: String },
+    #[error("artifact length mismatch: declared {declared}, actual {actual}")]
+    ArtifactLengthMismatch { declared: u64, actual: u64 },
+    #[error("origin result artifact id mismatch for task {task_id} ordinal {ordinal}")]
+    OriginResultArtifactIdMismatch { task_id: TaskId, ordinal: u32 },
+    #[error("origin result artifact ordinal mismatch: expected {expected}, got {actual}")]
+    OriginResultArtifactOrdinalMismatch { expected: u32, actual: u32 },
+    #[error("origin result artifact task mismatch: expected {task_id}, got {artifact_task_id}")]
+    OriginResultArtifactTaskMismatch {
+        task_id: TaskId,
+        artifact_task_id: TaskId,
+    },
+    #[error("origin result artifact conflict: {0}")]
+    OriginResultArtifactConflict(ArtifactId),
     #[error("idempotency key {key} already belongs to task {existing_task_id}")]
     IdempotencyConflict {
         key: IdempotencyKey,
@@ -89,6 +102,14 @@ pub enum StoreError {
     LeaseNotFound(TaskId),
     #[error("task already has an active lease: {task_id}")]
     LeaseConflict { task_id: TaskId },
+    #[error(
+        "task deadline expired: task={task_id} deadline_ms={deadline_ms} attempted_lease_at_ms={attempted_lease_at_ms}"
+    )]
+    TaskDeadlineExpired {
+        task_id: TaskId,
+        deadline_ms: i64,
+        attempted_lease_at_ms: i64,
+    },
     #[error("lease {lease_id} does not own task {task_id}")]
     LeaseMismatch { task_id: TaskId, lease_id: LeaseId },
     #[error("worker {worker_id} does not own active lease for task {task_id}")]
@@ -525,6 +546,28 @@ impl InMemoryStore {
         if state.leases.contains_key(task_id) {
             return Err(StoreError::LeaseConflict {
                 task_id: task_id.clone(),
+            });
+        }
+        if let Some(deadline_ms) = task
+            .deadline_ms
+            .filter(|deadline_ms| *deadline_ms <= lease.leased_at_ms)
+        {
+            validate_deadline_transition(task.status)?;
+            let mut failed = task;
+            let from_status = failed.status;
+            failed.status = TaskStatus::Failed;
+            append_in_memory_event(
+                &mut state,
+                task_id,
+                KeryxEventType::TaskTimedOut,
+                Some(from_status),
+                TaskStatus::Failed,
+            );
+            state.tasks.insert(task_id.clone(), failed);
+            return Err(StoreError::TaskDeadlineExpired {
+                task_id: task_id.clone(),
+                deadline_ms,
+                attempted_lease_at_ms: lease.leased_at_ms,
             });
         }
         let transition = validate_transition(task.status, TaskStatus::Running)?;
@@ -1835,6 +1878,29 @@ impl SqliteStore {
         {
             return Err(StoreError::LeaseConflict {
                 task_id: task_id.clone(),
+            });
+        }
+        if let Some(deadline_ms) = task
+            .deadline_ms
+            .filter(|deadline_ms| *deadline_ms <= lease.leased_at_ms)
+        {
+            validate_deadline_transition(task.status)?;
+            let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+            update_task_status_with_executor(&mut tx, task_id, TaskStatus::Failed).await?;
+            insert_event(
+                &mut tx,
+                task_id,
+                sequence,
+                KeryxEventType::TaskTimedOut,
+                Some(task.status),
+                TaskStatus::Failed,
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(StoreError::TaskDeadlineExpired {
+                task_id: task_id.clone(),
+                deadline_ms,
+                attempted_lease_at_ms: lease.leased_at_ms,
             });
         }
         let transition = validate_transition(task.status, TaskStatus::Running)?;

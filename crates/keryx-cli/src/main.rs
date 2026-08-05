@@ -128,6 +128,7 @@ async fn run_task(command: TaskCommand) -> Result<()> {
                         status: 0,
                         messages: vec![],
                         metadata: Default::default(),
+                        deadline_ms: 0,
                     }),
                 })
                 .await

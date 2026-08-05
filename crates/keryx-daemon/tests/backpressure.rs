@@ -21,6 +21,7 @@ fn envelope(task_id: &str) -> TaskEnvelope {
         status: 0,
         messages: Vec::new(),
         metadata: Default::default(),
+        deadline_ms: 0,
     }
 }
 

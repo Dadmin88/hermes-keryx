@@ -89,7 +89,11 @@ async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endp
     await node.start()
     await node.register_skills(ttl_seconds=300)
     agents = await node.discover("echo", limit=1)
-    handle = await node.send_task({"parts": [{"text": "hello"}]}, peer_id=agents[0]["peer_id"])
+    handle = await node.send_task(
+        {"parts": [{"text": "hello"}]},
+        peer_id=agents[0]["peer_id"],
+        deadline_ms=1_800_000_000_000,
+    )
     print(handle.task_id)
     await node.deregister_skills()
     await node.stop()
@@ -98,8 +102,9 @@ async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endp
 Compatibility notes:
 
 - `send_task(..., skill="...")` resolves the first registry match.
+- `send_task(..., deadline_ms=...)` accepts `0` for no execution deadline or a positive signed 64-bit absolute Unix epoch timestamp. It is not the relay delivery `timeout_ms`.
 - `send_task(..., url="...")` is not implemented.
-- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and returned artifact descriptors/bounded text previews. Artifact bytes remain destination-local; general cross-node artifact-content retrieval is not implemented.
+- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. Bounded artifact bytes traverse the authenticated result route and can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact()`.
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - Registry tags exist in the protocol, but `Skill` and the high-level `register_skills()` helper do not yet propagate them.

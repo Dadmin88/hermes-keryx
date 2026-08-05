@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 PY_SDK="$(cd "$(dirname "$0")/.." && pwd)"
 PROTO_ROOT="$ROOT/proto"
 OUT="$PY_SDK/keryx/proto"

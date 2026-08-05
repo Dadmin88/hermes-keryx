@@ -7,10 +7,10 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | Component | Implemented surface |
 |---|---|
 | `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, durable task envelopes, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
-| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
+| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; authenticated terminal-result publication; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; AgentAnycast-compatible transition helpers. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
 | Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
@@ -26,7 +26,7 @@ Operational outcomes are metadata/events rather than extra task status values:
 - retry requeue: `running -> pending`, increments `retry_count`, appends `RecoveryAction`
 - dead-letter: `running -> failed`, sets `dead_lettered` and `dead_letter_reason`
 - cancel: `pending` or `running` -> `failed`, marks cancellation counters and reason metadata
-- deadline expiry: expired local `TaskRecord.deadline_ms` on `pending`/`running` -> `failed`; the current remote `TaskEnvelope` does not carry a deadline, so `SendTask` does not yet propagate this guarantee cross-node
+- deadline expiry: `TaskEnvelope.deadline_ms` carries an absolute Unix epoch deadline across local, relay, and offline-mailbox routes; destination ingestion persists positive values into `TaskRecord.deadline_ms`, rejects negative values, and prevents expired `pending`/`running` work from being claimed
 - routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
 
 ## Daemon gRPC API
@@ -53,6 +53,8 @@ Important defaults:
 | submit envelope limit | `4 MiB` (`0` means unlimited) |
 | inline artifact threshold | `64 KiB` |
 | max artifact/blob size | `256 MiB` |
+| cross-node result artifact content | `4 MiB` aggregate per terminal result |
+| result transport frame ceiling | `5 MiB` |
 | default local peer id | `node-local` |
 | default `SendTask` timeout | `30_000 ms` |
 
@@ -89,6 +91,8 @@ Current registry limits:
 - `max_skills_per_peer` is parsed from relay configuration but is not currently enforced.
 - Registry state is in-memory and TTL-based.
 
+Terminal-result publication requires configured node-token authentication and fails closed when the relay has no `NodeTokenAuth`. This prevents descriptor-only and byte-bearing results from using a claimed `source_node_id` as an authenticated executor identity.
+
 ## Cross-node delivery boundary
 
 Keryx proves the authenticated round trip:
@@ -101,12 +105,12 @@ sender keryxd SendTask
   -> destination lifecycle row + durable full envelope
   -> Python worker ClaimNextTask + handler
   -> destination durable terminal result/outbox
-  -> relay result frame
+  -> authenticated relay result frame
   -> origin keryxd IngestRemoteResult
   -> Python TaskHandle.wait()
 ```
 
-Phase 17 was completed in [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29). The permanent proof starts a relay/registry, two daemons, two edge nodes, and a real Python worker, then verifies discovery, authenticated sender/executor identity, remote handler execution, durable result return, artifact descriptors/bounded text previews, and clean shutdown. Artifact bytes remain destination-local; general cross-node artifact-content retrieval is not implemented.
+Phase 17 was completed in [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29). The permanent proof starts a relay/registry, two daemons, two edge nodes, and a real Python worker, then verifies discovery, authenticated sender/executor identity, remote handler execution, durable result return, canonical origin-assigned artifact descriptors, exact binary artifact retrieval, explicit-path download, and clean shutdown. Cross-node result content is bounded to 4 MiB aggregate, integrity-checked before origin persistence, and never uses remote logical names as local paths.
 
 The relay's offline mailbox is currently in-memory. It delivers frames when a node reconnects to the same running relay process, but it is not a relay-restart-durable queue.
 
@@ -146,7 +150,7 @@ Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, 
 Current compatibility behavior:
 
 - `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
-- `send_task()` submits through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results.
+- `send_task(..., deadline_ms=...)` propagates a zero-or-positive absolute Unix epoch deadline through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results. This execution deadline is separate from the daemon client's delivery `timeout_ms`.
 - `IncomingTask.complete()` / `.fail()` persist terminal state and feed the authenticated relay result route.
 - Registry tags exist in the protocol, but the high-level Python `Skill`/`register_skills()` helper does not yet propagate them.
 - Python/edge registration is one-shot; neither path automatically refreshes before the default 300-second TTL expires. Long-running integrations must explicitly renew or use a supervised restart loop until a lifecycle helper exists.

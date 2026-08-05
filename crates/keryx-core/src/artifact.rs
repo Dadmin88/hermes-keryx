@@ -10,10 +10,29 @@ use crate::{
 
 pub const MAX_INLINE_ARTIFACT_BYTES: usize = 64 * 1024;
 pub const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum serialized relay frame size for a result artifact payload.
+///
+/// This leaves bounded protobuf framing and descriptor metadata headroom above
+/// the semantic four MiB cross-node result content cap.
+pub const RESULT_ARTIFACT_FRAME_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ArtifactId(String);
+
+/// Produces the origin-owned artifact identity for a result ordinal.
+///
+/// The digest deliberately incorporates only the task identity and ordinal: remote
+/// display names and paths are untrusted metadata and never become identifiers.
+#[must_use]
+pub fn origin_result_artifact_id(task_id: &TaskId, ordinal: u32) -> ArtifactId {
+    let mut hasher = Sha256::new();
+    hasher.update(task_id.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(ordinal.to_be_bytes());
+    ArtifactId(format!("origin-result-{:x}", hasher.finalize()))
+}
 
 impl ArtifactId {
     pub fn new(value: impl AsRef<str>) -> Result<Self, ValidationError> {
@@ -164,9 +183,11 @@ pub fn should_inline(byte_len: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_inline, validate_artifact_size, Digest, MediaType, ValidationError, MAX_BLOB_BYTES,
-        MAX_INLINE_ARTIFACT_BYTES,
+        origin_result_artifact_id, should_inline, validate_artifact_size, Digest, MediaType,
+        ValidationError, MAX_BLOB_BYTES, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
+        MAX_INLINE_ARTIFACT_BYTES, RESULT_ARTIFACT_FRAME_MAX_BYTES,
     };
+    use crate::TaskId;
 
     #[test]
     fn digest_compute_matches_sha256_reference() {
@@ -199,5 +220,20 @@ mod tests {
         assert!(should_inline(MAX_INLINE_ARTIFACT_BYTES as u64));
         assert!(!should_inline((MAX_INLINE_ARTIFACT_BYTES + 1) as u64));
         assert!(validate_artifact_size((MAX_BLOB_BYTES + 1) as u64).is_err());
+    }
+
+    #[test]
+    fn origin_result_artifact_ids_are_stable_and_ignore_remote_metadata() {
+        let task_id = TaskId::new("origin-result-task").unwrap();
+        let first = origin_result_artifact_id(&task_id, 0);
+        let repeat = origin_result_artifact_id(&task_id, 0);
+        let next = origin_result_artifact_id(&task_id, 1);
+        let other_task = origin_result_artifact_id(&TaskId::new("other-task").unwrap(), 0);
+
+        assert_eq!(MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES, 4 * 1024 * 1024);
+        assert_eq!(RESULT_ARTIFACT_FRAME_MAX_BYTES, 5 * 1024 * 1024);
+        assert_eq!(first, repeat);
+        assert_ne!(first, next);
+        assert_ne!(first, other_task);
     }
 }

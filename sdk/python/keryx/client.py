@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import socket
 import stat
 import struct
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import grpc
 
@@ -25,6 +28,19 @@ from hermes.keryx.v1 import (  # noqa: E402
     registry_pb2_grpc,
     task_pb2,
 )
+
+from keryx.models import ArtifactContent  # noqa: E402
+
+if TYPE_CHECKING:
+    from keryx.card import AgentCard
+
+
+RESULT_ARTIFACT_FRAME_MAX_BYTES = 5 * 1024 * 1024
+RESULT_ARTIFACT_GRPC_OPTIONS = (
+    ("grpc.max_send_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
+    ("grpc.max_receive_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
+)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def default_daemon_endpoint() -> str:
@@ -129,7 +145,8 @@ class DaemonClient:
             _validate_unix_socket_endpoint(self._daemon_endpoint)
             _assert_unix_peer_owned_by_current_user(self._daemon_endpoint)
             self._channel = grpc.aio.insecure_channel(
-                _grpc_target(self._daemon_endpoint)
+                _grpc_target(self._daemon_endpoint),
+                options=RESULT_ARTIFACT_GRPC_OPTIONS,
             )
         self._daemon = daemon_pb2_grpc.KeryxDaemonStub(self._channel)
         if self._registry_endpoint:
@@ -175,9 +192,16 @@ class DaemonClient:
         task_id: str,
         message_text: str,
         metadata: dict[str, str] | None = None,
+        deadline_ms: int = 0,
         timeout_ms: int = 0,
     ) -> daemon_pb2.SendTaskResponse:
         assert self._daemon is not None
+        if (
+            isinstance(deadline_ms, bool)
+            or not isinstance(deadline_ms, int)
+            or not 0 <= deadline_ms <= 2**63 - 1
+        ):
+            raise ValueError("deadline_ms must be zero or a positive signed 64-bit integer")
         envelope = task_pb2.TaskEnvelope(
             task_id=common_pb2.TaskId(value=task_id),
             status=task_pb2.TASK_STATUS_CREATED,
@@ -192,6 +216,7 @@ class DaemonClient:
                 )
             ],
             metadata=metadata or {},
+            deadline_ms=deadline_ms,
         )
         request = daemon_pb2.SendTaskRequest(
             target_peer_id=target_peer_id,
@@ -209,6 +234,33 @@ class DaemonClient:
                 task_id=common_pb2.TaskId(value=task_id)
             )
         )
+
+    async def get_artifact(
+        self, artifact_id: str, *, metadata_only: bool = False
+    ) -> ArtifactContent:
+        assert self._daemon is not None
+        response = await self._daemon.GetArtifact(
+            daemon_pb2.GetArtifactRequest(
+                artifact_id=common_pb2.ArtifactId(value=artifact_id),
+                metadata_only=metadata_only,
+            )
+        )
+        return _verified_artifact_content(
+            response,
+            requested_artifact_id=artifact_id,
+            metadata_only=metadata_only,
+        )
+
+    async def download_artifact(
+        self,
+        artifact_id: str,
+        destination: str | Path,
+        *,
+        overwrite: bool = False,
+    ) -> ArtifactContent:
+        artifact = await self.get_artifact(artifact_id)
+        _write_artifact_download(artifact, destination, overwrite=overwrite)
+        return artifact
 
     async def cancel_task(
         self, task_id: str, *, reason: str = ""
@@ -347,3 +399,96 @@ class DaemonClient:
                     peer_id=registration.peer_id,
                 )
         raise RuntimeError(f"No agent card for peer {peer_id}")
+
+
+def _verified_artifact_content(
+    response: daemon_pb2.GetArtifactResponse,
+    *,
+    requested_artifact_id: str,
+    metadata_only: bool,
+) -> ArtifactContent:
+    returned_artifact_id = response.artifact_id.value
+    if returned_artifact_id != requested_artifact_id:
+        raise ValueError("returned artifact id does not match the request")
+    if not _SHA256_RE.fullmatch(response.digest):
+        raise ValueError("artifact digest must be lowercase SHA-256")
+
+    content = bytes(response.content)
+    if not metadata_only or content:
+        if response.byte_len != len(content):
+            raise ValueError("artifact byte_len does not match content")
+        if hashlib.sha256(content).hexdigest() != response.digest:
+            raise ValueError("artifact digest does not match content")
+
+    return ArtifactContent(
+        artifact_id=returned_artifact_id,
+        task_id=response.task_id.value,
+        digest=response.digest,
+        media_type=response.media_type,
+        byte_len=response.byte_len,
+        inline=response.inline,
+        created_at=response.created_at,
+        content=None if metadata_only else content,
+    )
+
+
+def _write_artifact_download(
+    artifact: ArtifactContent,
+    destination: str | Path,
+    *,
+    overwrite: bool,
+) -> Path:
+    if artifact.content is None:
+        raise ValueError("artifact content is required for download")
+    content = artifact.content
+    if len(content) != artifact.byte_len:
+        raise ValueError("artifact byte_len does not match content")
+    if not _SHA256_RE.fullmatch(artifact.digest):
+        raise ValueError("artifact digest must be lowercase SHA-256")
+    if hashlib.sha256(content).hexdigest() != artifact.digest:
+        raise ValueError("artifact digest does not match content")
+
+    target = Path(destination).expanduser()
+    parent = target.parent
+    if not parent.exists() or not parent.is_dir():
+        raise FileNotFoundError(
+            f"artifact destination parent is not a directory: {parent}"
+        )
+    if target.is_symlink():
+        raise ValueError("artifact destination must not be a symlink")
+    if target.exists() and not overwrite:
+        raise FileExistsError(target)
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    published = False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            if target.is_symlink():
+                raise ValueError("artifact destination must not be a symlink")
+            os.replace(temporary, target)
+        else:
+            os.link(temporary, target, follow_symlinks=False)
+            temporary.unlink()
+        published = True
+        directory_fd = os.open(
+            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not published:
+            temporary.unlink(missing_ok=True)
+    return target
