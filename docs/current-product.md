@@ -87,7 +87,7 @@ Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC healt
 
 Current registry limits:
 
-- The separate registry gRPC surface does not authenticate registration ownership. A reachable client can register, replace, or unregister another peer's skill record. Protect it with a private network/ACL; authenticated peer-owned mutation is not yet implemented.
+- Registry registration and deregistration require configured node-token authentication. The relay derives the mutation owner from authenticated node metadata, rejects request-body identity mismatches, and fails closed when node authentication is absent. Plaintext authenticated relay control and registry gRPC are accepted only on loopback. Non-loopback control or registry binds use the configured TLS certificate/key, and remote Rust/Python clients require `https://` with optional private-CA trust. Skill discovery remains unauthenticated and read-only.
 - `max_skills_per_peer` is parsed from relay configuration but is not currently enforced.
 - Registry state is in-memory and TTL-based.
 

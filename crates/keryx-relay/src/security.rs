@@ -414,6 +414,10 @@ pub struct RelayTomlRelaySection {
     pub health_http_bind: String,
     #[serde(default = "crate::config::default_registry_grpc_bind")]
     pub registry_grpc_bind: String,
+    #[serde(default)]
+    pub registry_tls_cert_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub registry_tls_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for RelayTomlRelaySection {
@@ -432,6 +436,8 @@ impl Default for RelayTomlRelaySection {
             health_grpc_bind: crate::config::default_health_grpc_bind(),
             health_http_bind: crate::config::default_health_http_bind(),
             registry_grpc_bind: crate::config::default_registry_grpc_bind(),
+            registry_tls_cert_path: None,
+            registry_tls_key_path: None,
         }
     }
 }
@@ -461,6 +467,8 @@ impl RelayTomlConfig {
             health_grpc_bind: self.relay.health_grpc_bind.clone(),
             health_http_bind: self.relay.health_http_bind.clone(),
             registry_grpc_bind: self.relay.registry_grpc_bind.clone(),
+            registry_tls_cert_path: self.relay.registry_tls_cert_path.clone(),
+            registry_tls_key_path: self.relay.registry_tls_key_path.clone(),
         }
     }
 

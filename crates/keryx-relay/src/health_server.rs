@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 use crate::health::RelayHealthReport;
@@ -496,21 +497,38 @@ pub async fn serve_grpc_health(
     runtime: Arc<RelayRuntime>,
     registry: Option<Arc<SkillRegistry>>,
     addr: SocketAddr,
-) -> Result<(), tonic::transport::Error> {
-    let listener = TcpListener::bind(addr).await.expect("bind health grpc");
+) -> anyhow::Result<()> {
+    serve_grpc_health_with_tls(runtime, registry, addr, None).await
+}
+
+pub async fn serve_grpc_health_with_tls(
+    runtime: Arc<RelayRuntime>,
+    registry: Option<Arc<SkillRegistry>>,
+    addr: SocketAddr,
+    tls_identity: Option<Identity>,
+) -> anyhow::Result<()> {
+    if tls_identity.is_none() && !addr.ip().is_loopback() {
+        anyhow::bail!("non-loopback relay control listeners require TLS");
+    }
+    let listener = TcpListener::bind(addr).await?;
     let incoming = TcpListenerStream::new(listener);
     let service = match registry {
         Some(registry) => RelayHealthService::with_registry(runtime, registry),
         None => RelayHealthService::new(runtime),
     };
-    tonic::transport::Server::builder()
+    let mut server = tonic::transport::Server::builder();
+    if let Some(identity) = tls_identity {
+        server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
+    }
+    server
         .add_service(
             KeryxRelayServer::new(service)
                 .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
                 .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES),
         )
         .serve_with_incoming(incoming)
-        .await
+        .await?;
+    Ok(())
 }
 
 pub async fn serve_grpc_health_with_auth(
@@ -518,18 +536,36 @@ pub async fn serve_grpc_health_with_auth(
     registry: Arc<SkillRegistry>,
     node_auth: Arc<NodeTokenAuth>,
     addr: SocketAddr,
-) -> Result<(), tonic::transport::Error> {
-    let listener = TcpListener::bind(addr).await.expect("bind health grpc");
+) -> anyhow::Result<()> {
+    serve_grpc_health_with_auth_and_tls(runtime, registry, node_auth, addr, None).await
+}
+
+pub async fn serve_grpc_health_with_auth_and_tls(
+    runtime: Arc<RelayRuntime>,
+    registry: Arc<SkillRegistry>,
+    node_auth: Arc<NodeTokenAuth>,
+    addr: SocketAddr,
+    tls_identity: Option<Identity>,
+) -> anyhow::Result<()> {
+    if tls_identity.is_none() && !addr.ip().is_loopback() {
+        anyhow::bail!("non-loopback authenticated relay control listeners require TLS");
+    }
+    let listener = TcpListener::bind(addr).await?;
     let incoming = TcpListenerStream::new(listener);
     let service = RelayHealthService::with_registry_and_auth(runtime, registry, node_auth);
-    tonic::transport::Server::builder()
+    let mut server = tonic::transport::Server::builder();
+    if let Some(identity) = tls_identity {
+        server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
+    }
+    server
         .add_service(
             KeryxRelayServer::new(service)
                 .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
                 .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES),
         )
         .serve_with_incoming(incoming)
-        .await
+        .await?;
+    Ok(())
 }
 
 /// Accept HTTP `GET /health` on `addr` until `shutdown` completes.

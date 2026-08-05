@@ -107,6 +107,7 @@ Compatibility notes:
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - `Skill.tags` round-trips through card dictionaries, registry publication, and discovery.
+- Registry registration and deregistration are owner-authenticated. The SDK sends the local peer ID and `node_token=` (or `HERMES_KERYX_NODE_TOKEN`) only as gRPC metadata; the relay rejects missing, invalid, revoked, or body/metadata-mismatched credentials. Remote registry endpoints must use `https://`; plaintext is accepted only on loopback. Set `HERMES_KERYX_REGISTRY_CA_CERT` to a PEM CA file for a private certificate authority. Credential-bearing clients cannot inject an arbitrary registry channel; provide the endpoint and optional CA so the SDK can enforce transport security. Skill discovery remains read-only and does not require node credentials.
 - `send_task()` retains the daemon's exact `status`, `routed_to`, and `delivery_route` fields in an immutable `SubmissionReceipt` on the returned handle.
 - `register_skills()` remains a one-shot primitive. `start_registration()` registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` reports lifecycle health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutations use finite RPC deadlines. One stop budget spans refresh cancellation acknowledgement and deregistration. Work exceeding that budget continues as tracked cleanup, blocks restart, and preserves refresh-before-deregister ordering. During node shutdown, ownership of the registry client transfers to pending cleanup so accepted deregistration and client close can finish in order.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
@@ -149,6 +150,8 @@ Environment variables:
 | `HERMES_KERYX_CONFIG` / `KERYX_CONFIG` | unset | SDK TOML config path |
 | `HERMES_KERYX_DAEMON_ENDPOINT` / `KERYX_DAEMON_ENDPOINT` | SDK default `unix://~/.hermes/keryx/run/keryx-daemon.sock`; repo examples use `127.0.0.1:50051` | `keryxd` gRPC endpoint |
 | `HERMES_KERYX_REGISTRY_ENDPOINT` / `KERYX_REGISTRY_ENDPOINT` | dual-run: `127.0.0.1:51053` | relay skill registry endpoint |
+| `HERMES_KERYX_NODE_TOKEN` | unset | node credential attached as gRPC metadata to registry mutations |
+| `HERMES_KERYX_REGISTRY_CA_CERT` | unset (system roots) | PEM CA certificate used to verify an HTTPS registry endpoint |
 | `HERMES_KERYX_RELAY_ENDPOINT` / `KERYX_RELAY_ENDPOINT` | unset | compatibility relay endpoint alias |
 | `HERMES_KERYX_WORKER_ID` / `KERYX_WORKER_ID` | unset | default worker id for claim/heartbeat/complete/fail |
 | `HERMES_KERYX_DEFAULT_LEASE_DURATION_MS` / `KERYX_DEFAULT_LEASE_DURATION_MS` | `0` (daemon default) | claim/heartbeat lease duration |

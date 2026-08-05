@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import grpc
 import pytest
 from hermes.keryx.v1 import registry_pb2
 
 from keryx import AgentCard, KeryxNode, Skill
-from keryx.client import REGISTRY_RPC_TIMEOUT_SECONDS, DaemonClient
+from keryx.client import REGISTRY_RPC_TIMEOUT_SECONDS, DaemonClient, _registry_channel
 
 
 async def wait_until(predicate, *, timeout: float = 1.0) -> None:
@@ -43,17 +45,21 @@ class RegistryStub:
     def __init__(self) -> None:
         self.requests: list[registry_pb2.RegisterSkillsRequest] = []
         self.timeouts: list[float | None] = []
+        self.metadata: list[object] = []
         self.unregister_requests: list[registry_pb2.UnregisterSkillsRequest] = []
         self.unregister_timeouts: list[float | None] = []
+        self.unregister_metadata: list[object] = []
 
     async def RegisterSkills(
         self,
         request: registry_pb2.RegisterSkillsRequest,
         *,
         timeout: float | None = None,
+        metadata: object = None,
     ) -> registry_pb2.RegisterSkillsResponse:
         self.requests.append(request)
         self.timeouts.append(timeout)
+        self.metadata.append(metadata)
         return registry_pb2.RegisterSkillsResponse(accepted=True)
 
     async def UnregisterSkills(
@@ -61,9 +67,11 @@ class RegistryStub:
         request: registry_pb2.UnregisterSkillsRequest,
         *,
         timeout: float | None = None,
+        metadata: object = None,
     ) -> registry_pb2.UnregisterSkillsResponse:
         self.unregister_requests.append(request)
         self.unregister_timeouts.append(timeout)
+        self.unregister_metadata.append(metadata)
         return registry_pb2.UnregisterSkillsResponse(accepted=True)
 
     async def DiscoverBySkill(
@@ -89,7 +97,10 @@ class RegistryStub:
 @pytest.mark.asyncio
 async def test_client_registration_serializes_skill_tags() -> None:
     registry = RegistryStub()
-    client = DaemonClient(daemon_endpoint="unix:///tmp/keryx-unused.sock")
+    client = DaemonClient(
+        daemon_endpoint="unix:///tmp/keryx-unused.sock",
+        node_token="registry-test-token",
+    )
     client._registry = registry
 
     accepted = await client.register_skills(
@@ -102,6 +113,12 @@ async def test_client_registration_serializes_skill_tags() -> None:
 
     assert accepted is True
     assert registry.timeouts == [REGISTRY_RPC_TIMEOUT_SECONDS]
+    assert registry.metadata == [
+        (
+            ("x-keryx-node-id", "peer-worker"),
+            ("x-keryx-node-token", "registry-test-token"),
+        )
+    ]
     assert list(registry.requests[0].skills[0].tags) == ["python", "linux"]
 
     unregistered = await client.unregister_skills(
@@ -109,6 +126,74 @@ async def test_client_registration_serializes_skill_tags() -> None:
     )
     assert unregistered is True
     assert registry.unregister_timeouts == [REGISTRY_RPC_TIMEOUT_SECONDS]
+    assert registry.unregister_metadata == registry.metadata
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_plaintext_remote_registry_with_bearer_token() -> None:
+    daemon_channel = grpc.aio.insecure_channel("unix:///tmp/keryx-unused.sock")
+    client = DaemonClient(
+        daemon_endpoint="unix:///tmp/keryx-unused.sock",
+        registry_endpoint="http://192.0.2.1:50053",
+        node_token="secret-test-token",
+        channel=daemon_channel,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="TLS"):
+            await client.connect()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_injected_plaintext_remote_registry_channel() -> None:
+    daemon_channel = grpc.aio.insecure_channel("unix:///tmp/keryx-unused.sock")
+    registry_channel = grpc.aio.insecure_channel("192.0.2.1:50053")
+    client = DaemonClient(
+        daemon_endpoint="unix:///tmp/keryx-unused.sock",
+        registry_endpoint="https://registry.example:50053",
+        node_token="secret-test-token",
+        channel=daemon_channel,
+        registry_channel=registry_channel,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="injected channels"):
+            await client.connect()
+    finally:
+        await client.close()
+
+
+def test_registry_https_channel_loads_private_ca(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ca_path = tmp_path / "registry-ca.pem"
+    ca_path.write_bytes(b"test-ca-pem")
+    captured: dict[str, object] = {}
+    fake_credentials = object()
+    fake_channel = object()
+
+    def credentials(*, root_certificates: bytes | None = None) -> object:
+        captured["root_certificates"] = root_certificates
+        return fake_credentials
+
+    def secure_channel(target: str, supplied_credentials: object) -> object:
+        captured["target"] = target
+        captured["credentials"] = supplied_credentials
+        return fake_channel
+
+    monkeypatch.setattr(grpc, "ssl_channel_credentials", credentials)
+    monkeypatch.setattr(grpc.aio, "secure_channel", secure_channel)
+
+    channel = _registry_channel("https://registry.example:50053", ca_path)
+
+    assert channel is fake_channel
+    assert captured == {
+        "root_certificates": b"test-ca-pem",
+        "target": "registry.example:50053",
+        "credentials": fake_credentials,
+    }
 
 
 @pytest.mark.asyncio

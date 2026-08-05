@@ -3,6 +3,7 @@
 mod cancellation;
 mod deadline_enforcement_loop;
 mod discovery;
+pub mod grpc_transport;
 mod health_loop;
 mod incoming;
 mod lease_recovery_loop;
@@ -368,6 +369,7 @@ impl KeryxDaemonConfig {
 const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const RELAY_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
+const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
@@ -409,7 +411,12 @@ pub fn discovery_settings_from_env() -> Option<DiscoverySettings> {
     };
     Some(DiscoverySettings {
         registry_endpoint,
+        registry_ca_cert_path: grpc_transport::ca_cert_path_from_env(),
         registration,
+        node_token: std::env::var(NODE_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     })
 }
 

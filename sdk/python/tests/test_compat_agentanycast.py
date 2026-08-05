@@ -59,6 +59,7 @@ class _FakeRegistryStub:
         request: registry_pb2.RegisterSkillsRequest,
         *,
         timeout: float | None = None,
+        metadata: object = None,
     ) -> registry_pb2.RegisterSkillsResponse:
         self.register_calls.append(request)
         return registry_pb2.RegisterSkillsResponse(accepted=True)
@@ -68,6 +69,7 @@ class _FakeRegistryStub:
         request: registry_pb2.UnregisterSkillsRequest,
         *,
         timeout: float | None = None,
+        metadata: object = None,
     ) -> registry_pb2.UnregisterSkillsResponse:
         self.unregister_calls.append(request)
         return registry_pb2.UnregisterSkillsResponse(accepted=True)

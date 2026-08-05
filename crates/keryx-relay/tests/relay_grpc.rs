@@ -14,16 +14,70 @@ use keryx_proto::v1::{
     TerminalOutcome,
 };
 use keryx_relay::health_server::{
-    serve_grpc_health, serve_grpc_health_with_auth, NODE_ID_METADATA_KEY, NODE_TOKEN_METADATA_KEY,
+    serve_grpc_health, serve_grpc_health_with_auth, serve_grpc_health_with_auth_and_tls,
+    NODE_ID_METADATA_KEY, NODE_TOKEN_METADATA_KEY,
 };
 use keryx_relay::registry::SkillRegistry;
 use keryx_relay::runtime::RelayRuntime;
 use keryx_relay::security::NodeTokenAuth;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Request};
+
+#[tokio::test]
+async fn authenticated_plaintext_helper_rejects_non_loopback_bind() {
+    let runtime = RelayRuntime::new("relay-control-plaintext-test");
+    let registry = Arc::new(SkillRegistry::new());
+    let auth = Arc::new(NodeTokenAuth::new(HashMap::new(), Default::default()));
+
+    let error = serve_grpc_health_with_auth(runtime, registry, auth, "0.0.0.0:0".parse().unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("non-loopback authenticated relay control listeners require TLS"));
+}
+
+#[tokio::test]
+async fn authenticated_relay_control_accepts_tls_connection() {
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let runtime = RelayRuntime::new("relay-control-tls-test");
+    let auth = Arc::new(NodeTokenAuth::new(HashMap::new(), Default::default()));
+    let server = tokio::spawn(serve_grpc_health_with_auth_and_tls(
+        runtime,
+        Arc::new(SkillRegistry::new()),
+        auth,
+        addr,
+        Some(Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes())),
+    ));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let channel = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert_pem.as_bytes())),
+        )
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = KeryxRelayClient::new(channel);
+
+    client
+        .health(keryx_proto::v1::HealthRequest {})
+        .await
+        .unwrap();
+    server.abort();
+}
 
 #[tokio::test]
 async fn connect_node_relays_node_frames_to_connected_target() {

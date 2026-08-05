@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import socket
@@ -13,6 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import grpc
 
@@ -124,6 +126,33 @@ def _grpc_target(endpoint: str) -> str:
     return endpoint
 
 
+def _registry_endpoint_target(endpoint: str) -> tuple[str, bool]:
+    raw = endpoint.strip()
+    parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+    host = parsed.hostname or ""
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    secure = parsed.scheme.lower() == "https"
+    if not secure and not loopback:
+        raise RuntimeError("remote Keryx registry endpoints require TLS (https://)")
+    return parsed.netloc or parsed.path, secure
+
+
+def _registry_channel(
+    endpoint: str, ca_cert_path: str | os.PathLike[str] | None
+) -> grpc.aio.Channel:
+    target, secure = _registry_endpoint_target(endpoint)
+    if not secure:
+        return grpc.aio.insecure_channel(target)
+    root_certificates = None
+    if ca_cert_path:
+        root_certificates = Path(ca_cert_path).expanduser().read_bytes()
+    credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+    return grpc.aio.secure_channel(target, credentials)
+
+
 @dataclass
 class PeerInfo:
     peer_id: str
@@ -139,12 +168,23 @@ class DaemonClient:
         *,
         daemon_endpoint: str,
         registry_endpoint: str | None = None,
+        node_token: str | None = None,
+        registry_ca_cert: str | os.PathLike[str] | None = None,
         channel: grpc.aio.Channel | None = None,
         registry_channel: grpc.aio.Channel | None = None,
     ) -> None:
         self._daemon_endpoint = daemon_endpoint
         self._registry_endpoint = registry_endpoint or os.environ.get(
             "HERMES_KERYX_REGISTRY_ENDPOINT"
+        )
+        token = (
+            os.environ.get("HERMES_KERYX_NODE_TOKEN")
+            if node_token is None
+            else node_token
+        )
+        self._node_token = token.strip() if token and token.strip() else None
+        self._registry_ca_cert = registry_ca_cert or os.environ.get(
+            "HERMES_KERYX_REGISTRY_CA_CERT"
         )
         self._channel = channel
         self._registry_channel = registry_channel
@@ -161,9 +201,14 @@ class DaemonClient:
             )
         self._daemon = daemon_pb2_grpc.KeryxDaemonStub(self._channel)
         if self._registry_endpoint:
+            if self._registry_channel is not None and self._node_token:
+                raise RuntimeError(
+                    "credential-bearing Keryx registry clients cannot use injected channels"
+                )
+            _registry_endpoint_target(self._registry_endpoint)
             if self._registry_channel is None:
-                self._registry_channel = grpc.aio.insecure_channel(
-                    _grpc_target(self._registry_endpoint)
+                self._registry_channel = _registry_channel(
+                    self._registry_endpoint, self._registry_ca_cert
                 )
             self._registry = registry_pb2_grpc.RegistryServiceStub(
                 self._registry_channel
@@ -212,7 +257,9 @@ class DaemonClient:
             or not isinstance(deadline_ms, int)
             or not 0 <= deadline_ms <= 2**63 - 1
         ):
-            raise ValueError("deadline_ms must be zero or a positive signed 64-bit integer")
+            raise ValueError(
+                "deadline_ms must be zero or a positive signed 64-bit integer"
+            )
         envelope = task_pb2.TaskEnvelope(
             task_id=common_pb2.TaskId(value=task_id),
             status=task_pb2.TASK_STATUS_CREATED,
@@ -236,14 +283,10 @@ class DaemonClient:
         )
         return await self._daemon.SendTask(request)
 
-    async def get_task_result(
-        self, task_id: str
-    ) -> daemon_pb2.GetTaskResultResponse:
+    async def get_task_result(self, task_id: str) -> daemon_pb2.GetTaskResultResponse:
         assert self._daemon is not None
         return await self._daemon.GetTaskResult(
-            daemon_pb2.GetTaskResultRequest(
-                task_id=common_pb2.TaskId(value=task_id)
-            )
+            daemon_pb2.GetTaskResultRequest(task_id=common_pb2.TaskId(value=task_id))
         )
 
     async def get_artifact(
@@ -372,13 +415,13 @@ class DaemonClient:
             ],
         )
         response = await self._registry.RegisterSkills(
-            request, timeout=REGISTRY_RPC_TIMEOUT_SECONDS
+            request,
+            timeout=REGISTRY_RPC_TIMEOUT_SECONDS,
+            metadata=self._registry_auth_metadata(peer_id),
         )
         return response.accepted
 
-    async def unregister_skills(
-        self, *, peer_id: str, skill_ids: list[str]
-    ) -> bool:
+    async def unregister_skills(self, *, peer_id: str, skill_ids: list[str]) -> bool:
         if self._registry is None:
             return False
         assert self._registry is not None
@@ -388,8 +431,15 @@ class DaemonClient:
                 skill_ids=skill_ids,
             ),
             timeout=REGISTRY_RPC_TIMEOUT_SECONDS,
+            metadata=self._registry_auth_metadata(peer_id),
         )
         return response.accepted
+
+    def _registry_auth_metadata(self, peer_id: str) -> tuple[tuple[str, str], ...]:
+        metadata = [("x-keryx-node-id", peer_id)]
+        if self._node_token is not None:
+            metadata.append(("x-keryx-node-token", self._node_token))
+        return tuple(metadata)
 
     async def get_card(self, peer_id: str) -> "AgentCard":
         from keryx.card import AgentCard, Skill
@@ -496,9 +546,7 @@ def _write_artifact_download(
             os.link(temporary, target, follow_symlinks=False)
             temporary.unlink()
         published = True
-        directory_fd = os.open(
-            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
         finally:

@@ -142,6 +142,13 @@ Artifact limits:
 }
 ```
 
+Authenticated relay control and registry gRPC permit plaintext only on
+loopback. A non-loopback `health_grpc_bind` or `registry_grpc_bind` must also
+configure both `registry_tls_cert_path` and `registry_tls_key_path`; the same
+TLS identity protects both services. PEM paths are resolved relative to the
+config file. Rust control and registry clients must use `https://` remotely
+and may trust a private CA through `HERMES_KERYX_REGISTRY_CA_CERT`.
+
 Start and inspect:
 
 ```bash

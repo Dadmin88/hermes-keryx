@@ -3,13 +3,87 @@ use keryx_daemon::{serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime};
 use keryx_relay::{
     health_server::serve_grpc_health,
     registry::{SkillRegistry, StoredSkill},
-    registry_server::{serve_registry_rpc, RegistryRpcService},
+    registry_server::{serve_registry_rpc, serve_registry_rpc_with_tls, RegistryRpcService},
     runtime::RelayRuntime,
 };
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Identity;
+
+#[test]
+fn cli_registry_reads_reject_remote_plaintext_endpoints() {
+    let endpoint = "http://0.0.0.0:1";
+    for args in [
+        &["relay", "registry", "list"][..],
+        &["node", "discover", "python"][..],
+    ] {
+        let output = run_keryx(args, &[("HERMES_KERYX_RELAY_REGISTRY_ENDPOINT", endpoint)]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("require TLS"),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_registry_reads_accept_https_with_private_ca() {
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.pem();
+    let dir = tempdir().unwrap();
+    let ca_path = dir.path().join("registry-ca.pem");
+    std::fs::write(&ca_path, cert_pem.as_bytes()).unwrap();
+    let registry = Arc::new(SkillRegistry::new());
+    registry
+        .register(
+            PeerId::new("peer-tls-cli").unwrap(),
+            vec![StoredSkill {
+                skill_id: "python".into(),
+                description: String::new(),
+                tags: vec![],
+            }],
+            "TLS CLI".into(),
+            String::new(),
+            None,
+        )
+        .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_registry_rpc_with_tls(
+        RegistryRpcService::new(registry),
+        listener,
+        Some(Identity::from_pem(
+            cert_pem.as_bytes(),
+            key_pair.serialize_pem().as_bytes(),
+        )),
+    ));
+    let endpoint = format!("https://localhost:{}", addr.port());
+    let ca_path = ca_path.to_string_lossy().to_string();
+
+    for args in [
+        &["relay", "registry", "list"][..],
+        &["node", "discover", "python"][..],
+    ] {
+        let output = run_keryx(
+            args,
+            &[
+                ("HERMES_KERYX_RELAY_REGISTRY_ENDPOINT", endpoint.as_str()),
+                ("HERMES_KERYX_REGISTRY_CA_CERT", ca_path.as_str()),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    server.abort();
+}
 
 fn run_keryx(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_keryx"));
@@ -77,10 +151,7 @@ async fn cli_relay_registry_list_shows_registrations() {
     let addr = listener.local_addr().unwrap();
     let reg = Arc::clone(&registry);
     let service = RegistryRpcService::new(reg);
-    tokio::spawn(serve_registry_rpc(
-        service,
-        TcpListenerStream::new(listener),
-    ));
+    tokio::spawn(serve_registry_rpc(service, listener));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let endpoint = format!("http://{addr}");
@@ -165,10 +236,7 @@ async fn cli_node_discover_filters_by_skill() {
     let addr = listener.local_addr().unwrap();
     let reg = Arc::clone(&registry);
     let service = RegistryRpcService::new(reg);
-    tokio::spawn(serve_registry_rpc(
-        service,
-        TcpListenerStream::new(listener),
-    ));
+    tokio::spawn(serve_registry_rpc(service, listener));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let endpoint = format!("http://{addr}");

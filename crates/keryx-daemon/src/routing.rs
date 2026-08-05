@@ -1,6 +1,7 @@
 //! Task routing between local store and relay-connected peers.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ use tonic::transport::Channel;
 use tonic::Request;
 use tonic::Status;
 use tracing::{info, instrument, warn};
+
+use crate::grpc_transport::{ca_cert_path_from_env, secure_grpc_endpoint};
 
 /// Default outbound delivery timeout when callers omit `timeout_ms`.
 pub const DEFAULT_SEND_TASK_TIMEOUT_MS: u64 = 30_000;
@@ -118,6 +121,7 @@ pub struct GrpcRelayTaskPublisher {
     endpoint: String,
     source_peer_id: PeerId,
     node_token: Option<String>,
+    ca_cert_path: Option<PathBuf>,
 }
 
 impl GrpcRelayTaskPublisher {
@@ -130,6 +134,7 @@ impl GrpcRelayTaskPublisher {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            ca_cert_path: ca_cert_path_from_env(),
         }
     }
 
@@ -137,8 +142,16 @@ impl GrpcRelayTaskPublisher {
         &self,
         target_peer_id: &PeerId,
     ) -> Result<KeryxRelayClient<Channel>, RoutingError> {
-        KeryxRelayClient::connect(self.endpoint.clone())
+        let endpoint = secure_grpc_endpoint(&self.endpoint, self.ca_cert_path.as_deref()).map_err(
+            |error| RoutingError::RelayFailed {
+                peer_id: target_peer_id.to_string(),
+                reason: error.to_string(),
+            },
+        )?;
+        endpoint
+            .connect()
             .await
+            .map(KeryxRelayClient::new)
             .map_err(|error| RoutingError::RelayFailed {
                 peer_id: target_peer_id.to_string(),
                 reason: format!("failed to connect to relay at {}: {error}", self.endpoint),
@@ -785,6 +798,18 @@ pub fn routing_error_to_status(error: RoutingError) -> Status {
 mod tests {
     use super::*;
     use keryx_proto::v1::TaskId as ProtoTaskId;
+
+    #[tokio::test]
+    async fn relay_publisher_rejects_remote_plaintext_endpoint() {
+        let publisher = GrpcRelayTaskPublisher::new(
+            "http://192.0.2.1:50052",
+            PeerId::new("source-peer").unwrap(),
+        );
+        let target = PeerId::new("target-peer").unwrap();
+
+        let error = publisher.connect(&target).await.unwrap_err();
+        assert!(error.to_string().contains("require TLS"));
+    }
 
     #[test]
     fn routing_policy_requires_approval_for_matching_capability() {

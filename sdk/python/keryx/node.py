@@ -77,6 +77,7 @@ class KeryxNode:
         daemon_endpoint: str | None = None,
         daemon_addr: str | None = None,
         registry_endpoint: str | None = None,
+        node_token: str | None = None,
         worker_id: str | None = None,
         home: str | Path | None = None,
         daemon_bin: str | Path | None = None,
@@ -110,6 +111,7 @@ class KeryxNode:
         self._status_callback = status_callback
         self._daemon_endpoint = loaded_config.daemon_endpoint
         self._registry_endpoint = loaded_config.registry_endpoint
+        self._node_token = node_token
         self._worker_id = loaded_config.worker_id
 
         self._channel = channel
@@ -500,10 +502,13 @@ class KeryxNode:
         if self._registration_task is not None:
             raise RuntimeError("node restart is blocked while registration cleanup is pending")
         factory = self._client_factory or DaemonClient
-        self._client = factory(
+        client_kwargs: dict[str, Any] = dict(
             daemon_endpoint=self._daemon_endpoint,
             registry_endpoint=self._registry_endpoint,
         )
+        if self._node_token is not None:
+            client_kwargs["node_token"] = self._node_token
+        self._client = factory(**client_kwargs)
         await self._client.connect()
         self._peer_id = await self._client.local_peer_id()
         if self._card is not None:
