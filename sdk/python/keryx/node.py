@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import sys
 import time
 import uuid
@@ -19,6 +20,7 @@ from keryx.card import AgentCard
 from keryx.client import (
     RESULT_ARTIFACT_GRPC_OPTIONS,
     DaemonClient,
+    _validate_registration_ttl,
     _verified_artifact_content,
     _write_artifact_download,
 )
@@ -84,6 +86,7 @@ class KeryxNode:
         claim_wait_timeout_ms: int = 1_000,
         heartbeat_interval_ms: int | None = None,
         shutdown_grace_seconds: float = 5.0,
+        registration_stop_timeout_seconds: float = 1.0,
         client_factory: Callable[..., DaemonClient] | type[DaemonClient] | None = None,
         **_ignored: Any,
     ) -> None:
@@ -125,6 +128,13 @@ class KeryxNode:
             raise ValueError("heartbeat_interval_ms must be positive")
         if shutdown_grace_seconds < 0:
             raise ValueError("shutdown_grace_seconds cannot be negative")
+        if (
+            isinstance(registration_stop_timeout_seconds, bool)
+            or not isinstance(registration_stop_timeout_seconds, (int, float))
+            or not math.isfinite(registration_stop_timeout_seconds)
+            or registration_stop_timeout_seconds <= 0
+        ):
+            raise ValueError("registration_stop_timeout_seconds must be positive and finite")
         self._serve_stop = asyncio.Event()
         self._serve_done = asyncio.Event()
         self._serve_done.set()
@@ -132,7 +142,19 @@ class KeryxNode:
         self._claim_wait_timeout_ms = claim_wait_timeout_ms
         self._heartbeat_interval_ms = heartbeat_interval_ms
         self._shutdown_grace_seconds = shutdown_grace_seconds
+        self._registration_stop_timeout_seconds = float(
+            registration_stop_timeout_seconds
+        )
         self._task_handlers: list[TaskHandler] = []
+        self._registration_stop = asyncio.Event()
+        self._registration_lock = asyncio.Lock()
+        self._registration_task: asyncio.Task[None] | None = None
+        self._registration_cleanup_task: asyncio.Task[None] | None = None
+        self._registration_close_client_after_cleanup = False
+        self._registration_card: AgentCard | None = None
+        self._registration_last_error: str | None = None
+        self._registration_consecutive_failures = 0
+        self._registration_last_success_ms = 0
 
     @property
     def config(self) -> KeryxConfig:
@@ -175,9 +197,28 @@ class KeryxNode:
     async def close(self) -> None:
         """Close the SDK-owned gRPC channel."""
 
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+        stop_result: dict[str, Any] | None = None
+        if self._registration_task is not None:
+            try:
+                stop_result = await self.stop_registration()
+            except Exception:
+                logger.warning("Unable to deregister skills during shutdown", exc_info=True)
+        client = self._client
+        client_transferred = False
+        if stop_result and stop_result.get("cleanup_pending") and client is not None:
+            async with self._registration_lock:
+                if self._registration_cleanup_task is not None and self._client is client:
+                    self._registration_close_client_after_cleanup = True
+                    self._client = None
+                    client_transferred = True
+        if client is not None and not client_transferred:
+            await client.close()
+            if self._client is client:
+                self._client = None
+            async with self._registration_lock:
+                if self._registration_cleanup_task is None:
+                    self._registration_task = None
+                    self._registration_card = None
         if self._channel is not None and self._owns_channel:
             result = self._channel.close()
             if inspect.isawaitable(result):
@@ -455,6 +496,8 @@ class KeryxNode:
     async def start(self) -> None:
         if self._running:
             return
+        if self._registration_task is not None:
+            raise RuntimeError("node restart is blocked while registration cleanup is pending")
         factory = self._client_factory or DaemonClient
         self._client = factory(
             daemon_endpoint=self._daemon_endpoint,
@@ -801,6 +844,7 @@ class KeryxNode:
         ttl_seconds: int = 300,
     ) -> dict[str, Any]:
         self._ensure_running()
+        ttl_seconds = _validate_registration_ttl(ttl_seconds)
         assert self._client is not None
         active_card = card or self._card
         if active_card is None:
@@ -809,7 +853,10 @@ class KeryxNode:
             peer_id=self.peer_id,
             name=active_card.name,
             description=active_card.description,
-            skills=[(skill.id, skill.description) for skill in active_card.skills],
+            skills=[
+                (skill.id, skill.description, list(skill.tags))
+                for skill in active_card.skills
+            ],
             ttl_seconds=ttl_seconds,
         )
         return {
@@ -828,6 +875,300 @@ class KeryxNode:
         skill_ids = [skill.id for skill in active_card.skills]
         accepted = await self._client.unregister_skills(peer_id=self.peer_id, skill_ids=skill_ids)
         return {"accepted": accepted, "peer_id": self.peer_id}
+
+    async def start_registration(
+        self,
+        card: AgentCard | None = None,
+        *,
+        capacity: int | None = None,
+        current_load: int = 0,
+        ttl_seconds: int = 300,
+        refresh_interval_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Register skills now and keep their TTL alive until stopped."""
+
+        async with self._registration_lock:
+            return await self._start_registration_unlocked(
+                card,
+                capacity=capacity,
+                current_load=current_load,
+                ttl_seconds=ttl_seconds,
+                refresh_interval_seconds=refresh_interval_seconds,
+            )
+
+    async def _start_registration_unlocked(
+        self,
+        card: AgentCard | None = None,
+        *,
+        capacity: int | None = None,
+        current_load: int = 0,
+        ttl_seconds: int = 300,
+        refresh_interval_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_running()
+        source_card = card or self._card
+        if source_card is None:
+            raise RuntimeError("start_registration requires an AgentCard")
+        active_card = AgentCard.from_dict(source_card.to_dict())
+        ttl_seconds = _validate_registration_ttl(ttl_seconds)
+        refresh_interval = (
+            ttl_seconds / 2 if refresh_interval_seconds is None else refresh_interval_seconds
+        )
+        if (
+            isinstance(refresh_interval, bool)
+            or not isinstance(refresh_interval, (int, float))
+            or not math.isfinite(refresh_interval)
+            or refresh_interval <= 0
+            or refresh_interval >= ttl_seconds
+        ):
+            raise ValueError("refresh_interval_seconds must be positive and less than ttl_seconds")
+        if self._registration_task is not None:
+            raise RuntimeError("skill registration lifecycle is already running")
+
+        result = await self.register_skills(
+            active_card,
+            capacity=capacity,
+            current_load=current_load,
+            ttl_seconds=ttl_seconds,
+        )
+        if not result["accepted"]:
+            raise RuntimeError("skill registration was rejected")
+
+        self._registration_last_error = None
+        self._registration_consecutive_failures = 0
+        self._registration_last_success_ms = int(time.time() * 1_000)
+        self._registration_stop.clear()
+        self._registration_card = active_card
+        self._registration_task = asyncio.create_task(
+            self._registration_refresh_loop(
+                active_card,
+                capacity=capacity,
+                current_load=current_load,
+                ttl_seconds=ttl_seconds,
+                refresh_interval_seconds=refresh_interval,
+            ),
+            name="keryx-skill-registration-refresh",
+        )
+        return result
+
+    def registration_status(self) -> dict[str, Any]:
+        """Return a bounded snapshot of TTL registration lifecycle health."""
+
+        active = self._registration_task is not None
+        if self._registration_last_error:
+            state = "degraded"
+        elif not active:
+            state = "inactive"
+        else:
+            state = "healthy"
+        return {
+            "active": active,
+            "state": state,
+            "cleanup_pending": self._registration_cleanup_task is not None,
+            "last_error": self._registration_last_error,
+            "consecutive_failures": self._registration_consecutive_failures,
+            "last_success_ms": self._registration_last_success_ms,
+        }
+
+    async def stop_registration(self) -> dict[str, Any] | None:
+        """Stop TTL refresh and deregister the exact active skill set."""
+
+        async with self._registration_lock:
+            return await self._stop_registration_unlocked()
+
+    async def _stop_registration_unlocked(self) -> dict[str, Any] | None:
+        refresh_task = self._registration_task
+        active_card = self._registration_card
+        if refresh_task is None or active_card is None:
+            return None
+        if self._registration_cleanup_task is not None:
+            return self._registration_pending_result()
+        client = self._client
+        if client is None:
+            raise RuntimeError("registration lifecycle client is unavailable")
+        peer_id = self.peer_id
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self._registration_stop_timeout_seconds
+        )
+
+        self._registration_stop.set()
+        refresh_task.cancel()
+        if not await self._wait_for_registration_task(refresh_task, deadline):
+            self._mark_registration_cleanup_pending(
+                "registration refresh cancellation acknowledgement timed out; "
+                "deregistration is pending"
+            )
+            self._registration_cleanup_task = asyncio.create_task(
+                self._finish_registration_stop(
+                    refresh_task,
+                    None,
+                    active_card,
+                    client,
+                    peer_id,
+                ),
+                name="keryx-skill-registration-cleanup",
+            )
+            return self._registration_pending_result()
+
+        await asyncio.gather(refresh_task, return_exceptions=True)
+        deregistration_task = self._start_registration_deregistration(
+            client, active_card, peer_id
+        )
+        if not await self._wait_for_registration_task(deregistration_task, deadline):
+            self._mark_registration_cleanup_pending(
+                "skill deregistration exceeded the registration stop bound; "
+                "cleanup is pending"
+            )
+            self._registration_cleanup_task = asyncio.create_task(
+                self._finish_registration_stop(
+                    refresh_task,
+                    deregistration_task,
+                    active_card,
+                    client,
+                    peer_id,
+                ),
+                name="keryx-skill-registration-cleanup",
+            )
+            return self._registration_pending_result()
+        return await self._complete_registration_stop_unlocked(
+            deregistration_task, peer_id
+        )
+
+    async def _finish_registration_stop(
+        self,
+        refresh_task: asyncio.Task[None],
+        deregistration_task: asyncio.Task[bool] | None,
+        active_card: AgentCard,
+        client: Any,
+        peer_id: str,
+    ) -> None:
+        await asyncio.gather(refresh_task, return_exceptions=True)
+        if deregistration_task is None:
+            deregistration_task = self._start_registration_deregistration(
+                client, active_card, peer_id
+            )
+        await asyncio.gather(deregistration_task, return_exceptions=True)
+
+        close_client = False
+        async with self._registration_lock:
+            close_client = self._registration_close_client_after_cleanup
+            try:
+                if (
+                    self._registration_task is refresh_task
+                    and self._registration_card is active_card
+                ):
+                    try:
+                        await self._complete_registration_stop_unlocked(
+                            deregistration_task, peer_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Unable to deregister skills after delayed refresh shutdown",
+                            exc_info=True,
+                        )
+                        if close_client:
+                            self._registration_task = None
+                            self._registration_card = None
+            finally:
+                self._registration_cleanup_task = None
+                self._registration_close_client_after_cleanup = False
+
+        if close_client:
+            try:
+                await client.close()
+            except Exception:
+                logger.warning(
+                    "Unable to close registration client after delayed cleanup",
+                    exc_info=True,
+                )
+
+    def _start_registration_deregistration(
+        self, client: Any, active_card: AgentCard, peer_id: str
+    ) -> asyncio.Task[bool]:
+        return asyncio.create_task(
+            client.unregister_skills(
+                peer_id=peer_id,
+                skill_ids=[skill.id for skill in active_card.skills],
+            ),
+            name="keryx-skill-deregistration",
+        )
+
+    async def _wait_for_registration_task(
+        self, task: asyncio.Task[Any], deadline: float
+    ) -> bool:
+        if task.done():
+            return True
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+        return task in done
+
+    def _mark_registration_cleanup_pending(self, error: str) -> None:
+        self._registration_last_error = error[:512]
+        self._registration_consecutive_failures += 1
+
+    def _registration_pending_result(self) -> dict[str, Any]:
+        return {
+            "accepted": False,
+            "peer_id": self.peer_id,
+            "cleanup_pending": True,
+        }
+
+    async def _complete_registration_stop_unlocked(
+        self, deregistration_task: asyncio.Task[bool], peer_id: str
+    ) -> dict[str, Any]:
+        try:
+            accepted = await deregistration_task
+            if not accepted:
+                raise RuntimeError("skill deregistration was rejected")
+        except Exception as exc:
+            self._registration_last_error = f"{type(exc).__name__}: {exc}"[:512]
+            self._registration_consecutive_failures += 1
+            raise
+        self._registration_task = None
+        self._registration_card = None
+        self._registration_last_error = None
+        self._registration_consecutive_failures = 0
+        return {"accepted": True, "peer_id": peer_id}
+
+    async def _registration_refresh_loop(
+        self,
+        card: AgentCard,
+        *,
+        capacity: int | None,
+        current_load: int,
+        ttl_seconds: int,
+        refresh_interval_seconds: float,
+    ) -> None:
+        while not self._registration_stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._registration_stop.wait(), timeout=refresh_interval_seconds
+                )
+                return
+            except TimeoutError:
+                pass
+            try:
+                result = await self.register_skills(
+                    card,
+                    capacity=capacity,
+                    current_load=current_load,
+                    ttl_seconds=ttl_seconds,
+                )
+                if not result["accepted"]:
+                    self._registration_last_error = "registration refresh was rejected"
+                    self._registration_consecutive_failures += 1
+                    logger.warning("Keryx skill registration refresh was rejected")
+                else:
+                    self._registration_last_error = None
+                    self._registration_consecutive_failures = 0
+                    self._registration_last_success_ms = int(time.time() * 1_000)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._registration_last_error = f"{type(exc).__name__}: {exc}"[:512]
+                self._registration_consecutive_failures += 1
+                logger.warning("Keryx skill registration refresh failed", exc_info=True)
 
     async def _daemon(self) -> Any:
         if not self._connected or self._daemon_stub is None:

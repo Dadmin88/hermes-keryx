@@ -71,6 +71,6 @@ The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node
 ## Current limitations
 
 - The relay offline mailbox is in-memory. It handles reconnects to the same relay process but does not survive relay restarts.
-- The high-level Python `Skill`/`register_skills()` path does not yet propagate protocol-level skill tags.
+- Python callers that need TTL renewal must opt into `start_registration()` and monitor `registration_status()`; refresh is retrying but best-effort, so a prolonged registry outage can still expire the lease. Registry mutations have finite RPC deadlines. One configured stop budget spans refresh acknowledgement and deregistration; overruns stay visibly pending, block restart, and preserve refresh-before-deregister ordering. Shutdown transfers the registry client to delayed cleanup rather than closing it underneath deregistration. The lower-level `register_skills()` call remains one-shot.
 - The high-level Python `send_task()` helper does not expose every lower-level envelope field or routing option.
 - `TaskHandle` observes results by bounded polling rather than a streaming subscription.

@@ -87,7 +87,7 @@ The SDK keeps transition helpers so older Hermes Agency call sites can migrate i
 ```python
 async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endpoint="127.0.0.1:51053") as node:
     await node.start()
-    await node.register_skills(ttl_seconds=300)
+    await node.start_registration(ttl_seconds=300)
     agents = await node.discover("echo", limit=1)
     handle = await node.send_task(
         {"parts": [{"text": "hello"}]},
@@ -95,7 +95,6 @@ async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endp
         deadline_ms=1_800_000_000_000,
     )
     print(handle.task_id)
-    await node.deregister_skills()
     await node.stop()
 ```
 
@@ -107,8 +106,8 @@ Compatibility notes:
 - The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. Bounded artifact bytes traverse the authenticated result route and can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact()`.
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
-- Registry tags exist in the protocol, but `Skill` and the high-level `register_skills()` helper do not yet propagate them.
-- Registration is one-shot; the SDK does not automatically refresh before TTL expiry or deregister on shutdown.
+- `Skill.tags` round-trips through card dictionaries, registry publication, and discovery.
+- `register_skills()` remains a one-shot primitive. `start_registration()` registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` reports lifecycle health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutations use finite RPC deadlines. One stop budget spans refresh cancellation acknowledgement and deregistration. Work exceeding that budget continues as tracked cleanup, blocks restart, and preserves refresh-before-deregister ordering. During node shutdown, ownership of the registry client transfers to pending cleanup so accepted deregistration and client close can finish in order.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 
 ## Configuration

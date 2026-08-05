@@ -12,6 +12,14 @@ class Skill:
     description: str = ""
     input_schema: str | None = None
     output_schema: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tags, list) or any(
+            not isinstance(tag, str) or not tag for tag in self.tags
+        ):
+            raise ValueError("Skill tags must be a list of non-empty strings")
+        self.tags = list(self.tags)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"id": self.id, "description": self.description}
@@ -19,6 +27,8 @@ class Skill:
             data["input_schema"] = self.input_schema
         if self.output_schema:
             data["output_schema"] = self.output_schema
+        if self.tags:
+            data["tags"] = list(self.tags)
         return data
 
     @classmethod
@@ -31,11 +41,17 @@ class Skill:
         description = data.get("description", "")
         if not isinstance(description, str):
             raise ValueError("Skill description must be a string")
+        tags = data.get("tags", [])
+        if not isinstance(tags, list) or any(
+            not isinstance(tag, str) or not tag for tag in tags
+        ):
+            raise ValueError("Skill tags must be a list of non-empty strings")
         return cls(
             id=skill_id,
             description=description,
             input_schema=data.get("input_schema"),
             output_schema=data.get("output_schema"),
+            tags=list(tags),
         )
 
 

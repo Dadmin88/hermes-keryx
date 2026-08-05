@@ -41,6 +41,17 @@ RESULT_ARTIFACT_GRPC_OPTIONS = (
     ("grpc.max_receive_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+REGISTRY_RPC_TIMEOUT_SECONDS = 10.0
+
+
+def _validate_registration_ttl(ttl_seconds: object) -> int:
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or not 0 < ttl_seconds <= 2**64 - 1
+    ):
+        raise ValueError("ttl_seconds must be a positive unsigned 64-bit integer")
+    return ttl_seconds
 
 
 def default_daemon_endpoint() -> str:
@@ -339,9 +350,10 @@ class DaemonClient:
         peer_id: str,
         name: str,
         description: str,
-        skills: list[tuple[str, str]],
+        skills: list[tuple[str, str, list[str]]],
         ttl_seconds: int = 300,
     ) -> bool:
+        ttl_seconds = _validate_registration_ttl(ttl_seconds)
         if self._registry is None:
             return False
         assert self._registry is not None
@@ -354,12 +366,15 @@ class DaemonClient:
                 registry_pb2.SkillInfo(
                     skill_id=skill_id,
                     description=skill_description,
+                    tags=tags,
                 )
-                for skill_id, skill_description in skills
+                for skill_id, skill_description, tags in skills
             ],
         )
-        response = await self._registry.RegisterSkills(request)
-        return bool(response.accepted)
+        response = await self._registry.RegisterSkills(
+            request, timeout=REGISTRY_RPC_TIMEOUT_SECONDS
+        )
+        return response.accepted
 
     async def unregister_skills(
         self, *, peer_id: str, skill_ids: list[str]
@@ -371,9 +386,10 @@ class DaemonClient:
             registry_pb2.UnregisterSkillsRequest(
                 peer_id=peer_id,
                 skill_ids=skill_ids,
-            )
+            ),
+            timeout=REGISTRY_RPC_TIMEOUT_SECONDS,
         )
-        return bool(response.accepted)
+        return response.accepted
 
     async def get_card(self, peer_id: str) -> "AgentCard":
         from keryx.card import AgentCard, Skill
@@ -393,6 +409,7 @@ class DaemonClient:
                         Skill(
                             id=skill.skill_id,
                             description=skill.description,
+                            tags=list(skill.tags),
                         )
                         for skill in registration.skills
                     ],

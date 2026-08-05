@@ -152,8 +152,8 @@ Current compatibility behavior:
 - `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
 - `send_task(..., deadline_ms=...)` propagates a zero-or-positive absolute Unix epoch deadline through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results. This execution deadline is separate from the daemon client's delivery `timeout_ms`.
 - `IncomingTask.complete()` / `.fail()` persist terminal state and feed the authenticated relay result route.
-- Registry tags exist in the protocol, but the high-level Python `Skill`/`register_skills()` helper does not yet propagate them.
-- Python/edge registration is one-shot; neither path automatically refreshes before the default 300-second TTL expires. Long-running integrations must explicitly renew or use a supervised restart loop until a lifecycle helper exists.
+- High-level Python `Skill.tags` propagate through registry publication and discovery.
+- Python `register_skills()` remains a one-shot primitive. The opt-in `start_registration()` lifecycle registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` exposes health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutation RPCs use finite deadlines, and one stop budget covers both refresh cancellation acknowledgement and deregistration. Work exceeding that budget remains tracked, blocks restart, and preserves refresh-before-deregister ordering. Shutdown transfers its registry client to pending cleanup so deregistration can finish before client close. The edge binary's registration remains one-shot.
 
 The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
 

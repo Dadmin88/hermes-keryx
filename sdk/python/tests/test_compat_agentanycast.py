@@ -54,12 +54,20 @@ class _FakeRegistryStub:
         self.register_calls: list[registry_pb2.RegisterSkillsRequest] = []
         self.unregister_calls: list[registry_pb2.UnregisterSkillsRequest] = []
 
-    async def RegisterSkills(self, request: registry_pb2.RegisterSkillsRequest) -> registry_pb2.RegisterSkillsResponse:
+    async def RegisterSkills(
+        self,
+        request: registry_pb2.RegisterSkillsRequest,
+        *,
+        timeout: float | None = None,
+    ) -> registry_pb2.RegisterSkillsResponse:
         self.register_calls.append(request)
         return registry_pb2.RegisterSkillsResponse(accepted=True)
 
     async def UnregisterSkills(
-        self, request: registry_pb2.UnregisterSkillsRequest
+        self,
+        request: registry_pb2.UnregisterSkillsRequest,
+        *,
+        timeout: float | None = None,
     ) -> registry_pb2.UnregisterSkillsResponse:
         self.unregister_calls.append(request)
         return registry_pb2.UnregisterSkillsResponse(accepted=True)
