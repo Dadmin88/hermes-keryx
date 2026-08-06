@@ -4,15 +4,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use keryx_core::{NodeId, PeerId, TaskId as CoreTaskId, TaskStatus as CoreTaskStatus};
+use keryx_core::{Digest, NodeId, PeerId, TaskId as CoreTaskId, TaskStatus as CoreTaskStatus};
 use keryx_daemon::{serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime};
 use keryx_proto::v1::{
     AgentId, ClaimTaskRequest, CompleteTaskRequest, PublishResultRequest, PublishTaskRequest,
-    TaskEnvelope, TaskId, TaskResultEnvelope, TaskStatus as ProtoTaskStatus, TerminalOutcome,
+    RelayFrame, TaskArtifact, TaskEnvelope, TaskId, TaskResultEnvelope,
+    TaskStatus as ProtoTaskStatus, TerminalOutcome,
 };
 use keryx_store::{
     ResultDeliveryState, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
 };
+use prost::Message;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -116,6 +118,303 @@ fn permanent_publish_rejections_are_dead_lettered_without_acknowledgement() {
     ] {
         assert!(!publish_result_failure_is_permanent(code), "{code:?}");
     }
+}
+
+#[test]
+fn transient_result_delivery_failures_dead_letter_on_the_tenth_attempt() {
+    assert_eq!(MAX_RESULT_DELIVERY_ATTEMPTS, 10);
+    assert!(!result_delivery_failure_should_dead_letter(
+        Code::DeadlineExceeded,
+        MAX_RESULT_DELIVERY_ATTEMPTS - 2,
+    ));
+    assert!(result_delivery_failure_should_dead_letter(
+        Code::DeadlineExceeded,
+        MAX_RESULT_DELIVERY_ATTEMPTS - 1,
+    ));
+    assert!(result_delivery_failure_should_dead_letter(
+        Code::DeadlineExceeded,
+        u32::MAX,
+    ));
+}
+
+#[tokio::test]
+async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_artifacts() {
+    const ORIGIN: &str = "retry-budget-origin";
+    const EXECUTOR: &str = "retry-budget-executor";
+    const TASK: &str = "retry-budget-artifact-result";
+    const WORKER: &str = "retry-budget-worker";
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(data_dir.path().join("daemon"), 0)
+            .with_local_peer_id(PeerId::new(EXECUTOR).unwrap()),
+    )
+    .await
+    .unwrap();
+    let task_id = CoreTaskId::new(TASK).unwrap();
+    let mut envelope = TaskEnvelope {
+        task_id: Some(TaskId {
+            value: TASK.to_string(),
+        }),
+        correlation_id: None,
+        idempotency_key: None,
+        status: ProtoTaskStatus::Created as i32,
+        messages: Vec::new(),
+        metadata: Default::default(),
+        deadline_ms: unix_ms_now() + 60_000,
+    };
+    envelope.metadata.insert(
+        "keryx.authenticated_source_protocol_features".to_string(),
+        serde_json::to_string(&vec!["result_artifact_bytes_v1"]).unwrap(),
+    );
+    runtime
+        .accept_pending_remote_task_with_backpressure(
+            TaskRecord::new(task_id.clone(), CoreTaskStatus::Pending, None),
+            TaskEnvelopeRecord::new(task_id.clone(), envelope.encode_to_vec(), unix_ms_now()),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(PeerId::new(ORIGIN).unwrap()),
+                expected_executor_peer_id: Some(PeerId::new(EXECUTOR).unwrap()),
+                destination_peer_id: PeerId::new(EXECUTOR).unwrap(),
+                relay_frame_id: Some("retry-budget-submit-frame".to_string()),
+                received_at_ms: unix_ms_now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let daemon_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_daemon_rpc(
+        runtime.clone(),
+        TcpListenerStream::new(listener),
+    ));
+    let mut client = KeryxDaemonClient::connect(format!("http://{daemon_addr}"))
+        .await
+        .unwrap();
+    let claim = client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: TASK.to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: WORKER.to_string(),
+            }),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let artifact_bytes = b"durable late result bytes".to_vec();
+    client
+        .complete_task(CompleteTaskRequest {
+            task_id: Some(TaskId {
+                value: TASK.to_string(),
+            }),
+            lease_id: claim.lease_id,
+            worker_id: Some(AgentId {
+                value: WORKER.to_string(),
+            }),
+            duration_ms: 1,
+            result_metadata: Default::default(),
+            output_artifacts: vec![TaskArtifact {
+                path: "late-result.bin".to_string(),
+                media_type: "application/octet-stream".to_string(),
+                metadata: Default::default(),
+                content: artifact_bytes.clone(),
+                byte_len: artifact_bytes.len() as u64,
+                sha256: Digest::compute(&artifact_bytes).as_str().to_string(),
+                content_present: true,
+            }],
+        })
+        .await
+        .unwrap();
+
+    let relay_addr = reserve_loopback_addr().await;
+    let relay_runtime = RelayRuntime::new("retry-budget-exhaustion-test");
+    relay_runtime.mark_transport_listening();
+    let registry = Arc::new(SkillRegistry::new());
+    for node_id in [ORIGIN, EXECUTOR] {
+        registry
+            .register_with_features(
+                PeerId::new(node_id).unwrap(),
+                Vec::new(),
+                node_id.to_string(),
+                String::new(),
+                vec!["result_artifact_bytes_v1".to_string()],
+                None,
+            )
+            .await;
+    }
+    let auth = Arc::new(NodeTokenAuth::new(
+        HashMap::from([
+            (NodeId::new(ORIGIN).unwrap(), "origin-token".to_string()),
+            (NodeId::new(EXECUTOR).unwrap(), "executor-token".to_string()),
+        ]),
+        Default::default(),
+    ));
+    for index in 0..crate::runtime::MAX_TRACKED_FRAMES {
+        relay_runtime.route_frame(
+            ORIGIN,
+            RelayFrame {
+                frame_id: format!("capacity-frame-{index}"),
+                task: None,
+                result: None,
+                authenticated_source_node_id: EXECUTOR.to_string(),
+                destination_node_id: ORIGIN.to_string(),
+            },
+        );
+    }
+    assert_eq!(
+        relay_runtime.mailbox_depth(ORIGIN),
+        crate::runtime::MAX_TRACKED_FRAMES
+    );
+    let relay_server = spawn_relay_server(relay_addr, Arc::clone(&relay_runtime), registry, auth);
+    let delivery_worker = tokio::spawn(run_result_delivery_worker_with_retry_delay(
+        format!("http://{relay_addr}"),
+        EXECUTOR.to_string(),
+        Some("executor-token".to_string()),
+        format!("http://{daemon_addr}"),
+        |_, _| 1,
+    ));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let dead_lettered = runtime
+                .store()
+                .result_delivery_for_task(&task_id)
+                .await
+                .unwrap()
+                .is_some_and(|delivery| {
+                    delivery.state == ResultDeliveryState::DeadLettered
+                        && delivery.attempt_count == MAX_RESULT_DELIVERY_ATTEMPTS
+                });
+            if dead_lettered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("automatic transient publication retries must exhaust their finite budget");
+    delivery_worker.abort();
+    let _ = delivery_worker.await;
+
+    let outbox = runtime
+        .store()
+        .result_delivery_for_task(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbox.state, ResultDeliveryState::DeadLettered);
+    assert_eq!(outbox.attempt_count, MAX_RESULT_DELIVERY_ATTEMPTS);
+    assert!(outbox.last_error.is_some());
+    assert!(runtime
+        .store()
+        .claim_next_result_delivery(WORKER, unix_ms_now() + 1_000, 1_000)
+        .await
+        .unwrap()
+        .is_none());
+    let terminal = runtime.store().get_terminal_result(&task_id).await.unwrap();
+    let persisted_result = TaskResultEnvelope::decode(terminal.encoded_result.as_slice()).unwrap();
+    assert_eq!(persisted_result.output_artifacts.len(), 1);
+    let artifact = &persisted_result.output_artifacts[0];
+    assert_eq!(artifact.path, "late-result.bin");
+    assert_eq!(artifact.media_type, "application/octet-stream");
+    assert_eq!(artifact.byte_len, artifact_bytes.len() as u64);
+    assert_eq!(artifact.sha256, Digest::compute(&artifact_bytes).as_str());
+    assert!(artifact.content_present);
+    assert_eq!(artifact.content, artifact_bytes);
+
+    let unrelated_id = CoreTaskId::new("retry-budget-unrelated-result").unwrap();
+    let unrelated_envelope = TaskEnvelope {
+        task_id: Some(TaskId {
+            value: unrelated_id.as_str().to_string(),
+        }),
+        correlation_id: None,
+        idempotency_key: None,
+        status: ProtoTaskStatus::Created as i32,
+        messages: Vec::new(),
+        metadata: Default::default(),
+        deadline_ms: unix_ms_now() + 60_000,
+    };
+    runtime
+        .accept_pending_remote_task_with_backpressure(
+            TaskRecord::new(unrelated_id.clone(), CoreTaskStatus::Pending, None),
+            TaskEnvelopeRecord::new(
+                unrelated_id.clone(),
+                unrelated_envelope.encode_to_vec(),
+                unix_ms_now(),
+            ),
+            TaskTransportContextRecord {
+                task_id: unrelated_id.clone(),
+                authenticated_sender_peer_id: Some(PeerId::new(ORIGIN).unwrap()),
+                expected_executor_peer_id: Some(PeerId::new(EXECUTOR).unwrap()),
+                destination_peer_id: PeerId::new(EXECUTOR).unwrap(),
+                relay_frame_id: Some("retry-budget-unrelated-frame".to_string()),
+                received_at_ms: unix_ms_now(),
+            },
+        )
+        .await
+        .unwrap();
+    let unrelated_claim = client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: unrelated_id.as_str().to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: WORKER.to_string(),
+            }),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .complete_task(CompleteTaskRequest {
+            task_id: Some(TaskId {
+                value: unrelated_id.as_str().to_string(),
+            }),
+            lease_id: unrelated_claim.lease_id,
+            worker_id: Some(AgentId {
+                value: WORKER.to_string(),
+            }),
+            duration_ms: 1,
+            result_metadata: Default::default(),
+            output_artifacts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let unrelated_now = unix_ms_now().saturating_add(1);
+    let (unrelated_delivery, _) = runtime
+        .store()
+        .claim_next_result_delivery(WORKER, unrelated_now, 1_000)
+        .await
+        .unwrap()
+        .expect("dead-lettered row must not block later unrelated result traffic");
+    assert_eq!(unrelated_delivery.task_id, unrelated_id);
+    runtime
+        .store()
+        .ack_result_delivery(
+            &unrelated_delivery.delivery_id,
+            WORKER,
+            unrelated_delivery.lease_expires_at_ms.unwrap(),
+            unrelated_now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .store()
+            .result_delivery_for_task(&unrelated_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ResultDeliveryState::Delivered
+    );
+
+    relay_server.abort();
+    server.abort();
 }
 
 #[test]
@@ -968,6 +1267,15 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     .expect("result must deliver and receive authenticated destination ACK after reconnect");
     assert!(origin_attempts.load(Ordering::SeqCst) >= 2);
     assert!(executor_attempts.load(Ordering::SeqCst) >= 2);
+    let recovered_delivery = executor_runtime
+        .store()
+        .result_delivery_for_task(&result_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_delivery.state, ResultDeliveryState::Delivered);
+    assert!(recovered_delivery.attempt_count > 0);
+    assert!(recovered_delivery.attempt_count < MAX_RESULT_DELIVERY_ATTEMPTS);
 
     publish_remote_task(relay_addr, ORIGIN, ORIGIN_TOKEN, EXECUTOR, NEXT_TASK).await;
     wait_for_task(&executor_runtime, NEXT_TASK).await;

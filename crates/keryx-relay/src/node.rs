@@ -315,6 +315,8 @@ fn relay_endpoint() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+const MAX_RESULT_DELIVERY_ATTEMPTS: u32 = 10;
+
 fn publish_result_failure_is_permanent(code: Code) -> bool {
     matches!(
         code,
@@ -328,6 +330,13 @@ fn publish_result_failure_is_permanent(code: Code) -> bool {
             | Code::Unimplemented
             | Code::DataLoss
     )
+}
+
+/// `attempt_count` is the number of previously failed publication attempts stored in the outbox.
+/// The failure currently being handled is therefore attempt `attempt_count + 1`.
+fn result_delivery_failure_should_dead_letter(code: Code, attempt_count: u32) -> bool {
+    publish_result_failure_is_permanent(code)
+        || attempt_count.saturating_add(1) >= MAX_RESULT_DELIVERY_ATTEMPTS
 }
 
 fn result_delivery_retry_delay_ms(delivery_id: &str, attempt_count: u32) -> i64 {
@@ -349,6 +358,26 @@ async fn run_result_delivery_worker(
     node_token: Option<String>,
     daemon_endpoint: String,
 ) -> Result<()> {
+    run_result_delivery_worker_with_retry_delay(
+        relay_endpoint,
+        registry_peer_id,
+        node_token,
+        daemon_endpoint,
+        result_delivery_retry_delay_ms,
+    )
+    .await
+}
+
+async fn run_result_delivery_worker_with_retry_delay<F>(
+    relay_endpoint: String,
+    registry_peer_id: String,
+    node_token: Option<String>,
+    daemon_endpoint: String,
+    retry_delay_ms: F,
+) -> Result<()>
+where
+    F: Fn(&str, u32) -> i64 + Send + Sync,
+{
     let channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
     let mut relay = KeryxRelayClient::new(channel)
         .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
@@ -398,11 +427,14 @@ async fn run_result_delivery_worker(
                         delivery_id: delivery.delivery_id.clone(),
                         worker_id: delivery_worker.clone(),
                         error_reason: error.message().to_string(),
-                        retry_delay_ms: result_delivery_retry_delay_ms(
+                        retry_delay_ms: retry_delay_ms(
                             &delivery.delivery_id,
                             delivery.attempt_count,
                         ),
-                        dead_letter: publish_result_failure_is_permanent(error.code()),
+                        dead_letter: result_delivery_failure_should_dead_letter(
+                            error.code(),
+                            delivery.attempt_count,
+                        ),
                         lease_expires_at_ms: delivery.lease_expires_at_ms,
                     })
                     .await?;
