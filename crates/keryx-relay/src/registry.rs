@@ -353,61 +353,11 @@ impl SkillRegistry {
             .expect("registry gossip snapshot serializes")
     }
 
-    /// Apply a registry gossip payload received from another relay.
+    /// Validate but ignore registry gossip. Owner authentication is available only on the
+    /// unary registry control plane, so gossip cannot authorize foreign registration mutation.
     pub async fn apply_gossip_bytes(&self, payload: &[u8]) -> Result<(), RegistryGossipError> {
-        let message: RegistryGossipMessage = serde_json::from_slice(payload)
+        let _message: RegistryGossipMessage = serde_json::from_slice(payload)
             .map_err(|err| RegistryGossipError(format!("decode registry gossip: {err}")))?;
-        match message {
-            RegistryGossipMessage::Upsert { registration } => {
-                self.apply_gossip_registration(registration).await?;
-            }
-            RegistryGossipMessage::Remove {
-                peer_id,
-                updated_at_unix_ms,
-            } => {
-                let peer_id = parse_peer_id(&peer_id)?;
-                let mut guard = self.inner.write().await;
-                let should_remove = match guard.nodes.get(&peer_id) {
-                    Some(existing) => updated_at_unix_ms >= existing.updated_at_unix_ms,
-                    None => true,
-                };
-                if should_remove {
-                    guard.remove_peer(&peer_id);
-                }
-            }
-            RegistryGossipMessage::Snapshot { registrations } => {
-                for registration in registrations {
-                    self.apply_gossip_registration(registration).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_gossip_registration(
-        &self,
-        gossip: GossipRegistration,
-    ) -> Result<(), RegistryGossipError> {
-        let mut registration = gossip.try_into_registration()?;
-        let mut guard = self.inner.write().await;
-        if registration.expires_at <= Instant::now() {
-            guard.remove_peer(&registration.peer_id);
-            return Ok(());
-        }
-        if guard
-            .nodes
-            .get(&registration.peer_id)
-            .is_some_and(|existing| existing.updated_at_unix_ms > registration.updated_at_unix_ms)
-        {
-            return Ok(());
-        }
-        // Gossip is useful for discovery but is not an authenticated capability authority.
-        // Preserve only features already established by this relay's authenticated control plane.
-        registration.protocol_features = guard
-            .nodes
-            .get(&registration.peer_id)
-            .map_or_else(Vec::new, |existing| existing.protocol_features.clone());
-        guard.insert_registration(registration);
         Ok(())
     }
 
@@ -531,22 +481,6 @@ impl From<&Registration> for GossipRegistration {
     }
 }
 
-impl GossipRegistration {
-    fn try_into_registration(self) -> Result<Registration, RegistryGossipError> {
-        let peer_id = parse_peer_id(&self.peer_id)?;
-        Ok(Registration {
-            peer_id,
-            skills: self.skills,
-            name: self.name,
-            description: self.description,
-            protocol_features: self.protocol_features,
-            expires_at: instant_from_unix_ms(self.expires_at_unix_ms),
-            expires_at_unix_ms: self.expires_at_unix_ms,
-            updated_at_unix_ms: self.updated_at_unix_ms,
-        })
-    }
-}
-
 fn registration_matches(reg: &Registration, skill_id: Option<&str>, tags: &[String]) -> bool {
     reg.skills.iter().any(|skill| {
         if let Some(want) = skill_id {
@@ -577,10 +511,6 @@ fn merge_skills(existing: &mut Vec<StoredSkill>, incoming: Vec<StoredSkill>) {
     }
 }
 
-fn parse_peer_id(raw: &str) -> Result<PeerId, RegistryGossipError> {
-    PeerId::new(raw).map_err(|err| RegistryGossipError(format!("invalid peer id {raw:?}: {err}")))
-}
-
 fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -590,15 +520,6 @@ fn unix_ms_now() -> u64 {
 
 fn millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn instant_from_unix_ms(expires_at_unix_ms: u64) -> Instant {
-    let now_ms = unix_ms_now();
-    if expires_at_unix_ms <= now_ms {
-        Instant::now()
-    } else {
-        Instant::now() + Duration::from_millis(expires_at_unix_ms - now_ms)
-    }
 }
 
 #[cfg(test)]
@@ -741,7 +662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gossip_snapshot_syncs_registry() {
+    async fn gossip_snapshot_cannot_create_foreign_registration() {
         let source = SkillRegistry::new();
         let target = SkillRegistry::new();
         source
@@ -757,9 +678,11 @@ mod tests {
         let payload = source.gossip_snapshot_bytes().await;
         target.apply_gossip_bytes(&payload).await.unwrap();
 
-        let found = target.discover(Some("sync"), &["relay".into()], 10).await;
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].peer_id.as_str(), "peer-gossip");
+        assert!(target.get(&peer("peer-gossip")).await.is_none());
+        assert!(target
+            .discover(Some("sync"), &["relay".into()], 10)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
@@ -823,5 +746,12 @@ mod tests {
                 .supports_protocol_feature(&id, "forged_feature")
                 .await
         );
+        let foreign_remove = serde_json::to_vec(&RegistryGossipMessage::Remove {
+            peer_id: id.as_str().to_string(),
+            updated_at_unix_ms: u64::MAX,
+        })
+        .unwrap();
+        target.apply_gossip_bytes(&foreign_remove).await.unwrap();
+        assert!(target.get(&id).await.is_some());
     }
 }
