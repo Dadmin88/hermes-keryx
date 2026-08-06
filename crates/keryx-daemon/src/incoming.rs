@@ -3,9 +3,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use keryx_core::{AgentId, IdempotencyKey, LeaseId, TaskId, TaskStatus};
+use keryx_core::{AgentId, IdempotencyKey, LeaseId, PeerId, TaskId, TaskStatus};
 use keryx_proto::v1::{RelayFrame, TaskEnvelope};
-use keryx_store::{LeaseRecord, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord};
+use keryx_store::{
+    LeaseRecord, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord,
+    TaskTransportContextRecord,
+};
 use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -48,6 +51,7 @@ impl IncomingRelayTask {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         }
     }
@@ -163,12 +167,32 @@ pub async fn handle_incoming_task(
         Ok(key) => key,
         Err(message) => return IncomingHandleResult::InvalidEnvelope(message),
     };
+    let deadline_ms = match deadline_from_envelope(&incoming.envelope) {
+        Ok(deadline_ms) => deadline_ms,
+        Err(message) => return IncomingHandleResult::InvalidEnvelope(message),
+    };
     let encoded_envelope = incoming.envelope.encode_to_vec();
 
-    let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
-    let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
+    let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    record.deadline_ms = deadline_ms;
+    let received_at_ms = unix_ms_now();
+    let envelope_record =
+        TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, received_at_ms);
+    let authenticated_sender_peer_id = match PeerId::new(incoming.sender_node_id.clone()) {
+        Ok(peer_id) => peer_id,
+        Err(error) => return IncomingHandleResult::InvalidEnvelope(error.to_string()),
+    };
+    let local_peer_id = runtime.config().local_peer_id().clone();
+    let transport_context = TaskTransportContextRecord {
+        task_id: task_id.clone(),
+        authenticated_sender_peer_id: Some(authenticated_sender_peer_id),
+        expected_executor_peer_id: Some(local_peer_id.clone()),
+        destination_peer_id: local_peer_id,
+        relay_frame_id: Some(incoming.frame_id.clone()),
+        received_at_ms,
+    };
     let accepted = match runtime
-        .accept_pending_task_with_envelope_backpressure(record, envelope_record)
+        .accept_pending_remote_task_with_backpressure(record, envelope_record, transport_context)
         .await
     {
         Ok(task) => task,
@@ -193,6 +217,7 @@ pub async fn handle_incoming_task(
                 lease_id = Some(lease);
                 runtime.metrics().increment_tasks_claimed();
             }
+            Err(StoreError::TaskDeadlineExpired { .. }) => {}
             Err(error) => return IncomingHandleResult::Store(error),
         }
     }
@@ -235,7 +260,10 @@ async fn dispatch_to_local_worker(
         leased_at_ms,
         expires_at_ms,
     );
-    runtime.store().lease_task(task_id, lease).await?;
+    runtime
+        .store()
+        .lease_task_for_peer(task_id, lease, runtime.config().local_peer_id())
+        .await?;
     Ok(lease_id)
 }
 
@@ -262,6 +290,13 @@ fn parse_envelope_idempotency_key(
     IdempotencyKey::new(trimmed)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, String> {
+    if envelope.deadline_ms < 0 {
+        return Err("deadline_ms must be zero or a positive Unix epoch timestamp".to_string());
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn new_lease_id(task_id: &TaskId, leased_at_ms: i64) -> LeaseId {
@@ -350,6 +385,7 @@ mod tests {
             status: 0,
             messages: vec![],
             metadata: Default::default(),
+            deadline_ms: 0,
         }
     }
 

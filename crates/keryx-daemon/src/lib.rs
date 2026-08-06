@@ -3,6 +3,7 @@
 mod cancellation;
 mod deadline_enforcement_loop;
 mod discovery;
+pub mod grpc_transport;
 mod health_loop;
 mod incoming;
 mod lease_recovery_loop;
@@ -15,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keryx_core::{
-    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, KeryxEventType,
-    LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
-    ValidationError, MAX_BLOB_BYTES,
+    origin_result_artifact_id, should_inline, AgentId, ArtifactId, ArtifactMeta, Digest,
+    IdempotencyKey, LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId,
+    TaskStatus, ValidationError, MAX_BLOB_BYTES, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
@@ -49,8 +50,9 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
 
 use keryx_store::{
-    LeaseRecord, RecoveryReport, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,
-    TaskRecord, TaskTransportContextRecord, TerminalResultRecord, CURRENT_SCHEMA_VERSION,
+    LeaseRecord, OriginResultArtifact, RecoveryReport, SqliteStore, StoreError, StoreResult,
+    TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
+    CURRENT_SCHEMA_VERSION,
 };
 
 pub use cancellation::{CancellationSnapshot, CancellationState};
@@ -67,8 +69,8 @@ pub use incoming::{
 pub use lease_recovery_loop::{LeaseRecoveryLoop, LeaseRecoveryLoopHandle};
 pub use routing::{
     routing_error_to_status, DeliveryRoute, GrpcRelayTaskPublisher, NoopRelayPublisher,
-    PeerDirectory, PeerInfo, RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter,
-    DEFAULT_SEND_TASK_TIMEOUT_MS,
+    PeerDirectory, PeerInfo, RelayRouteReceipt, RelayTaskPublisher, RoutingError, SendTaskOutcome,
+    TaskRouter, DEFAULT_SEND_TASK_TIMEOUT_MS,
 };
 
 const CLAIM_NEXT_SCAN_LIMIT: usize = 256;
@@ -366,6 +368,7 @@ impl KeryxDaemonConfig {
 const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const RELAY_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
+const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
@@ -407,7 +410,12 @@ pub fn discovery_settings_from_env() -> Option<DiscoverySettings> {
     };
     Some(DiscoverySettings {
         registry_endpoint,
+        registry_ca_cert_path: grpc_transport::ca_cert_path_from_env(),
         registration,
+        node_token: std::env::var(NODE_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     })
 }
 
@@ -833,6 +841,16 @@ impl KeryxDaemonRuntime {
             .check_envelope_bytes(envelope.encoded_envelope.len() as u64)
             .map_err(|error| StoreError::Validation(error.into()))?;
         let _guard = self.submit_backpressure_lock.lock().await;
+        match self.store.get_task(record.task_id()).await {
+            Ok(_) => {
+                return self
+                    .store
+                    .accept_task_with_envelope_and_context(record, envelope, context)
+                    .await;
+            }
+            Err(StoreError::TaskNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
         let pending_count = self
             .store
             .count_tasks_by_status(TaskStatus::Pending)
@@ -927,6 +945,33 @@ impl KeryxDaemonRpcService {
         }
     }
 
+    async fn existing_canceled_response(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<CancelTaskResponse>, Status> {
+        let stored = match self.runtime.store().get_terminal_result(task_id).await {
+            Ok(stored) => stored,
+            Err(StoreError::TerminalResultNotFound(_)) => return Ok(None),
+            Err(error) => return Err(store_error_to_status(error)),
+        };
+        let result =
+            TaskResultEnvelope::decode(stored.encoded_result.as_slice()).map_err(|error| {
+                Status::data_loss(format!(
+                    "stored terminal result for task {} is invalid: {error}",
+                    task_id.as_str()
+                ))
+            })?;
+        if result.outcome != TerminalOutcome::Canceled as i32 {
+            return Ok(None);
+        }
+        Ok(Some(CancelTaskResponse {
+            task_id: Some(proto_task_id(task_id)),
+            status: "canceled".to_string(),
+            reason: result.error_reason,
+            canceled: true,
+        }))
+    }
+
     async fn try_claim_next_task(
         &self,
         worker_id: &AgentId,
@@ -934,10 +979,18 @@ impl KeryxDaemonRpcService {
         accepted_capability_ids: &HashSet<String>,
         lease_duration_ms: i64,
     ) -> Result<Option<ClaimNextTaskResponse>, Status> {
+        self.runtime
+            .store()
+            .fail_expired_deadlines(unix_ms_now(), None)
+            .await
+            .map_err(store_error_to_status)?;
         let candidates = self
             .runtime
             .store()
-            .pending_task_envelopes(CLAIM_NEXT_SCAN_LIMIT)
+            .claimable_pending_task_envelopes(
+                self.runtime.config().local_peer_id(),
+                CLAIM_NEXT_SCAN_LIMIT,
+            )
             .await
             .map_err(store_error_to_status)?;
         for candidate in candidates {
@@ -969,7 +1022,11 @@ impl KeryxDaemonRpcService {
             match self
                 .runtime
                 .store()
-                .lease_task(candidate.task.task_id(), lease)
+                .lease_task_for_peer(
+                    candidate.task.task_id(),
+                    lease,
+                    self.runtime.config().local_peer_id(),
+                )
                 .await
             {
                 Ok(task) => {
@@ -1154,7 +1211,8 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             .limits()
             .check_envelope_bytes(envelope_bytes)
             .map_err(limit_exceeded_to_status)?;
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_from_envelope(&envelope)?;
         let envelope_record =
             TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
         let accepted = self
@@ -1192,7 +1250,8 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
         let encoded = envelope.encode_to_vec();
         let now_ms = unix_ms_now();
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_from_envelope(&envelope)?;
         let accepted = self
             .runtime
             .accept_pending_remote_task_with_backpressure(
@@ -1229,10 +1288,16 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
         let lease_duration_ms =
             normalize_lease_duration_ms(inner.lease_duration_ms, self.runtime.config());
+        self.runtime
+            .store()
+            .fail_expired_deadlines(unix_ms_now(), None)
+            .await
+            .map_err(store_error_to_status)?;
         let leased_at_ms = unix_ms_now();
         let expires_at_ms = leased_at_ms.saturating_add(lease_duration_ms);
         let lease_id = new_lease_id(&task_id, leased_at_ms);
@@ -1246,7 +1311,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task = self
             .runtime
             .store()
-            .lease_task(&task_id, lease)
+            .lease_task_for_peer(&task_id, lease, self.runtime.config().local_peer_id())
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_claimed();
@@ -1369,6 +1434,24 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        let (_, has_content) = validate_worker_result_artifacts(inner.output_artifacts.clone())?;
+        let return_peer_id = return_peer_for_task(self.runtime.store(), &task_id).await;
+        if has_content {
+            if let Some(return_peer_id) = return_peer_id.as_ref() {
+                let source_features =
+                    authenticated_source_features_for_task(self.runtime.store(), &task_id).await?;
+                if !source_features
+                    .iter()
+                    .any(|feature| feature == discovery::RESULT_ARTIFACT_BYTES_FEATURE)
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "destination peer {} did not advertise protocol feature {} when the task was accepted",
+                        return_peer_id.as_str(),
+                        discovery::RESULT_ARTIFACT_BYTES_FEATURE
+                    )));
+                }
+            }
+        }
         let result = build_terminal_result(
             self.runtime.store(),
             self.runtime.config().local_peer_id(),
@@ -1384,7 +1467,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             task_id: task_id.clone(),
             encoded_result: result.encode_to_vec(),
             terminal_status: TaskStatus::Completed,
-            return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+            return_peer_id,
             executor_peer_id: self.runtime.config().local_peer_id().clone(),
             created_at_ms: result.completed_at_ms,
         };
@@ -1491,18 +1574,67 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let reason = normalized_cancel_reason(&inner.reason);
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("reason", tracing::field::display(&reason));
+        match self.runtime.store().get_transport_context(&task_id).await {
+            Ok(context)
+                if context
+                    .expected_executor_peer_id
+                    .as_ref()
+                    .is_some_and(|expected| expected != self.runtime.config().local_peer_id()) =>
+            {
+                return Err(Status::failed_precondition(
+                    "cross-node cancellation is unavailable; remote-target tasks fail closed",
+                ));
+            }
+            Ok(_) | Err(StoreError::TransportContextNotFound(_)) => {}
+            Err(error) => return Err(store_error_to_status(error)),
+        }
         self.runtime.cancellation().increment_cancel_requests();
-        let task = self
+        if let Some(response) = self.existing_canceled_response(&task_id).await? {
+            return Ok(Response::new(response));
+        }
+        let now_ms = unix_ms_now();
+        let result = TaskResultEnvelope {
+            protocol_version: 2,
+            task_id: Some(proto_task_id(&task_id)),
+            correlation_id: None,
+            outcome: TerminalOutcome::Canceled as i32,
+            executor_peer_id: self.runtime.config().local_peer_id().to_string(),
+            duration_ms: 0,
+            completed_at_ms: now_ms,
+            error_reason: reason.clone(),
+            result_metadata: inner.metadata,
+            output_artifacts: vec![],
+        };
+        let task = match self
             .runtime
             .store()
-            .accept_legacy_event(&task_id, KeryxEventType::TaskCanceled)
+            .cancel_task_with_result(
+                &task_id,
+                &reason,
+                now_ms,
+                TerminalResultRecord {
+                    task_id: task_id.clone(),
+                    encoded_result: result.encode_to_vec(),
+                    terminal_status: TaskStatus::Failed,
+                    return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+                    executor_peer_id: self.runtime.config().local_peer_id().clone(),
+                    created_at_ms: now_ms,
+                },
+            )
             .await
-            .map_err(store_error_to_status)?;
+        {
+            Ok(task) => task,
+            Err(error) => {
+                if let Ok(Some(response)) = self.existing_canceled_response(&task_id).await {
+                    return Ok(Response::new(response));
+                }
+                return Err(store_error_to_status(error));
+            }
+        };
         self.runtime.cancellation().increment_tasks_canceled();
-        self.runtime.metrics().increment_tasks_failed();
         Ok(Response::new(CancelTaskResponse {
             task_id: Some(proto_task_id(task.task_id())),
-            status: task_status_label(task.status).to_string(),
+            status: "canceled".to_string(),
             reason,
             canceled: true,
         }))
@@ -1665,9 +1797,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 )?;
                 Ok(Response::new(GetTaskResultResponse {
                     found: true,
-                    status: task_status_label(task.status).to_string(),
+                    status: terminal_result_status(&result)?.to_string(),
                     result: Some(result),
                     update_sequence: events.len() as u64,
+                    terminal_result_unavailable: false,
+                    data_unavailable_reason: String::new(),
                 }))
             }
             Err(StoreError::TerminalResultNotFound(_)) => {
@@ -1676,6 +1810,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                     status: task_status_label(task.status).to_string(),
                     result: None,
                     update_sequence: events.len() as u64,
+                    terminal_result_unavailable: task.status.is_terminal(),
+                    data_unavailable_reason: if task.status.is_terminal() {
+                        "terminal_result_unavailable".to_string()
+                    } else {
+                        String::new()
+                    },
                 }))
             }
             Err(error) => Err(store_error_to_status(error)),
@@ -1732,7 +1872,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let inner = request.into_inner();
         self.runtime
             .store()
-            .ack_result_delivery(&inner.delivery_id, &inner.worker_id, unix_ms_now())
+            .ack_result_delivery(
+                &inner.delivery_id,
+                &inner.worker_id,
+                inner.lease_expires_at_ms,
+                unix_ms_now(),
+            )
             .await
             .map_err(store_error_to_status)?;
         Ok(Response::new(AckResultDeliveryResponse { accepted: true }))
@@ -1748,7 +1893,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             .store()
             .fail_result_delivery(
                 &inner.delivery_id,
-                &inner.worker_id,
+                (&inner.worker_id, inner.lease_expires_at_ms),
                 now_ms,
                 now_ms.saturating_add(inner.retry_delay_ms.max(1_000)),
                 &inner.error_reason,
@@ -1764,7 +1909,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<IngestRemoteResultRequest>,
     ) -> Result<Response<IngestRemoteResultResponse>, Status> {
         let inner = request.into_inner();
-        let result = inner
+        let mut result = inner
             .result
             .ok_or_else(|| Status::invalid_argument("result is required"))?;
         let task_id = parse_required_task_id(result.task_id.as_ref())?;
@@ -1775,7 +1920,15 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 "result destination does not match local peer",
             ));
         }
+        let envelope_executor = PeerId::new(result.executor_peer_id.trim())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if envelope_executor != executor {
+            return Err(Status::permission_denied(
+                "result executor does not match authenticated executor",
+            ));
+        }
         let terminal_status = terminal_outcome_status(result.outcome)?;
+        let artifacts = canonicalize_origin_result_artifacts(&task_id, &mut result)?;
         let record = TerminalResultRecord {
             task_id: task_id.clone(),
             encoded_result: result.encode_to_vec(),
@@ -1787,7 +1940,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task = self
             .runtime
             .store()
-            .apply_remote_result(record, &executor)
+            .apply_remote_result_with_artifacts(
+                record,
+                &artifacts,
+                &executor,
+                self.runtime.config().blob_dir(),
+            )
             .await
             .map_err(store_error_to_status)?;
         Ok(Response::new(IngestRemoteResultResponse {
@@ -1850,11 +2008,32 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         if outcome.route == DeliveryRoute::Local {
             self.runtime.metrics().increment_tasks_submitted();
         }
+        let route = outcome.relay_receipt;
         Ok(Response::new(SendTaskResponse {
             task_id: Some(proto_task_id(&outcome.task_id)),
             status: outcome.status,
             routed_to: outcome.routed_to.to_string(),
             delivery_route: outcome.route.as_str().to_string(),
+            relay_frame_id: route
+                .as_ref()
+                .map(|receipt| receipt.frame_id.clone())
+                .unwrap_or_default(),
+            authenticated_source_peer_id: route
+                .as_ref()
+                .map(|receipt| receipt.authenticated_source_peer_id.to_string())
+                .unwrap_or_default(),
+            accepted_destination_peer_id: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_destination_peer_id.to_string())
+                .unwrap_or_default(),
+            accepted_route: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_route.clone())
+                .unwrap_or_default(),
+            accepted_at_ms: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_at_ms)
+                .unwrap_or_default(),
         }))
     }
 
@@ -1889,6 +2068,32 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     }
 }
 
+const AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY: &str =
+    "keryx.authenticated_source_protocol_features";
+
+async fn authenticated_source_features_for_task(
+    store: &SqliteStore,
+    task_id: &TaskId,
+) -> Result<Vec<String>, Status> {
+    let envelope_record = store
+        .get_task_envelope(task_id)
+        .await
+        .map_err(store_error_to_status)?;
+    let envelope = TaskEnvelope::decode(envelope_record.encoded_envelope.as_slice())
+        .map_err(|error| Status::data_loss(format!("invalid stored task envelope: {error}")))?;
+    let Some(encoded_features) = envelope
+        .metadata
+        .get(AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY)
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(encoded_features).map_err(|error| {
+        Status::data_loss(format!(
+            "invalid authenticated source feature snapshot: {error}"
+        ))
+    })
+}
+
 async fn return_peer_for_task(store: &SqliteStore, task_id: &TaskId) -> Option<PeerId> {
     store
         .get_transport_context(task_id)
@@ -1914,8 +2119,9 @@ async fn build_terminal_result(
         .ok()
         .and_then(|record| TaskEnvelope::decode(record.encoded_envelope.as_slice()).ok())
         .and_then(|envelope| envelope.correlation_id);
+    let (output_artifacts, has_content) = validate_worker_result_artifacts(artifacts)?;
     Ok(TaskResultEnvelope {
-        protocol_version: 1,
+        protocol_version: if has_content { 2 } else { 1 },
         task_id: Some(proto_task_id(task_id)),
         correlation_id,
         outcome: outcome as i32,
@@ -1924,15 +2130,169 @@ async fn build_terminal_result(
         completed_at_ms: unix_ms_now(),
         error_reason,
         result_metadata,
-        output_artifacts: artifacts
-            .into_iter()
-            .map(|artifact| ResultArtifact {
+        output_artifacts,
+    })
+}
+
+fn validate_worker_result_artifacts(
+    artifacts: Vec<keryx_proto::v1::TaskArtifact>,
+) -> Result<(Vec<ResultArtifact>, bool), Status> {
+    let mut aggregate_len = 0_u64;
+    let mut has_content = false;
+    let mut result = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if artifact.content_present {
+            let declared_digest = parse_lowercase_digest(&artifact.sha256)?;
+            let actual_len = artifact.content.len() as u64;
+            if artifact.byte_len != actual_len {
+                return Err(Status::invalid_argument(
+                    "artifact byte_len does not match content length",
+                ));
+            }
+            let actual_digest = Digest::compute(&artifact.content);
+            if declared_digest != actual_digest {
+                return Err(Status::invalid_argument(
+                    "artifact sha256 does not match content",
+                ));
+            }
+            aggregate_len = aggregate_len.checked_add(actual_len).ok_or_else(|| {
+                Status::resource_exhausted("result artifact bytes exceed cross-node limit")
+            })?;
+            if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+                return Err(Status::resource_exhausted(
+                    "result artifact bytes exceed cross-node limit",
+                ));
+            }
+            has_content = true;
+            result.push(ResultArtifact {
                 path: artifact.path,
                 media_type: artifact.media_type,
                 metadata: artifact.metadata,
-            })
-            .collect(),
-    })
+                artifact_id: None,
+                sha256: declared_digest.as_str().to_string(),
+                byte_len: actual_len,
+                content: artifact.content,
+                content_present: true,
+            });
+        } else {
+            if !artifact.content.is_empty() || !artifact.sha256.is_empty() || artifact.byte_len != 0
+            {
+                return Err(Status::invalid_argument(
+                    "descriptor-only artifact must not include content, sha256, or byte_len",
+                ));
+            }
+            result.push(ResultArtifact {
+                path: artifact.path,
+                media_type: artifact.media_type,
+                metadata: artifact.metadata,
+                artifact_id: None,
+                sha256: String::new(),
+                byte_len: 0,
+                content: Vec::new(),
+                content_present: false,
+            });
+        }
+    }
+    Ok((result, has_content))
+}
+
+fn parse_lowercase_digest(value: &str) -> Result<Digest, Status> {
+    let digest = Digest::new(value).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if value != digest.as_str() {
+        return Err(Status::invalid_argument(
+            "artifact sha256 must be lowercase hexadecimal without surrounding whitespace",
+        ));
+    }
+    Ok(digest)
+}
+
+fn canonicalize_origin_result_artifacts(
+    task_id: &TaskId,
+    result: &mut TaskResultEnvelope,
+) -> Result<Vec<OriginResultArtifact>, Status> {
+    let has_content = result
+        .output_artifacts
+        .iter()
+        .any(|artifact| artifact.content_present);
+    if has_content && result.protocol_version < 2 {
+        return Err(Status::failed_precondition(
+            "byte-bearing result artifacts require protocol_version >= 2",
+        ));
+    }
+    let mut aggregate_len = 0_u64;
+    let mut stored = Vec::new();
+    for (index, artifact) in result.output_artifacts.iter_mut().enumerate() {
+        if artifact.artifact_id.is_some() {
+            return Err(Status::invalid_argument(
+                "result artifact_id is origin-assigned and must be absent on ingest",
+            ));
+        }
+        let ordinal = u32::try_from(index)
+            .map_err(|_| Status::invalid_argument("result artifact ordinal exceeds u32 range"))?;
+        let artifact_id = origin_result_artifact_id(task_id, ordinal);
+        artifact.artifact_id = Some(proto_artifact_id(&artifact_id));
+        if !artifact.content_present {
+            if !artifact.content.is_empty() || !artifact.sha256.is_empty() || artifact.byte_len != 0
+            {
+                return Err(Status::invalid_argument(
+                    "descriptor-only artifact must not include content, sha256, or byte_len",
+                ));
+            }
+            artifact.content.clear();
+            continue;
+        }
+        let digest = parse_lowercase_digest(&artifact.sha256)?;
+        let actual_len = artifact.content.len() as u64;
+        if artifact.byte_len != actual_len {
+            return Err(Status::invalid_argument(
+                "artifact byte_len does not match content length",
+            ));
+        }
+        if digest != Digest::compute(&artifact.content) {
+            return Err(Status::invalid_argument(
+                "artifact sha256 does not match content",
+            ));
+        }
+        aggregate_len = aggregate_len.checked_add(actual_len).ok_or_else(|| {
+            Status::resource_exhausted("result artifact bytes exceed cross-node limit")
+        })?;
+        if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+            return Err(Status::resource_exhausted(
+                "result artifact bytes exceed cross-node limit",
+            ));
+        }
+        let content = std::mem::take(&mut artifact.content);
+        artifact.sha256 = digest.as_str().to_string();
+        artifact.byte_len = actual_len;
+        artifact.content_present = false;
+        stored.push(OriginResultArtifact {
+            ordinal,
+            meta: ArtifactMeta {
+                artifact_id,
+                task_id: task_id.clone(),
+                digest,
+                media_type: MediaType::new(&artifact.media_type),
+                byte_len: actual_len,
+                inline: should_inline(actual_len),
+                created_at: result.completed_at_ms.to_string(),
+            },
+            content,
+        });
+    }
+    Ok(stored)
+}
+
+fn terminal_result_status(result: &TaskResultEnvelope) -> Result<&'static str, Status> {
+    match TerminalOutcome::try_from(result.outcome).unwrap_or(TerminalOutcome::Unspecified) {
+        TerminalOutcome::Completed => Ok("completed"),
+        TerminalOutcome::Failed => Ok("failed"),
+        TerminalOutcome::Canceled => Ok("canceled"),
+        TerminalOutcome::TimedOut => Ok("timed_out"),
+        TerminalOutcome::Rejected => Ok("rejected"),
+        TerminalOutcome::Unspecified => Err(Status::data_loss(
+            "stored terminal result has no terminal outcome",
+        )),
+    }
 }
 
 fn terminal_outcome_status(outcome: i32) -> Result<TaskStatus, Status> {
@@ -1991,6 +2351,15 @@ fn envelope_matches_claim_filters(
         ],
         accepted_capability_ids,
     )
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, Status> {
+    if envelope.deadline_ms < 0 {
+        return Err(Status::invalid_argument(
+            "deadline_ms must be zero or a positive Unix epoch timestamp",
+        ));
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn normalize_claim_wait_ms(wait_timeout_ms: i64) -> u64 {
@@ -2242,6 +2611,16 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             "transport context conflicts for task {}",
             task_id.as_str()
         )),
+        StoreError::TaskExecutorMismatch {
+            task_id,
+            expected,
+            actual,
+        } => Status::failed_precondition(format!(
+            "task {} targets executor {}, not local peer {}",
+            task_id.as_str(),
+            expected.as_str(),
+            actual.as_str()
+        )),
         StoreError::TransportContextTaskMismatch {
             task_id,
             context_task_id,
@@ -2307,6 +2686,7 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         StoreError::LeaseConflict { task_id } => {
             Status::aborted(format!("task {task_id} already has an active lease"))
         }
+        StoreError::TaskDeadlineExpired { .. } => Status::failed_precondition(error_detail.clone()),
         StoreError::LeaseMismatch { task_id, lease_id } => Status::permission_denied(format!(
             "lease {} does not own task {}",
             lease_id.as_str(),
@@ -2327,7 +2707,14 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             ))
         }
         StoreError::ArtifactTooLarge { .. } => Status::resource_exhausted(error_detail.clone()),
-        StoreError::DigestMismatch { .. } => Status::data_loss(error_detail.clone()),
+        StoreError::ArtifactLengthMismatch { .. }
+        | StoreError::DigestMismatch { .. }
+        | StoreError::OriginResultArtifactIdMismatch { .. }
+        | StoreError::OriginResultArtifactOrdinalMismatch { .. }
+        | StoreError::OriginResultArtifactTaskMismatch { .. } => {
+            Status::invalid_argument(error_detail.clone())
+        }
+        StoreError::OriginResultArtifactConflict(_) => Status::already_exists(error_detail.clone()),
         StoreError::InvalidLeaseExpiry { .. } => Status::invalid_argument(error_detail.clone()),
         StoreError::UnsupportedSchema { .. }
         | StoreError::MigrationFailed(_)

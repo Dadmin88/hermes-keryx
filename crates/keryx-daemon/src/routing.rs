@@ -1,6 +1,7 @@
 //! Task routing between local store and relay-connected peers.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +9,7 @@ use async_trait::async_trait;
 use keryx_core::{IdempotencyKey, PeerId, TaskId, TaskStatus};
 use keryx_proto::v1::{keryx_relay_client::KeryxRelayClient, PublishTaskRequest, TaskEnvelope};
 use keryx_store::{
-    SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord, TaskRecord,
-    TaskTransportContextRecord,
+    SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
 };
 use prost::Message;
 use thiserror::Error;
@@ -18,6 +18,8 @@ use tonic::transport::Channel;
 use tonic::Request;
 use tonic::Status;
 use tracing::{info, instrument, warn};
+
+use crate::grpc_transport::{ca_cert_path_from_env, secure_grpc_endpoint};
 
 /// Default outbound delivery timeout when callers omit `timeout_ms`.
 pub const DEFAULT_SEND_TASK_TIMEOUT_MS: u64 = 30_000;
@@ -48,6 +50,18 @@ pub struct SendTaskOutcome {
     pub status: String,
     pub routed_to: PeerId,
     pub route: DeliveryRoute,
+    pub relay_receipt: Option<RelayRouteReceipt>,
+}
+
+/// Relay-issued evidence that an exact frame was accepted for an exact destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRouteReceipt {
+    pub task_id: TaskId,
+    pub frame_id: String,
+    pub authenticated_source_peer_id: PeerId,
+    pub accepted_destination_peer_id: PeerId,
+    pub accepted_route: String,
+    pub accepted_at_ms: i64,
 }
 
 /// Connected peer snapshot returned by [`PeerDirectory::list_peers`].
@@ -70,6 +84,8 @@ pub enum RoutingError {
     RelayFailed { peer_id: String, reason: String },
     #[error("routing policy denied task: {reason}")]
     PolicyDenied { reason: String },
+    #[error("invalid task envelope: {reason}")]
+    InvalidEnvelope { reason: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -88,7 +104,7 @@ pub trait RelayTaskPublisher: Send + Sync {
         target_peer_id: &PeerId,
         envelope: TaskEnvelope,
         timeout: Duration,
-    ) -> Result<(), RoutingError>;
+    ) -> Result<RelayRouteReceipt, RoutingError>;
 }
 
 /// No-op publisher used when the daemon has no relay session.
@@ -106,7 +122,7 @@ impl RelayTaskPublisher for NoopRelayPublisher {
         _target_peer_id: &PeerId,
         _envelope: TaskEnvelope,
         _timeout: Duration,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<RelayRouteReceipt, RoutingError> {
         Err(RoutingError::RelayUnavailable)
     }
 }
@@ -117,6 +133,7 @@ pub struct GrpcRelayTaskPublisher {
     endpoint: String,
     source_peer_id: PeerId,
     node_token: Option<String>,
+    ca_cert_path: Option<PathBuf>,
 }
 
 impl GrpcRelayTaskPublisher {
@@ -129,15 +146,31 @@ impl GrpcRelayTaskPublisher {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            ca_cert_path: ca_cert_path_from_env(),
         }
+    }
+
+    #[must_use]
+    pub fn with_node_token(mut self, node_token: impl Into<String>) -> Self {
+        let node_token = node_token.into();
+        self.node_token = (!node_token.trim().is_empty()).then_some(node_token);
+        self
     }
 
     async fn connect(
         &self,
         target_peer_id: &PeerId,
     ) -> Result<KeryxRelayClient<Channel>, RoutingError> {
-        KeryxRelayClient::connect(self.endpoint.clone())
+        let endpoint = secure_grpc_endpoint(&self.endpoint, self.ca_cert_path.as_deref()).map_err(
+            |error| RoutingError::RelayFailed {
+                peer_id: target_peer_id.to_string(),
+                reason: error.to_string(),
+            },
+        )?;
+        endpoint
+            .connect()
             .await
+            .map(KeryxRelayClient::new)
             .map_err(|error| RoutingError::RelayFailed {
                 peer_id: target_peer_id.to_string(),
                 reason: format!("failed to connect to relay at {}: {error}", self.endpoint),
@@ -152,7 +185,15 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         target_peer_id: &PeerId,
         mut envelope: TaskEnvelope,
         _timeout: Duration,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<RelayRouteReceipt, RoutingError> {
+        let expected_task_id = envelope
+            .task_id
+            .as_ref()
+            .map(|task_id| TaskId::new(task_id.value.trim()))
+            .transpose()?
+            .ok_or_else(|| RoutingError::InvalidEnvelope {
+                reason: "relay task envelope requires task_id".to_string(),
+            })?;
         envelope.metadata.insert(
             "target_node_id".to_string(),
             target_peer_id.as_str().to_string(),
@@ -182,10 +223,9 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
                 })?,
             );
         }
-        client
+        let response = client
             .publish_task(request)
             .await
-            .map(|_| ())
             .map_err(|status| RoutingError::RelayFailed {
                 peer_id: target_peer_id.to_string(),
                 reason: format!(
@@ -193,8 +233,57 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
                     status.code(),
                     status.message()
                 ),
-            })
+            })?
+            .into_inner();
+        let receipt = RelayRouteReceipt {
+            task_id: response
+                .task_id
+                .as_ref()
+                .map(|task_id| TaskId::new(task_id.value.trim()))
+                .transpose()?
+                .ok_or_else(|| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: "relay returned a route receipt without task_id".to_string(),
+                })?,
+            frame_id: response.frame_id.trim().to_string(),
+            authenticated_source_peer_id: PeerId::new(
+                response.authenticated_source_peer_id.trim(),
+            )?,
+            accepted_destination_peer_id: PeerId::new(
+                response.accepted_destination_peer_id.trim(),
+            )?,
+            accepted_route: response.accepted_route.trim().to_string(),
+            accepted_at_ms: response.accepted_at_ms,
+        };
+        validate_relay_receipt(
+            &receipt,
+            &expected_task_id,
+            &self.source_peer_id,
+            target_peer_id,
+        )?;
+        Ok(receipt)
     }
+}
+
+fn validate_relay_receipt(
+    receipt: &RelayRouteReceipt,
+    expected_task_id: &TaskId,
+    expected_source: &PeerId,
+    expected_destination: &PeerId,
+) -> Result<(), RoutingError> {
+    if receipt.task_id != *expected_task_id
+        || receipt.frame_id.is_empty()
+        || receipt.authenticated_source_peer_id != *expected_source
+        || receipt.accepted_destination_peer_id != *expected_destination
+        || receipt.accepted_route != "relay"
+        || receipt.accepted_at_ms <= 0
+    {
+        return Err(RoutingError::RelayFailed {
+            peer_id: expected_destination.to_string(),
+            reason: "relay returned an invalid route receipt".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Tracks the local peer id and relay-connected remote peers.
@@ -521,11 +610,12 @@ impl TaskRouter {
         &self,
         store: &SqliteStore,
         target_peer_id: PeerId,
-        envelope: TaskEnvelope,
+        mut envelope: TaskEnvelope,
         timeout_ms: i64,
     ) -> Result<SendTaskOutcome, RoutingError> {
         let task_id = parse_envelope_task_id(&envelope)?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        let deadline_ms = deadline_from_envelope(&envelope)?;
 
         let policy_decision = self.policy.read().await.evaluate(&envelope);
         let audit_event =
@@ -576,6 +666,7 @@ impl TaskRouter {
                     status: "awaiting_approval".to_string(),
                     routed_to: target_peer_id,
                     route: DeliveryRoute::AwaitingApproval,
+                    relay_receipt: None,
                 });
             }
         }
@@ -587,8 +678,15 @@ impl TaskRouter {
                 status: outcome.status,
                 routed_to: target_peer_id,
                 route: DeliveryRoute::Local,
+                relay_receipt: None,
             });
         }
+
+        envelope.metadata.insert(
+            "keryx.authenticated_source_protocol_features".to_string(),
+            serde_json::to_string(crate::discovery::SUPPORTED_PROTOCOL_FEATURES)
+                .expect("supported protocol features serialize"),
+        );
 
         let publisher = Arc::clone(&*self.publisher.read().await);
         if !self.peers.is_routable(&target_peer_id).await && !publisher.is_configured() {
@@ -599,20 +697,50 @@ impl TaskRouter {
 
         let encoded_envelope = envelope.encode_to_vec();
         let idempotency_key = parse_envelope_idempotency_key(&envelope)?;
-        let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+        record.deadline_ms = deadline_ms;
         let now_ms = unix_ms_now();
         let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, now_ms);
-        let context = TaskTransportContextRecord {
-            task_id: task_id.clone(),
-            authenticated_sender_peer_id: None,
-            expected_executor_peer_id: Some(target_peer_id.clone()),
-            destination_peer_id: self.peers.local_peer_id().clone(),
-            relay_frame_id: Some(format!("relay-{}", task_id.as_str())),
-            received_at_ms: now_ms,
+        let existing_intent = match store.get_task(&task_id).await {
+            Ok(existing) => {
+                if existing != record {
+                    return Err(StoreError::TaskAlreadyExists(task_id.clone()).into());
+                }
+                let stored_envelope = store.get_task_envelope(&task_id).await?;
+                if stored_envelope.encoded_envelope != envelope_record.encoded_envelope {
+                    return Err(StoreError::TaskEnvelopeConflict(task_id.clone()).into());
+                }
+                let context = store.get_transport_context(&task_id).await?;
+                if context.expected_executor_peer_id.as_ref() != Some(&target_peer_id)
+                    || context.destination_peer_id != target_peer_id
+                {
+                    return Err(StoreError::TransportContextConflict(task_id.clone()).into());
+                }
+                if context.authenticated_sender_peer_id.as_ref() != Some(self.peers.local_peer_id())
+                {
+                    return Err(StoreError::TransportContextConflict(task_id.clone()).into());
+                }
+                true
+            }
+            Err(StoreError::TaskNotFound(_)) => false,
+            Err(error) => return Err(error.into()),
         };
-        store
-            .accept_task_with_envelope_and_context(record, envelope_record, context)
-            .await?;
+        if !existing_intent {
+            store
+                .accept_task_with_envelope_and_context(
+                    record,
+                    envelope_record,
+                    TaskTransportContextRecord {
+                        task_id: task_id.clone(),
+                        authenticated_sender_peer_id: Some(self.peers.local_peer_id().clone()),
+                        expected_executor_peer_id: Some(target_peer_id.clone()),
+                        destination_peer_id: target_peer_id.clone(),
+                        relay_frame_id: None,
+                        received_at_ms: now_ms,
+                    },
+                )
+                .await?;
+        }
 
         let timeout = normalize_timeout(timeout_ms, self.default_timeout_ms);
         let delivery = tokio::time::timeout(
@@ -622,12 +750,24 @@ impl TaskRouter {
         .await;
 
         match delivery {
-            Ok(Ok(())) => Ok(SendTaskOutcome {
-                task_id,
-                status: "delivered".to_string(),
-                routed_to: target_peer_id,
-                route: DeliveryRoute::Relay,
-            }),
+            Ok(Ok(receipt)) => {
+                store
+                    .record_relay_receipt(
+                        &task_id,
+                        &receipt.authenticated_source_peer_id,
+                        &receipt.accepted_destination_peer_id,
+                        &receipt.frame_id,
+                        receipt.accepted_at_ms,
+                    )
+                    .await?;
+                Ok(SendTaskOutcome {
+                    task_id,
+                    status: "relay_accepted".to_string(),
+                    routed_to: target_peer_id,
+                    route: DeliveryRoute::Relay,
+                    relay_receipt: Some(receipt),
+                })
+            }
             Ok(Err(error)) => Err(error),
             Err(_elapsed) => Err(RoutingError::Timeout {
                 peer_id: target_peer_id.to_string(),
@@ -656,15 +796,11 @@ struct LocalAcceptOutcome {
 async fn accept_local_task(
     store: &SqliteStore,
     envelope: TaskEnvelope,
-) -> StoreResult<LocalAcceptOutcome> {
-    let task_id = parse_envelope_task_id(&envelope).map_err(|error| {
-        StoreError::Validation(keryx_core::ValidationError::InvalidIdValue {
-            kind: "TaskId",
-            value: error.to_string(),
-        })
-    })?;
+) -> Result<LocalAcceptOutcome, RoutingError> {
+    let task_id = parse_envelope_task_id(&envelope)?;
     let idempotency_key = parse_envelope_idempotency_key(&envelope)?;
-    let record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
+    record.deadline_ms = deadline_from_envelope(&envelope)?;
     let accepted = store.accept_task(record).await?;
     Ok(LocalAcceptOutcome {
         task_id,
@@ -774,6 +910,7 @@ pub fn routing_error_to_status(error: RoutingError) -> Status {
             }
         }
         RoutingError::PolicyDenied { reason } => Status::permission_denied(redact_secrets(&reason)),
+        RoutingError::InvalidEnvelope { reason } => Status::invalid_argument(reason),
         RoutingError::Store(store_error) => super::store_error_to_status(store_error),
         RoutingError::Validation(validation_error) => {
             Status::invalid_argument(validation_error.to_string())
@@ -787,11 +924,44 @@ mod tests {
     use keryx_proto::v1::TaskId as ProtoTaskId;
 
     #[test]
+    fn relay_receipt_must_match_the_submitted_task_identity() {
+        let expected_task_id = TaskId::new("task-expected").unwrap();
+        let source = PeerId::new("source-peer").unwrap();
+        let destination = PeerId::new("destination-peer").unwrap();
+        let receipt = RelayRouteReceipt {
+            task_id: TaskId::new("task-other").unwrap(),
+            frame_id: "relay-frame".to_string(),
+            authenticated_source_peer_id: source.clone(),
+            accepted_destination_peer_id: destination.clone(),
+            accepted_route: "relay".to_string(),
+            accepted_at_ms: 1,
+        };
+
+        assert!(matches!(
+            validate_relay_receipt(&receipt, &expected_task_id, &source, &destination),
+            Err(RoutingError::RelayFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_publisher_rejects_remote_plaintext_endpoint() {
+        let publisher = GrpcRelayTaskPublisher::new(
+            "http://192.0.2.1:50052",
+            PeerId::new("source-peer").unwrap(),
+        );
+        let target = PeerId::new("target-peer").unwrap();
+
+        let error = publisher.connect(&target).await.unwrap_err();
+        assert!(error.to_string().contains("require TLS"));
+    }
+
+    #[test]
     fn routing_policy_requires_approval_for_matching_capability() {
         let mut envelope = TaskEnvelope {
             task_id: Some(ProtoTaskId {
                 value: "task:deploy".to_string(),
             }),
+            deadline_ms: 0,
             ..TaskEnvelope::default()
         };
         envelope
@@ -807,6 +977,48 @@ mod tests {
             RoutingPolicyPermission::ApprovalRequired
         );
         assert_eq!(decision.capability_id.as_deref(), Some("cap:deploy"));
+    }
+
+    #[tokio::test]
+    async fn send_task_rejects_negative_deadline_before_approval_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::connect(&dir.path().join("keryx.sqlite3"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let local_peer = PeerId::new("node-policy-deadline").unwrap();
+        let router = TaskRouter::new(
+            Arc::new(PeerDirectory::new(local_peer.clone())),
+            Arc::new(NoopRelayPublisher),
+            DEFAULT_SEND_TASK_TIMEOUT_MS,
+        );
+        let mut policy = RoutingPolicy::default();
+        policy.set_permission(
+            "cap:approval-required",
+            RoutingPolicyPermission::ApprovalRequired,
+        );
+        router.set_policy(policy).await;
+        let mut envelope = TaskEnvelope {
+            task_id: Some(ProtoTaskId {
+                value: "route-invalid-before-policy".to_string(),
+            }),
+            deadline_ms: -1,
+            ..TaskEnvelope::default()
+        };
+        envelope.metadata.insert(
+            "capability_id".to_string(),
+            "cap:approval-required".to_string(),
+        );
+
+        let error = router
+            .send_task(&store, local_peer, envelope, 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RoutingError::InvalidEnvelope { .. }));
+        let task_id = TaskId::new("route-invalid-before-policy").unwrap();
+        assert!(store.get_task(&task_id).await.is_err());
+        assert!(router.audit_events().await.is_empty());
     }
 }
 
@@ -860,7 +1072,7 @@ pub mod test_support {
             target_peer_id: &PeerId,
             envelope: TaskEnvelope,
             _timeout: Duration,
-        ) -> Result<(), RoutingError> {
+        ) -> Result<RelayRouteReceipt, RoutingError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             if self.delay > Duration::ZERO {
                 tokio::time::sleep(self.delay).await;
@@ -879,10 +1091,26 @@ pub mod test_support {
             self.deliveries
                 .lock()
                 .await
-                .push((target_peer_id.to_string(), task_id));
-            Ok(())
+                .push((target_peer_id.to_string(), task_id.clone()));
+            Ok(RelayRouteReceipt {
+                task_id: TaskId::new(&task_id)?,
+                frame_id: format!("relay-test-{task_id}"),
+                authenticated_source_peer_id: PeerId::new("peer-local")?,
+                accepted_destination_peer_id: target_peer_id.clone(),
+                accepted_route: "relay".to_string(),
+                accepted_at_ms: 1,
+            })
         }
     }
+}
+
+fn deadline_from_envelope(envelope: &TaskEnvelope) -> Result<Option<i64>, RoutingError> {
+    if envelope.deadline_ms < 0 {
+        return Err(RoutingError::InvalidEnvelope {
+            reason: "deadline_ms must be zero or a positive Unix epoch timestamp".to_string(),
+        });
+    }
+    Ok((envelope.deadline_ms > 0).then_some(envelope.deadline_ms))
 }
 
 fn unix_ms_now() -> i64 {

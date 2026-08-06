@@ -5,7 +5,7 @@ import warnings
 
 from hermes.keryx.v1 import relay_pb2 as hermes_dot_keryx_dot_v1_dot_relay__pb2
 
-GRPC_GENERATED_VERSION = '1.82.1'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -75,7 +75,9 @@ class KeryxRelayServicer:
     """Missing associated documentation comment in .proto file."""
 
     def ConnectNode(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Receive-only delivery stream. Task/result mutation frames sent by clients are rejected;
+        use the authenticated unary PublishTask and PublishResult RPCs instead.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -87,13 +89,16 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def PublishTask(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary task publication.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def PublishResult(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary terminal-result publication. Success is returned only after the
+        authenticated destination persists the result and acknowledges the relay-issued frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -105,7 +110,8 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AckFrame(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Destination-owned acknowledgement; the authenticated caller must own the relay frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

@@ -22,6 +22,7 @@ async fn claim_task_via_rpc_leases_pending_task_as_running() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await
@@ -63,6 +64,7 @@ async fn claim_task_via_rpc_rejects_completed_tasks_with_failed_precondition() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

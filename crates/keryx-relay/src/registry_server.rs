@@ -3,24 +3,28 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use keryx_core::PeerId;
+use keryx_core::{NodeId, PeerId};
 use keryx_proto::v1::{
     registry_service_server::{RegistryService, RegistryServiceServer},
     DiscoverBySkillRequest, DiscoverBySkillResponse, RegisterSkillsRequest, RegisterSkillsResponse,
     Registration as ProtoRegistration, SkillInfo, Timestamp, UnregisterSkillsRequest,
     UnregisterSkillsResponse,
 };
+use tonic::transport::{Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 use keryx_observe::RelayMetrics;
 
+use crate::health_server::{NODE_ID_METADATA_KEY, NODE_TOKEN_METADATA_KEY};
 use crate::registry::{SkillRegistry, StoredSkill};
+use crate::security::NodeTokenAuth;
 
 /// Shared registry service state.
 #[derive(Clone)]
 pub struct RegistryRpcService {
     registry: Arc<SkillRegistry>,
     metrics: Option<Arc<RelayMetrics>>,
+    node_auth: Option<Arc<NodeTokenAuth>>,
 }
 
 impl RegistryRpcService {
@@ -29,6 +33,7 @@ impl RegistryRpcService {
         Self {
             registry,
             metrics: None,
+            node_auth: None,
         }
     }
 
@@ -37,7 +42,70 @@ impl RegistryRpcService {
         Self {
             registry,
             metrics: Some(metrics),
+            node_auth: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_auth(registry: Arc<SkillRegistry>, node_auth: Arc<NodeTokenAuth>) -> Self {
+        Self {
+            registry,
+            metrics: None,
+            node_auth: Some(node_auth),
+        }
+    }
+
+    #[must_use]
+    pub fn with_metrics_and_auth(
+        registry: Arc<SkillRegistry>,
+        metrics: Arc<RelayMetrics>,
+        node_auth: Arc<NodeTokenAuth>,
+    ) -> Self {
+        Self {
+            registry,
+            metrics: Some(metrics),
+            node_auth: Some(node_auth),
+        }
+    }
+
+    fn authenticate_mutation<T>(
+        &self,
+        request: &Request<T>,
+        claimed_peer_id: &str,
+    ) -> Result<PeerId, Status> {
+        let Some(auth) = &self.node_auth else {
+            return Err(Status::unauthenticated(
+                "registry mutation requires node authentication",
+            ));
+        };
+        let claimed_peer_id = claimed_peer_id.trim();
+        let metadata_node_id = request
+            .metadata()
+            .get(NODE_ID_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::unauthenticated("node id metadata is required"))?;
+        let node_id = NodeId::new(metadata_node_id)
+            .map_err(|_| Status::unauthenticated("invalid node identity metadata"))?;
+        let token = request
+            .metadata()
+            .get(NODE_TOKEN_METADATA_KEY)
+            .and_then(|value| value.to_str().ok());
+        auth.authenticate_optional(&node_id, token)
+            .map_err(|failure| {
+                Status::unauthenticated(format!("node authentication failed: {}", failure.reason()))
+            })?;
+        if claimed_peer_id.is_empty() {
+            return Err(Status::invalid_argument("peer id is required"));
+        }
+        if metadata_node_id != claimed_peer_id {
+            return Err(Status::permission_denied(
+                "claimed peer id does not match authenticated node metadata",
+            ));
+        }
+        PeerId::new(metadata_node_id)
+            .map_err(|_| Status::unauthenticated("invalid node identity metadata"))
     }
 
     async fn sync_registry_metric(&self) {
@@ -49,19 +117,34 @@ impl RegistryRpcService {
     }
 }
 
-/// Serve the registry gRPC API on the given TCP listener stream.
+/// Serve the registry gRPC API, requiring loopback when TLS is absent.
 pub async fn serve_registry_rpc(
     service: RegistryRpcService,
-    incoming: tokio_stream::wrappers::TcpListenerStream,
-) -> Result<(), tonic::transport::Error> {
-    tonic::transport::Server::builder()
-        .add_service(RegistryServiceServer::new(service))
-        .serve_with_incoming(incoming)
-        .await
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
+    serve_registry_rpc_with_tls(service, listener, None).await
 }
 
-fn parse_peer_id(raw: &str) -> Result<PeerId, Status> {
-    PeerId::new(raw).map_err(|e| Status::invalid_argument(e.to_string()))
+/// Serve the registry gRPC API, requiring loopback when TLS is absent.
+pub async fn serve_registry_rpc_with_tls(
+    service: RegistryRpcService,
+    listener: tokio::net::TcpListener,
+    identity: Option<Identity>,
+) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
+    if identity.is_none() && !addr.ip().is_loopback() {
+        anyhow::bail!("non-loopback registry listeners require TLS");
+    }
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let mut server = tonic::transport::Server::builder();
+    if let Some(identity) = identity {
+        server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
+    }
+    server
+        .add_service(RegistryServiceServer::new(service))
+        .serve_with_incoming(incoming)
+        .await?;
+    Ok(())
 }
 
 fn proto_timestamp_from_unix_ms(unix_ms: i64) -> Timestamp {
@@ -94,6 +177,7 @@ fn registration_to_proto(reg: &crate::registry::Registration) -> ProtoRegistrati
         name: reg.name.clone(),
         description: reg.description.clone(),
         expires_at: Some(proto_timestamp_from_unix_ms(expires_ms)),
+        protocol_features: reg.protocol_features.clone(),
     }
 }
 
@@ -103,8 +187,8 @@ impl RegistryService for RegistryRpcService {
         &self,
         request: Request<RegisterSkillsRequest>,
     ) -> Result<Response<RegisterSkillsResponse>, Status> {
+        let peer_id = self.authenticate_mutation(&request, &request.get_ref().peer_id)?;
         let inner = request.into_inner();
-        let peer_id = parse_peer_id(&inner.peer_id)?;
         let skills: Vec<StoredSkill> = inner
             .skills
             .into_iter()
@@ -120,7 +204,14 @@ impl RegistryService for RegistryRpcService {
             Some(Duration::from_secs(inner.ttl_seconds))
         };
         self.registry
-            .register(peer_id, skills, inner.name, inner.description, ttl)
+            .register_with_features(
+                peer_id,
+                skills,
+                inner.name,
+                inner.description,
+                inner.protocol_features,
+                ttl,
+            )
             .await;
         self.sync_registry_metric().await;
         Ok(Response::new(RegisterSkillsResponse { accepted: true }))
@@ -130,8 +221,8 @@ impl RegistryService for RegistryRpcService {
         &self,
         request: Request<UnregisterSkillsRequest>,
     ) -> Result<Response<UnregisterSkillsResponse>, Status> {
+        let peer_id = self.authenticate_mutation(&request, &request.get_ref().peer_id)?;
         let inner = request.into_inner();
-        let peer_id = parse_peer_id(&inner.peer_id)?;
         self.registry.unregister(&peer_id, &inner.skill_ids).await;
         self.sync_registry_metric().await;
         Ok(Response::new(UnregisterSkillsResponse { accepted: true }))

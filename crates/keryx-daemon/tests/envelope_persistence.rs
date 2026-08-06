@@ -52,6 +52,7 @@ async fn submit_task_retains_complete_envelope_across_restart() {
             ("skill".into(), "backend-api".into()),
             ("origin_peer_id".into(), "untrusted-hint".into()),
         ]),
+        deadline_ms: 0,
     };
 
     service

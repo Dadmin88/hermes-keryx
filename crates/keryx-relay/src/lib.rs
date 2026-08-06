@@ -17,7 +17,7 @@ pub use health::{health_json, RelayHealthReport};
 pub use registry::{
     Registration, SkillRegistry, StoredSkill, DEFAULT_CLEANUP_INTERVAL, DEFAULT_REGISTRATION_TTL,
 };
-pub use registry_server::{serve_registry_rpc, RegistryRpcService};
+pub use registry_server::{serve_registry_rpc, serve_registry_rpc_with_tls, RegistryRpcService};
 pub use runtime::RelayRuntime;
 pub use security::{
     allowlist_behaviour_toggle, new_shared_allowlist, sync_allowlist_to_swarm, Allowlist,

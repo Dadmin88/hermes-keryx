@@ -1,10 +1,12 @@
 //! Edge node runtime: libp2p relay client with optional registry registration.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use keryx_core::RESULT_ARTIFACT_FRAME_MAX_BYTES;
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
@@ -19,6 +21,7 @@ use libp2p::Multiaddr;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tonic::Request;
 use tracing::info;
 
@@ -32,6 +35,7 @@ const NODE_PEER_ID_ENV: &str = "HERMES_KERYX_NODE_PEER_ID";
 const NODE_KEYPAIR_ENV: &str = "HERMES_KERYX_NODE_KEYPAIR_PATH";
 const NODE_BOOTSTRAP_ENV: &str = "HERMES_KERYX_NODE_BOOTSTRAP_PEERS";
 const NODE_SKILLS_ENV: &str = "HERMES_KERYX_NODE_SKILLS";
+const REGISTRY_CA_CERT_ENV: &str = "HERMES_KERYX_REGISTRY_CA_CERT";
 const NODE_REGISTRY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_REGISTRY_ENDPOINT";
 const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
@@ -184,10 +188,14 @@ async fn run_relay_stream(
     node_token: Option<String>,
     daemon_endpoint: String,
 ) -> Result<()> {
-    let mut relay = KeryxRelayClient::connect(relay_endpoint.clone())
+    let channel = secure_endpoint_builder(&relay_endpoint)?
+        .connect()
         .await
         .with_context(|| format!("keryx node stream: relay unavailable at {relay_endpoint}"))?;
-    let (_tx, rx) = mpsc::channel::<NodeFrame>(8);
+    let mut relay = KeryxRelayClient::new(channel)
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let (request_sender, rx) = mpsc::channel::<NodeFrame>(8);
     let mut request = Request::new(ReceiverStream::new(rx));
     add_node_auth_metadata(&mut request, &registry_peer_id, node_token.as_deref())?;
     let mut stream = relay
@@ -206,7 +214,9 @@ async fn run_relay_stream(
                 let frame = frame.context("keryx node stream: relay frame failed")?;
                 let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
                     .await
-                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?;
+                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?
+                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
                 if let Some(task) = frame.task {
                     daemon
                         .submit_remote_task(SubmitRemoteTaskRequest {
@@ -231,7 +241,8 @@ async fn run_relay_stream(
                     tracing::warn!(frame_id = %frame.frame_id, "dropping empty relay frame");
                     continue;
                 }
-                let mut ack_client = KeryxRelayClient::connect(relay_endpoint.clone()).await?;
+                let ack_channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
+                let mut ack_client = KeryxRelayClient::new(ack_channel);
                 let mut ack_request = Request::new(AckFrameRequest { frame_id: frame.frame_id });
                 add_node_auth_metadata(
                     &mut ack_request,
@@ -244,7 +255,10 @@ async fn run_relay_stream(
                     .context("keryx node stream: relay AckFrame failed")?;
             }
             _ = delivery_tick.tick() => {
-                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone()).await?;
+                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
+                    .await?
+                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
                 let delivery = daemon
                     .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
                         worker_id: delivery_worker.clone(),
@@ -273,6 +287,7 @@ async fn run_relay_stream(
                             .ack_result_delivery(AckResultDeliveryRequest {
                                 delivery_id: delivery.delivery_id,
                                 worker_id: delivery_worker.clone(),
+                                lease_expires_at_ms: delivery.lease_expires_at_ms,
                             })
                             .await?;
                     }
@@ -284,6 +299,7 @@ async fn run_relay_stream(
                                 error_reason: error.message().to_string(),
                                 retry_delay_ms: 1_000,
                                 dead_letter: false,
+                                lease_expires_at_ms: delivery.lease_expires_at_ms,
                             })
                             .await?;
                     }
@@ -291,6 +307,7 @@ async fn run_relay_stream(
             }
         }
     }
+    drop(request_sender);
     Ok(())
 }
 
@@ -343,28 +360,64 @@ async fn register_node_skills(registry_peer_id: &str) -> Result<()> {
         return Ok(());
     };
     let skills = skills_from_env();
-    if skills.is_empty() {
-        return Ok(());
-    }
 
-    let mut client = RegistryServiceClient::connect(endpoint.clone())
-        .await
-        .with_context(|| format!("keryx node start: registry unavailable at {endpoint}"))?;
+    let mut client = connect_registry_client(&endpoint).await?;
+    let mut request = Request::new(RegisterSkillsRequest {
+        peer_id: registry_peer_id.to_string(),
+        skills,
+        name: std::env::var("HERMES_KERYX_NODE_NAME").unwrap_or_default(),
+        description: std::env::var("HERMES_KERYX_NODE_DESCRIPTION").unwrap_or_default(),
+        ttl_seconds: std::env::var("HERMES_KERYX_NODE_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+        protocol_features: vec![
+            "absolute_deadlines_v1".to_string(),
+            "result_artifact_bytes_v1".to_string(),
+        ],
+    });
+    add_node_auth_metadata(&mut request, registry_peer_id, node_token().as_deref())?;
     client
-        .register_skills(RegisterSkillsRequest {
-            peer_id: registry_peer_id.to_string(),
-            skills,
-            name: std::env::var("HERMES_KERYX_NODE_NAME").unwrap_or_default(),
-            description: std::env::var("HERMES_KERYX_NODE_DESCRIPTION").unwrap_or_default(),
-            ttl_seconds: std::env::var("HERMES_KERYX_NODE_TTL_SECONDS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(300),
-        })
+        .register_skills(request)
         .await
         .context("keryx node start: register_skills RPC failed")?;
     info!(registry_peer_id = %registry_peer_id, "registered node skills with relay registry");
     Ok(())
+}
+
+async fn connect_registry_client(
+    endpoint: &str,
+) -> Result<RegistryServiceClient<tonic::transport::Channel>> {
+    let channel = secure_endpoint_builder(endpoint)?
+        .connect()
+        .await
+        .with_context(|| format!("keryx node start: registry unavailable at {endpoint}"))?;
+    Ok(RegistryServiceClient::new(channel))
+}
+
+fn secure_endpoint_builder(endpoint: &str) -> Result<Endpoint> {
+    let mut endpoint_builder = Endpoint::from_shared(endpoint.to_string())
+        .with_context(|| format!("invalid Keryx endpoint {endpoint}"))?;
+    let uri = endpoint_builder.uri();
+    let host = uri.host().context("Keryx endpoint must include a host")?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let secure = uri.scheme_str() == Some("https");
+    if !secure && !loopback {
+        anyhow::bail!("remote Keryx gRPC endpoints require TLS (https://)");
+    }
+    if secure {
+        let mut tls = ClientTlsConfig::new().with_native_roots();
+        if let Some(path) = std::env::var_os(REGISTRY_CA_CERT_ENV).map(PathBuf::from) {
+            let pem = std::fs::read(&path)
+                .with_context(|| format!("read Keryx CA certificate {}", path.display()))?;
+            tls = tls.ca_certificate(Certificate::from_pem(pem));
+        }
+        endpoint_builder = endpoint_builder
+            .tls_config(tls)
+            .context("configure Keryx gRPC TLS")?;
+    }
+    Ok(endpoint_builder)
 }
 
 fn registry_endpoint() -> Option<String> {
@@ -387,4 +440,29 @@ fn skills_from_env() -> Vec<SkillInfo> {
             tags: vec![],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_plaintext_registry_endpoint_fails_closed() {
+        let error = connect_registry_client("http://192.0.2.1:50053")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("require TLS"));
+    }
+
+    #[test]
+    fn remote_plaintext_relay_control_endpoint_fails_closed() {
+        let error = secure_endpoint_builder("http://192.0.2.1:50052").unwrap_err();
+        assert!(error.to_string().contains("require TLS"));
+    }
+
+    #[test]
+    fn https_relay_control_endpoint_uses_tls() {
+        let endpoint = secure_endpoint_builder("https://relay.example:50052").unwrap();
+        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+    }
 }

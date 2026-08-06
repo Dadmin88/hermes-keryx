@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use keryx_core::AgentId;
+use keryx_core::{AgentId, TaskId as CoreTaskId, TaskStatus};
 use keryx_daemon::{
     handle_incoming_task, IncomingDispatchConfig, IncomingHandleResult, IncomingRelayTask,
     KeryxDaemonConfig, KeryxDaemonRuntime, StaticSenderAllowlist,
@@ -22,6 +22,14 @@ fn envelope(task_id: &str) -> TaskEnvelope {
         status: 0,
         messages: vec![],
         metadata: Default::default(),
+        deadline_ms: 0,
+    }
+}
+
+fn envelope_with_deadline(task_id: &str, deadline_ms: i64) -> TaskEnvelope {
+    TaskEnvelope {
+        deadline_ms,
+        ..envelope(task_id)
     }
 }
 
@@ -58,6 +66,71 @@ async fn incoming_task_accepted_into_store() {
         other => panic!("expected accepted, got {other:?}"),
     }
 
+    let task_id = CoreTaskId::new("incoming-task-1").unwrap();
+    let context = runtime
+        .store()
+        .get_transport_context(&task_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        context.authenticated_sender_peer_id.unwrap().as_str(),
+        "node-trusted"
+    );
+    assert_eq!(
+        context.expected_executor_peer_id.as_ref(),
+        Some(runtime.config().local_peer_id())
+    );
+    assert_eq!(
+        context.destination_peer_id,
+        *runtime.config().local_peer_id()
+    );
+    assert_eq!(context.relay_frame_id.as_deref(), Some("frame-accept"));
+    assert!(context.received_at_ms > 0);
+
+    let replay = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new("frame-accept", "node-trusted", envelope("incoming-task-1")),
+    )
+    .await;
+    assert!(matches!(replay, IncomingHandleResult::Accepted { .. }));
+    assert_eq!(
+        runtime
+            .store()
+            .get_transport_context(&task_id)
+            .await
+            .unwrap()
+            .received_at_ms,
+        context.received_at_ms
+    );
+
+    let fresh_frame_replay = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new(
+            "frame-after-relay-restart",
+            "node-trusted",
+            envelope("incoming-task-1"),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        fresh_frame_replay,
+        IncomingHandleResult::Accepted { .. }
+    ));
+    assert_eq!(
+        runtime
+            .store()
+            .get_transport_context(&task_id)
+            .await
+            .unwrap()
+            .relay_frame_id
+            .as_deref(),
+        Some("frame-after-relay-restart")
+    );
+
     let data_dir = dir.path().join("incoming-home");
     drop(runtime);
     let mut harness = RpcTestHarness::start_with_data_dir(data_dir).await;
@@ -76,6 +149,114 @@ async fn incoming_task_accepted_into_store() {
         .unwrap()
         .into_inner();
     assert_eq!(claim.status, "running");
+}
+
+#[tokio::test]
+async fn incoming_task_persists_positive_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path().join("deadline-home"), 0))
+            .await
+            .unwrap(),
+    );
+    let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
+    let deadline_ms = 1_800_000_000_000;
+
+    let result = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new(
+            "frame-deadline",
+            "node-trusted",
+            envelope_with_deadline("incoming-task-deadline", deadline_ms),
+        ),
+    )
+    .await;
+
+    assert!(matches!(result, IncomingHandleResult::Accepted { .. }));
+    let task_id = CoreTaskId::new("incoming-task-deadline").unwrap();
+    assert_eq!(
+        runtime
+            .store()
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .deadline_ms,
+        Some(deadline_ms)
+    );
+}
+
+#[tokio::test]
+async fn incoming_negative_deadline_is_rejected_without_store_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
+            dir.path().join("negative-deadline-home"),
+            0,
+        ))
+        .await
+        .unwrap(),
+    );
+    let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
+
+    let result = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new(
+            "frame-negative-deadline",
+            "node-trusted",
+            envelope_with_deadline("incoming-task-negative-deadline", -1),
+        ),
+    )
+    .await;
+
+    assert!(matches!(result, IncomingHandleResult::InvalidEnvelope(_)));
+    let task_id = CoreTaskId::new("incoming-task-negative-deadline").unwrap();
+    assert!(runtime.store().get_task(&task_id).await.is_err());
+}
+
+#[tokio::test]
+async fn incoming_expired_deadline_is_terminalized_before_auto_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
+            dir.path().join("expired-deadline-home"),
+            0,
+        ))
+        .await
+        .unwrap(),
+    );
+    let allowlist = StaticSenderAllowlist::new().with_nodes(["node-trusted"]);
+    let dispatch =
+        IncomingDispatchConfig::auto_dispatch(AgentId::new("deadline-worker").unwrap(), 60_000);
+
+    let result = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &dispatch,
+        IncomingRelayTask::new(
+            "frame-expired-deadline",
+            "node-trusted",
+            envelope_with_deadline("incoming-task-expired-deadline", 1),
+        ),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        IncomingHandleResult::Accepted {
+            dispatched: false,
+            lease_id: None,
+            ..
+        }
+    ));
+    let task_id = CoreTaskId::new("incoming-task-expired-deadline").unwrap();
+    assert_eq!(
+        runtime.store().get_task(&task_id).await.unwrap().status,
+        TaskStatus::Failed
+    );
 }
 
 #[tokio::test]
@@ -245,6 +426,7 @@ async fn incoming_invalid_envelope_returns_error_without_store_write() {
             status: 0,
             messages: vec![],
             metadata: Default::default(),
+            deadline_ms: 0,
         },
     );
 

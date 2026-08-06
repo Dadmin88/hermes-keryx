@@ -42,7 +42,7 @@ export HERMES_KERYX_DAEMON_ENDPOINT=http://127.0.0.1:50051
 1. Create `HERMES_KERYX_DATA_DIR` if missing.
 2. Open SQLite at `{data_dir}/keryx.db`.
 3. Run migrations.
-4. Read and check schema version (current supported: `5`).
+4. Read and check schema version (current supported: `7`).
 5. Run startup `recover_stale_leases`.
 6. Fail closed if recovery reports unrepaired corruption.
 7. Create the blob directory on artifact writes (`{data_dir}/blobs`).
@@ -123,6 +123,8 @@ Artifact limits:
 
 ## Relay operations
 
+Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-receipt history are process-local in-memory state. They survive reconnect to the same relay process, but not relay restart; acknowledgement and retained task-receipt history are bounded to 8,192 entries. Blank frame identities are rejected, every mailbox entry consumes bounded frame ownership, and reconnect backpressure never panics the relay. A task relay-acceptance receipt proves only authenticated relay acceptance, not execution or durable destination acknowledgement. `PublishResult` is stronger: it returns success only after the authenticated destination has persisted the result and acknowledged the relay-issued frame, so an executor does not settle its durable result outbox on relay admission alone.
+
 ### JSON config (direct `RelayConfig`)
 
 ```json
@@ -141,6 +143,13 @@ Artifact limits:
   "registry_grpc_bind": "127.0.0.1:51053"
 }
 ```
+
+Authenticated relay control and registry gRPC permit plaintext only on
+loopback. A non-loopback `health_grpc_bind` or `registry_grpc_bind` must also
+configure both `registry_tls_cert_path` and `registry_tls_key_path`; the same
+TLS identity protects both services. PEM paths are resolved relative to the
+config file. Rust control and registry clients must use `https://` remotely
+and may trust a private CA through `HERMES_KERYX_REGISTRY_CA_CERT`.
 
 Start and inspect:
 

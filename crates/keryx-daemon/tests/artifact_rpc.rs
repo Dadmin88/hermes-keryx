@@ -19,6 +19,7 @@ async fn submit_pending_task(harness: &mut RpcTestHarness, task_id: &TaskId) {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

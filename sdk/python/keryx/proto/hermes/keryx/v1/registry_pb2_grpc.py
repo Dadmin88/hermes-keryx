@@ -5,7 +5,7 @@ import warnings
 
 from hermes.keryx.v1 import registry_pb2 as hermes_dot_keryx_dot_v1_dot_registry__pb2
 
-GRPC_GENERATED_VERSION = '1.82.1'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -55,19 +55,22 @@ class RegistryServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def RegisterSkills(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """The registration owner is authenticated metadata; request peer_id must match it.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def UnregisterSkills(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """The deregistration owner is authenticated metadata; request peer_id must match it.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DiscoverBySkill(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Read-only discovery; it does not mutate registration ownership.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

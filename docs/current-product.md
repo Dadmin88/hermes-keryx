@@ -7,10 +7,10 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | Component | Implemented surface |
 |---|---|
 | `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, durable task envelopes, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
-| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
+| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; fail-closed authenticated task/result publication; recipient-owned frame acknowledgement; relay-issued acceptance receipts; capability-gated deadline and byte-result delivery; in-memory offline mailboxes and skill registry with TTL cleanup/gossipsub discovery sync (gossip cannot assert protocol capabilities); peer allowlist and node token authentication. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; AgentAnycast-compatible transition helpers. Remote handler dispatch and terminal result return are not complete yet. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry and protocol-feature helpers; durable remote worker/result loop; public task reattachment by ID for refresh/wait with fail-closed cancellation; explicit `TaskResultUnavailableError` for pre-v7 terminal rows without durable result data; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
 | Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
@@ -25,8 +25,12 @@ Operational outcomes are metadata/events rather than extra task status values:
 
 - retry requeue: `running -> pending`, increments `retry_count`, appends `RecoveryAction`
 - dead-letter: `running -> failed`, sets `dead_lettered` and `dead_letter_reason`
-- cancel: `pending` or `running` -> `failed`, marks cancellation counters and reason metadata
-- deadline expiry: expired `deadline_ms` on `pending`/`running` -> `failed`
+- cancel: `pending` or `running` -> canonical durable terminal state with a persisted `Canceled` outcome; reattachment maps that outcome back to `canceled` and never reopens it as generic failure
+- cross-node cancellation requests remain explicitly unavailable: an origin record targeted at another executor returns `FAILED_PRECONDITION` without claiming remote cancellation or mutating local terminal state; independently, when the destination locally cancels a remote-origin task, it atomically emits the normal durable canceled-result outbox delivery back to that authenticated origin, and duplicate local cancellation returns the original durable outcome without creating a second delivery
+- deadline expiry: `TaskEnvelope.deadline_ms` carries an absolute Unix epoch deadline across local, relay, and offline-mailbox routes only when the destination advertises `absolute_deadlines_v1`; unknown or older destinations fail before relay acceptance
+- byte-bearing remote result artifacts require the origin destination to advertise `result_artifact_bytes_v1`; the executor verifies that authenticated registry capability before accepting terminal completion, so unsupported or unknown origins fail while the task remains running and no terminal result/outbox entry is created; descriptor-only results remain compatible with older peers
+- relay acceptance receipts bind the submitted task ID, authenticated source and destination identities, relay-issued frame ID, route, and acceptance timestamp, and report `relay_accepted`; they prove relay acceptance, not execution
+- incoming relay acceptance atomically persists the immutable envelope with authenticated sender, local destination/executor, relay frame identity, and original receive timestamp; exact frame replays are idempotent while changed context conflicts
 - routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
 
 ## Daemon gRPC API
@@ -34,7 +38,10 @@ Operational outcomes are metadata/events rather than extra task status values:
 `proto/hermes/keryx/v1/daemon.proto` implements:
 
 - health/operator: `Status`, `Doctor`, `Liveness`, `Readiness`
-- worker lifecycle: `SubmitTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
+- worker lifecycle: `SubmitTask`, `SubmitRemoteTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
+- remote results: `GetTaskResult`, `ClaimNextResultDelivery`, `AckResultDelivery`, `FailResultDelivery`, `IngestRemoteResult`
+- result-delivery claims return `lease_expires_at_ms` as a claim-generation fence; ACK/failure callers must echo that exact active value, and stale or expired claims fail closed even when a later claimant reuses the same worker ID
+- the executor settles its durable result-delivery outbox only after `PublishResult` observes the authenticated destination's `AckFrame`, which the destination sends after `IngestRemoteResult` succeeds; relay restart, timeout, or response loss before that acknowledgement leaves/requeues the durable outbox delivery for an idempotent fresh-frame retry
 - artifacts: `PutArtifact`, `GetArtifact`, `ListArtifacts`, `DeleteArtifact`
 - routing/discovery: `SendTask`, `ListPeers`, `DiscoverSkills`
 
@@ -42,7 +49,7 @@ Important defaults:
 
 | Setting | Default |
 |---|---:|
-| schema version | `6` |
+| schema version | `7` |
 | lease TTL when omitted | `300_000 ms` |
 | lease recovery interval | `30_000 ms` |
 | deadline enforcement interval | `30_000 ms` |
@@ -52,6 +59,8 @@ Important defaults:
 | submit envelope limit | `4 MiB` (`0` means unlimited) |
 | inline artifact threshold | `64 KiB` |
 | max artifact/blob size | `256 MiB` |
+| cross-node result artifact content | `4 MiB` aggregate per terminal result |
+| result transport frame ceiling | `5 MiB` |
 | default local peer id | `node-local` |
 | default `SendTask` timeout | `30_000 ms` |
 
@@ -67,7 +76,7 @@ Important defaults:
 - artifact metadata plus inline bytes/blob references
 - deadline/cancellation fields
 
-Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart.
+Schema v6 added `task_envelopes`. `SubmitTask` persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart. Schema v7 adds authenticated transport context, durable terminal results, and retryable result-delivery outbox records.
 
 The store intentionally treats the encoded envelope as opaque bytes and does not depend on `keryx-proto`; protobuf encoding and decoding remain daemon/SDK concerns. Idempotent retries must match both the lifecycle record and the stored envelope. Conflicting envelope bytes fail closed.
 
@@ -82,30 +91,37 @@ Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR
 
 Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC health, `127.0.0.1:8081` HTTP health, and `127.0.0.1:50053` registry. The dual-run script intentionally overrides these to loopback non-conflicting ports.
 
+Current registry limits:
+
+- Registry registration and deregistration require configured node-token authentication. The relay derives the mutation owner from authenticated node metadata, rejects request-body identity mismatches, and fails closed when node authentication is absent. Plaintext authenticated relay control and registry gRPC are accepted only on loopback. Non-loopback control or registry binds use the configured TLS certificate/key, and remote Rust/Python clients require `https://` with optional private-CA trust. Skill discovery remains unauthenticated and read-only.
+- Task publication cannot create, refresh, or alter the destination peer's registry entry; registry state is mutated only through owner-authenticated registration APIs.
+- `max_skills_per_peer` is parsed from relay configuration but is not currently enforced.
+- Registry state is in-memory and TTL-based.
+
+`ConnectNode` is a receive-only delivery stream. Task and result mutations use the authenticated unary `PublishTask` and `PublishResult` RPCs so the relay applies the same identity and compatibility admission boundary to every accepted mutation.
+
+Terminal-result publication requires configured node-token authentication and fails closed when the relay has no `NodeTokenAuth`. This prevents descriptor-only and byte-bearing results from using a claimed `source_node_id` as an authenticated executor identity.
+
 ## Cross-node delivery boundary
 
-Keryx currently proves this one-way transport path:
+Keryx proves the authenticated round trip:
 
 ```text
 sender keryxd SendTask
   -> relay PublishTask
   -> destination keryx-node stream
-  -> destination keryxd SubmitTask
+  -> destination keryxd SubmitRemoteTask
   -> destination lifecycle row + durable full envelope
+  -> Python worker ClaimNextTask + handler
+  -> destination durable terminal result/outbox
+  -> authenticated relay result frame
+  -> origin keryxd IngestRemoteResult
+  -> Python TaskHandle.wait()
 ```
 
-A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
+Phase 17 was completed in [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29). The permanent proof starts a relay/registry, two daemons, two edge nodes, and a real Python worker, then verifies discovery, authenticated sender/executor identity, remote handler execution, durable result return, canonical origin-assigned artifact descriptors, exact binary artifact retrieval, explicit-path download, and clean shutdown. Cross-node result content is bounded to 4 MiB aggregate, integrity-checked before origin persistence, and never uses remote logical names as local paths.
 
-Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`. Phase 17.3 makes Python `serve_forever()` a real worker runtime: it claims matching tasks, invokes registered handlers, maintains leases with heartbeats, and persists local completion or failure.
-
-Missing today:
-
-- transport-authenticated sender identity attached to the claimed envelope
-- authenticated terminal result/artifact routing back to the origin
-- a remotely updated `TaskHandle.wait()`
-- a repeatable two-daemon/two-edge-node Agency E2E
-
-This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, durable envelope retention, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
+The relay's offline mailbox is currently in-memory. It delivers frames when a node reconnects to the same running relay process, retains each pending frame until the authenticated destination acknowledges that exact relay frame, and preserves unsent reconnect overflow for later delivery. Relay task-envelope conflict checks and stable acceptance receipts are retained in a bounded in-memory history; after an acknowledged entry ages out, a later publication receives a fresh relay frame identity, so stale acknowledgements cannot remove the new delivery. None of this state is relay-restart durable.
 
 ## Operator CLI
 
@@ -140,11 +156,13 @@ The Python package is `keryx` and exports:
 
 Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `claim_next`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
 
-Current compatibility limits:
+Current compatibility behavior:
 
 - `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
-- `send_task()` can submit through a configured daemon/relay route, but its compatibility `TaskHandle` is not attached to a remote terminal-status/result stream.
-- `IncomingTask.complete()` / `.fail()` are not yet wired to a durable relay result route.
+- `send_task(..., deadline_ms=...)` propagates a zero-or-positive absolute Unix epoch deadline through the configured daemon/relay route and returns a `TaskHandle` that polls durable origin-side results. The handle retains an immutable submission receipt with the daemon's exact `task_id`, `status`, `routed_to`, and `delivery_route`; this execution deadline remains separate from the daemon client's delivery `timeout_ms`.
+- `IncomingTask.complete()` / `.fail()` persist terminal state and feed the authenticated relay result route.
+- High-level Python `Skill.tags` propagate through registry publication and discovery.
+- Python `register_skills()` remains a one-shot primitive. The opt-in `start_registration()` lifecycle registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` exposes health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutation RPCs use finite deadlines, and one stop budget covers both refresh cancellation acknowledgement and deregistration. Work exceeding that budget remains tracked, blocks restart, and preserves refresh-before-deregister ordering. Shutdown transfers its registry client to pending cleanup so deregistration can finish before client close. The edge binary's registration remains one-shot.
 
 The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
 
@@ -162,7 +180,7 @@ The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/r
 | relay libp2p QUIC | `/ip4/127.0.0.1/udp/4101/quic-v1` |
 | state root | `~/.hermes/.keryx` |
 
-Dual-run validates infrastructure health. It does not start two edge nodes or prove a remote Hermes Agency handler/result round trip.
+Dual-run validates one local infrastructure pair. Use `scripts/e2e_two_node.py` for the complete authenticated remote round trip.
 
 ## Environment variables
 

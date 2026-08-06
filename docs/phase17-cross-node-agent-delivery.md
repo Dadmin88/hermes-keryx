@@ -1,144 +1,77 @@
 # Phase 17: durable cross-node agent delivery
 
-Status: **required for a complete Hermes Agency remote round trip**
+Status: **implemented and verified**
 
-Tracking issue: [#10](https://github.com/DeployFaith/hermes-keryx/issues/10)
+- Tracking issue: [#10](https://github.com/DeployFaith/hermes-keryx/issues/10) — closed
+- Implementation: [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29)
+- Merge commit: `906823badac04fd9d159c4da927dda5c25d712dc`
+- Permanent proof: `scripts/e2e_two_node.py` and `.github/workflows/phase17-e2e.yml`
 
-## Why this phase exists
-
-Keryx currently implements the transport path from a sender daemon to a destination daemon:
+## Implemented round trip
 
 ```text
-sender SDK
+sender Python SDK
   -> sender keryxd SendTask
-  -> relay PublishTask
+  -> authenticated relay PublishTask
   -> destination keryx-node stream
-  -> destination keryxd SubmitTask
-  -> destination SQLite lifecycle row
+  -> destination keryxd SubmitRemoteTask
+  -> durable lifecycle row + full envelope
+  -> Python worker ClaimNextTask
+  -> registered on_task() handler
+  -> durable terminal result + result-delivery outbox
+  -> authenticated relay result frame
+  -> origin keryxd IngestRemoteResult
+  -> TaskHandle.wait()
 ```
 
-That is a useful transport foundation, but it is not yet a complete Agent-to-Agent execution loop.
+The implementation includes:
 
-The destination Hermes Agency process cannot durably claim the delivered envelope and invoke its registered task handler. The origin process also cannot observe the remote terminal result or receive returned artifacts.
+- durable full-envelope retention;
+- atomic compatible-task claims and worker leases;
+- Python `serve_forever()` worker dispatch and heartbeats;
+- authenticated sender and executor identities;
+- durable terminal results and retryable result delivery;
+- `TaskHandle.wait()` result observation and cancellation;
+- canonical origin-assigned artifact descriptors and capability-gated bounded result bytes (`result_artifact_bytes_v1`);
+- idempotent result ingestion and acknowledgement;
+- a real two-daemon/two-edge-node process harness.
 
-## Current boundary
+## Verification contract
 
-Implemented today:
+Run from the repository root:
 
-- daemon `SendTask` routing and relay publication
-- relay node streams and offline mailbox delivery
-- `keryx-node` frame consumption into destination `SubmitTask`
-- relay skill registration and discovery
-- durable four-state task lifecycle
-- lease, heartbeat, completion, failure, cancellation, deadlines, and artifacts for locally addressed daemon tasks
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace --bins
 
-Not yet complete:
-
-- durable retention of the full submitted envelope
-- worker discovery of the next pending task
-- daemon-backed Python `IncomingTask` dispatch
-- registered `on_task()` handler invocation through `serve_forever()`
-- remote result and artifact routing back to the origin
-- a terminal, remotely updated Python `TaskHandle`
-- a repeatable two-daemon/two-edge-node Hermes Agency E2E
-
-## Verified source gaps
-
-### Envelope retention
-
-`KeryxDaemon::SubmitTask` validates the `TaskEnvelope`, calculates its size, then persists only a `TaskRecord`. The prompt messages, metadata, correlation ID, origin identity, and requested capability are not recoverable after submission.
-
-### Worker consumption
-
-`ClaimTask` requires a known task ID. There is no atomic `ClaimNextTask`, pending-task stream, or envelope retrieval RPC for an Agency worker.
-
-### Python receive loop
-
-`KeryxNode.serve_forever()` currently keeps the process alive but does not consume work from the daemon. Registered handlers remain in memory and are not invoked by relay-delivered tasks.
-
-### Result propagation
-
-Completion and failure are local daemon operations. No authenticated result frame returns terminal status, metadata, errors, or artifacts to the origin daemon.
-
-### Sender observation
-
-The compatibility `TaskHandle` is created as submitted but is not attached to a status/result stream. `wait()` cannot complete from a remote worker result.
-
-## Required protocol and storage contract
-
-### Durable inbox envelope
-
-Persist an inbox record atomically with the lifecycle row. It must contain:
-
-- serialized `TaskEnvelope`
-- authoritative origin peer ID
-- destination peer ID
-- correlation ID
-- received timestamp
-- requested skill/capability
-- claim/delivery state
-
-Authenticated transport identity must override or reject spoofable sender metadata.
-
-### Atomic worker claim
-
-Add a durable worker API, preferably:
-
-```proto
-rpc ClaimNextTask(ClaimNextTaskRequest) returns (ClaimNextTaskResponse);
+python -m pip install -e "sdk/python[dev]"
+python -m pytest sdk/python/tests -q
+python scripts/e2e_two_node.py --bin-dir target/debug
 ```
 
-The request should include worker ID, optional accepted skills, lease duration, and bounded long-poll timeout. The response should include the full envelope, authoritative sender identity, task ID, lease ID, and lease expiry.
-
-The operation must atomically select and lease one pending task, support concurrent workers, preserve deterministic ordering, and recover safely after lease expiry.
-
-### Daemon-backed Python incoming task
-
-`KeryxNode.serve_forever()` should long-poll the claim API, construct an `IncomingTask`, invoke registered handlers, heartbeat during work, and complete/fail through the lease-aware daemon RPCs.
-
-### Authenticated result route
-
-A terminal result must travel back through the relay:
-
-```text
-destination worker
-  -> destination daemon
-  -> destination result publisher / edge node
-  -> relay
-  -> origin edge node
-  -> origin daemon
-  -> sender TaskHandle
-```
-
-The result contract must carry task/correlation identity, authenticated responder peer ID, canonical terminal status, failure reason, result metadata, and artifact references. Duplicate delivery must be idempotent.
-
-### Sender status/result API
-
-Provide a durable `WatchTask` stream or bounded `GetTaskStatus` / `GetTaskResult` polling API. `TaskHandle.wait()` must terminate for completed, failed, cancelled, or rejected tasks and expose returned artifacts.
-
-## Runtime topology required for proof
-
-The final harness must start:
-
-- one relay and registry
-- sender daemon and sender edge node
-- receiver daemon and receiver edge node
-- separate peer IDs, keys, ports, and data directories
-- one harmless Hermes Agency task
-
-The harness must clean up all child processes and preserve inspectable logs outside the repository.
+The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node identities/tokens, a real Python receiver worker, and preserved logs on failure. It verifies skill discovery, authenticated sender identity, remote handler execution, terminal result return, authenticated executor identity, canonical origin-assigned descriptors, exact binary artifact retrieval, and explicit-path atomic download. Remote logical names are retained only as display metadata and cannot choose the local download path.
 
 ## Definition of done
 
-- [ ] Full envelopes survive relay delivery and daemon restart
-- [ ] A receiver worker atomically claims the next compatible task
-- [ ] Python `serve_forever()` invokes the real Agency handler
-- [ ] Completion, failure, and cancellation propagate to the origin
-- [ ] Sender `TaskHandle.wait()` receives terminal status and artifacts
-- [ ] Sender identity is transport-authenticated and cannot be spoofed through metadata
-- [ ] Two-daemon/two-edge-node harness is repeatable
-- [ ] Rust workspace checks pass
-- [ ] Python SDK tests pass
-- [ ] Hermes Agency cross-process E2E passes
+- [x] Full envelopes survive durable submission.
+- [x] A receiver worker atomically claims the next compatible task.
+- [x] Python `serve_forever()` invokes the registered handler.
+- [x] Completion/failure results propagate to the origin.
+- [x] Sender `TaskHandle.wait()` receives terminal status and canonical artifact descriptors.
+- [x] When the authenticated origin advertises `result_artifact_bytes_v1`, bounded artifact bytes traverse the result route and verify at origin; descriptor-only return remains compatible without it.
+- [x] Python retrieval and explicit-path download return the exact stored bytes.
+- [x] Sender and executor identities are transport-authenticated.
+- [x] Two-daemon/two-edge-node harness is repeatable.
+- [x] Rust workspace gates pass at the merged checkpoint.
+- [x] Python SDK tests pass at the merged checkpoint.
+- [x] Authenticated cross-process E2E passes at the merged checkpoint.
 
-Until these checks pass, documentation and public communication should describe Keryx as having the durable relay and lifecycle foundation for cross-node work, not a completed remote Agency execution round trip.
+## Current limitations
+
+- The relay offline mailbox is in-memory. It handles reconnects to the same relay process but does not survive relay restarts.
+- Python callers that need TTL renewal must opt into `start_registration()` and monitor `registration_status()`; refresh is retrying but best-effort, so a prolonged registry outage can still expire the lease. Registry mutations have finite RPC deadlines. One configured stop budget spans refresh acknowledgement and deregistration; overruns stay visibly pending, block restart, and preserve refresh-before-deregister ordering. Shutdown transfers the registry client to delayed cleanup rather than closing it underneath deregistration. The lower-level `register_skills()` call remains one-shot.
+- Registry mutation ownership is bound to authenticated node ID/token metadata and fails closed without authentication; request-body peer IDs cannot authorize cross-peer replacement or deregistration. Read-only skill discovery remains public.
+- The high-level Python `send_task()` helper retains daemon routing acknowledgement fields on its handle but does not expose every lower-level envelope field or routing option.
+- `TaskHandle` observes results by bounded polling rather than a streaming subscription.

@@ -6,11 +6,17 @@ import "hermes/keryx/v1/task.proto";
 import "hermes/keryx/v1/result.proto";
 
 service KeryxRelay {
+  // Receive-only delivery stream. Task/result mutation frames sent by clients are rejected;
+  // use the authenticated unary PublishTask and PublishResult RPCs instead.
   rpc ConnectNode(stream NodeFrame) returns (stream RelayFrame);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  // Authenticated unary task publication.
   rpc PublishTask(PublishTaskRequest) returns (PublishTaskResponse);
+  // Authenticated unary terminal-result publication. Success is returned only after the
+  // authenticated destination persists the result and acknowledges the relay-issued frame.
   rpc PublishResult(PublishResultRequest) returns (PublishResultResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
+  // Destination-owned acknowledgement; the authenticated caller must own the relay frame.
   rpc AckFrame(AckFrameRequest) returns (AckFrameResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -46,14 +52,25 @@ message PublishTaskRequest {
   string target_node_id = 2;
   string source_node_id = 3;
 }
-message PublishTaskResponse { TaskId task_id = 1; string frame_id = 2; }
+message PublishTaskResponse {
+  TaskId task_id = 1;
+  string frame_id = 2;
+  string authenticated_source_peer_id = 3;
+  string accepted_destination_peer_id = 4;
+  string accepted_route = 5;
+  int64 accepted_at_ms = 6;
+}
 message PublishResultRequest {
   TaskResultEnvelope result = 1;
   string target_node_id = 2;
   string source_node_id = 3;
   string frame_id = 4;
 }
-message PublishResultResponse { bool accepted = 1; string frame_id = 2; }
+message PublishResultResponse {
+  // True only after authenticated destination acknowledgement of frame_id.
+  bool accepted = 1;
+  string frame_id = 2;
+}
 message AckTaskRequest { TaskId task_id = 1; }
 message AckTaskResponse { bool accepted = 1; }
 message AckFrameRequest { string frame_id = 1; }

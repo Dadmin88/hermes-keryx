@@ -22,6 +22,7 @@ async fn fail_task_via_rpc_clears_lease_and_returns_failure_metadata() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

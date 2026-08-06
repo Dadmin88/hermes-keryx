@@ -128,6 +128,7 @@ async fn rpc_handlers_emit_named_tracing_spans() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await
