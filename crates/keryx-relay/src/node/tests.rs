@@ -10,7 +10,9 @@ use keryx_proto::v1::{
     AgentId, ClaimTaskRequest, CompleteTaskRequest, PublishResultRequest, PublishTaskRequest,
     TaskEnvelope, TaskId, TaskResultEnvelope, TaskStatus as ProtoTaskStatus, TerminalOutcome,
 };
-use keryx_store::{TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord};
+use keryx_store::{
+    ResultDeliveryState, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -86,6 +88,34 @@ fn relay_reconnect_backoff_is_bounded() {
         maximum
     );
     assert_eq!(next_reconnect_delay(maximum, maximum), maximum);
+}
+
+#[test]
+fn permanent_publish_rejections_are_dead_lettered_without_acknowledgement() {
+    for code in [
+        Code::InvalidArgument,
+        Code::Unauthenticated,
+        Code::PermissionDenied,
+        Code::NotFound,
+        Code::AlreadyExists,
+        Code::FailedPrecondition,
+        Code::OutOfRange,
+        Code::Unimplemented,
+        Code::DataLoss,
+    ] {
+        assert!(publish_result_failure_is_permanent(code), "{code:?}");
+    }
+    for code in [
+        Code::Cancelled,
+        Code::Unknown,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+        Code::Aborted,
+        Code::Internal,
+        Code::Unavailable,
+    ] {
+        assert!(!publish_result_failure_is_permanent(code), "{code:?}");
+    }
 }
 
 #[tokio::test]
@@ -316,6 +346,19 @@ async fn wait_for_task(runtime: &KeryxDaemonRuntime, task_id: &str) {
     })
     .await
     .expect("relay frame must reach daemon");
+}
+
+async fn wait_for_mailbox_depth(runtime: &RelayRuntime, node_id: &str, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime.mailbox_depth(node_id) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("relay mailbox must reach expected depth");
 }
 
 #[tokio::test]
@@ -600,6 +643,7 @@ async fn late_result_is_settled_and_next_result_continues_on_same_stream() {
         .get_terminal_result(&late_id)
         .await
         .is_err());
+    wait_for_mailbox_depth(&relay_runtime, DESTINATION, 0).await;
     assert_eq!(relay_runtime.mailbox_depth(DESTINATION), 0);
 
     publish_remote_result(
@@ -626,10 +670,12 @@ async fn late_result_is_settled_and_next_result_continues_on_same_stream() {
         .get_terminal_result(&next_id)
         .await
         .is_ok());
+    wait_for_mailbox_depth(&relay_runtime, DESTINATION, 0).await;
     assert_eq!(relay_runtime.mailbox_depth(DESTINATION), 0);
 
     publish_remote_task(relay_addr, SOURCE, SOURCE_TOKEN, DESTINATION, VALID_TASK).await;
     wait_for_task(&daemon_runtime, VALID_TASK).await;
+    wait_for_mailbox_depth(&relay_runtime, DESTINATION, 0).await;
     assert_eq!(relay_runtime.mailbox_depth(DESTINATION), 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
@@ -836,13 +882,15 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
                 .await
                 .map(|task| task.status == CoreTaskStatus::Completed)
                 .unwrap_or(false);
-            let outbox_empty = executor_runtime
+            let outbox_delivered = executor_runtime
                 .store()
-                .pending_result_deliveries(10)
+                .result_delivery_for_task(&result_id)
                 .await
-                .map(|rows| rows.is_empty())
+                .map(|row| {
+                    row.is_some_and(|delivery| delivery.state == ResultDeliveryState::Delivered)
+                })
                 .unwrap_or(false);
-            if completed && outbox_empty {
+            if completed && outbox_delivered {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -855,6 +903,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
 
     publish_remote_task(relay_addr, ORIGIN, ORIGIN_TOKEN, EXECUTOR, NEXT_TASK).await;
     wait_for_task(&executor_runtime, NEXT_TASK).await;
+    wait_for_mailbox_depth(&second_runtime, ORIGIN, 0).await;
+    wait_for_mailbox_depth(&second_runtime, EXECUTOR, 0).await;
     assert_eq!(second_runtime.mailbox_depth(ORIGIN), 0);
     assert_eq!(second_runtime.mailbox_depth(EXECUTOR), 0);
 
@@ -981,6 +1031,7 @@ async fn temporary_daemon_failure_does_not_ack_and_retries_after_recovery() {
         .await
         .expect("temporary daemon failure must retry after recovery")
         .unwrap();
+    wait_for_mailbox_depth(&relay_runtime, DESTINATION, 0).await;
     assert_eq!(relay_runtime.mailbox_depth(DESTINATION), 0);
     assert!(attempts.load(Ordering::SeqCst) >= 2);
     assert_eq!(

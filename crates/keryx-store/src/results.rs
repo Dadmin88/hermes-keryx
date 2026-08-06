@@ -510,6 +510,18 @@ impl InMemoryStore {
             .ok_or_else(|| StoreError::TerminalResultNotFound(task_id.clone()))
     }
 
+    pub fn result_delivery_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Option<ResultOutboxRecord>> {
+        Ok(self
+            .lock()?
+            .result_outbox
+            .values()
+            .find(|row| &row.task_id == task_id)
+            .cloned())
+    }
+
     pub fn pending_result_deliveries(&self, limit: usize) -> StoreResult<Vec<ResultOutboxRecord>> {
         let state = self.lock()?;
         let mut values = state
@@ -849,6 +861,17 @@ impl SqliteStore {
         Ok(value)
     }
 
+    pub async fn result_delivery_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Option<ResultOutboxRecord>> {
+        let row = sqlx::query("SELECT delivery_id, task_id, target_peer_id, state, attempt_count, next_attempt_at_ms, lease_owner, lease_expires_at_ms, last_error, created_at_ms, updated_at_ms FROM result_outbox WHERE task_id = ?")
+            .bind(task_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_outbox).transpose()
+    }
+
     pub async fn pending_result_deliveries(
         &self,
         limit: usize,
@@ -1043,7 +1066,7 @@ impl SqliteStore {
         let task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
         let terminal_reason = remote_result_terminal_reason_with_executor(&mut tx, &task).await?;
         let existing = fetch_terminal_result_optional(&mut tx, &result.task_id).await?;
-        if existing.as_ref().is_some_and(|stored| stored == &result) {
+        if terminal_reason.is_none() && existing.as_ref().is_some_and(|stored| stored == &result) {
             let stored = fetch_artifacts_for_task_with_executor(&mut tx, &result.task_id).await?;
             if stored.len() != records.len() || stored.iter().any(|row| !records.contains(row)) {
                 return Err(StoreError::TerminalResultConflict(result.task_id.clone()));

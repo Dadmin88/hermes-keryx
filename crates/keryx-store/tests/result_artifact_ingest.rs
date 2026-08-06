@@ -6,6 +6,7 @@ use keryx_store::{
     OriginResultArtifact, RemoteResultIngestOutcome, RemoteResultTerminalReason, SqliteStore,
     StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
 };
+use sqlx::SqlitePool;
 use tempfile::tempdir;
 
 fn peer(value: &str) -> PeerId {
@@ -759,4 +760,60 @@ async fn unauthorized_late_result_is_not_terminally_settled() {
         error,
         StoreError::RemoteResultExecutorMismatch { .. }
     ));
+}
+
+#[tokio::test]
+async fn deadline_task_with_unexpected_exact_canonical_result_fails_closed() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("keryx.db");
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+    let task_id = TaskId::new("deadline-corrupt-duplicate").unwrap();
+    let mut task = TaskRecord::new(task_id.clone(), TaskStatus::Pending, None);
+    task.deadline_ms = Some(15);
+    store
+        .accept_task_with_envelope_and_context(
+            task,
+            TaskEnvelopeRecord::new(task_id.clone(), b"envelope".to_vec(), 10),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(peer("origin-sender")),
+                expected_executor_peer_id: Some(peer("remote-executor")),
+                destination_peer_id: peer("origin-sender"),
+                relay_frame_id: Some("frame-corrupt-duplicate".to_owned()),
+                received_at_ms: 10,
+            },
+        )
+        .await
+        .unwrap();
+    store.fail_expired_deadlines(20, None).await.unwrap();
+    let record = result(&task_id);
+    let pool = SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO task_terminal_results (task_id, encoded_result, terminal_status, return_peer_id, executor_peer_id, created_at_ms) VALUES (?, ?, ?, NULL, ?, ?)")
+        .bind(task_id.as_str())
+        .bind(&record.encoded_result)
+        .bind("completed")
+        .bind(record.executor_peer_id.as_str())
+        .bind(record.created_at_ms)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = store
+        .ingest_remote_result_with_artifacts(
+            record,
+            &[],
+            &peer("remote-executor"),
+            dir.path().join("blobs"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::TerminalResultConflict(_)));
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().status,
+        TaskStatus::Failed
+    );
 }

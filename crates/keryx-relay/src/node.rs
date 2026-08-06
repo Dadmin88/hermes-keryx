@@ -22,7 +22,7 @@ use tokio::signal;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
-use tonic::Request;
+use tonic::{Code, Request};
 use tracing::info;
 
 use crate::bootstrap::{dial_bootstrap_peers, wait_for_listen_addr};
@@ -260,6 +260,21 @@ fn relay_endpoint() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn publish_result_failure_is_permanent(code: Code) -> bool {
+    matches!(
+        code,
+        Code::InvalidArgument
+            | Code::Unauthenticated
+            | Code::PermissionDenied
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::FailedPrecondition
+            | Code::OutOfRange
+            | Code::Unimplemented
+            | Code::DataLoss
+    )
+}
+
 async fn run_relay_stream(
     relay_endpoint: String,
     registry_peer_id: String,
@@ -376,7 +391,7 @@ async fn run_relay_stream(
                                 worker_id: delivery_worker.clone(),
                                 error_reason: error.message().to_string(),
                                 retry_delay_ms: 1_000,
-                                dead_letter: false,
+                                dead_letter: publish_result_failure_is_permanent(error.code()),
                                 lease_expires_at_ms: delivery.lease_expires_at_ms,
                             })
                             .await?;
