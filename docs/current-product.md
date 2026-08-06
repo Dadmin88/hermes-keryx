@@ -29,7 +29,7 @@ Operational outcomes are metadata/events rather than extra task status values:
 - cross-node cancellation remains explicitly unavailable: an origin record targeted at another executor returns `FAILED_PRECONDITION` without claiming remote cancellation or mutating local terminal state
 - deadline expiry: `TaskEnvelope.deadline_ms` carries an absolute Unix epoch deadline across local, relay, and offline-mailbox routes only when the destination advertises `absolute_deadlines_v1`; unknown or older destinations fail before relay acceptance
 - byte-bearing remote result artifacts require the origin destination to advertise `result_artifact_bytes_v1`; descriptor-only results remain compatible with older peers
-- relay acceptance receipts use authenticated source and destination identities plus a relay-issued frame ID and report `relay_accepted`; they prove relay acceptance, not execution
+- relay acceptance receipts bind the submitted task ID, authenticated source and destination identities, relay-issued frame ID, route, and acceptance timestamp, and report `relay_accepted`; they prove relay acceptance, not execution
 - routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
 
 ## Daemon gRPC API

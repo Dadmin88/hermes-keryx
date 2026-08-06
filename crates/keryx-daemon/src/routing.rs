@@ -56,6 +56,7 @@ pub struct SendTaskOutcome {
 /// Relay-issued evidence that an exact frame was accepted for an exact destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayRouteReceipt {
+    pub task_id: TaskId,
     pub frame_id: String,
     pub authenticated_source_peer_id: PeerId,
     pub accepted_destination_peer_id: PeerId,
@@ -185,6 +186,14 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         mut envelope: TaskEnvelope,
         _timeout: Duration,
     ) -> Result<RelayRouteReceipt, RoutingError> {
+        let expected_task_id = envelope
+            .task_id
+            .as_ref()
+            .map(|task_id| TaskId::new(task_id.value.trim()))
+            .transpose()?
+            .ok_or_else(|| RoutingError::InvalidEnvelope {
+                reason: "relay task envelope requires task_id".to_string(),
+            })?;
         envelope.metadata.insert(
             "target_node_id".to_string(),
             target_peer_id.as_str().to_string(),
@@ -227,6 +236,15 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
             })?
             .into_inner();
         let receipt = RelayRouteReceipt {
+            task_id: response
+                .task_id
+                .as_ref()
+                .map(|task_id| TaskId::new(task_id.value.trim()))
+                .transpose()?
+                .ok_or_else(|| RoutingError::RelayFailed {
+                    peer_id: target_peer_id.to_string(),
+                    reason: "relay returned a route receipt without task_id".to_string(),
+                })?,
             frame_id: response.frame_id.trim().to_string(),
             authenticated_source_peer_id: PeerId::new(
                 response.authenticated_source_peer_id.trim(),
@@ -237,17 +255,24 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
             accepted_route: response.accepted_route.trim().to_string(),
             accepted_at_ms: response.accepted_at_ms,
         };
-        validate_relay_receipt(&receipt, &self.source_peer_id, target_peer_id)?;
+        validate_relay_receipt(
+            &receipt,
+            &expected_task_id,
+            &self.source_peer_id,
+            target_peer_id,
+        )?;
         Ok(receipt)
     }
 }
 
 fn validate_relay_receipt(
     receipt: &RelayRouteReceipt,
+    expected_task_id: &TaskId,
     expected_source: &PeerId,
     expected_destination: &PeerId,
 ) -> Result<(), RoutingError> {
-    if receipt.frame_id.is_empty()
+    if receipt.task_id != *expected_task_id
+        || receipt.frame_id.is_empty()
         || receipt.authenticated_source_peer_id != *expected_source
         || receipt.accepted_destination_peer_id != *expected_destination
         || receipt.accepted_route != "relay"
@@ -690,11 +715,12 @@ impl TaskRouter {
                         .authenticated_sender_peer_id
                         .ok_or_else(|| StoreError::TransportContextConflict(task_id.clone()))?;
                     return Ok(SendTaskOutcome {
-                        task_id,
+                        task_id: task_id.clone(),
                         status: "relay_accepted".to_string(),
                         routed_to: target_peer_id.clone(),
                         route: DeliveryRoute::Relay,
                         relay_receipt: Some(RelayRouteReceipt {
+                            task_id: task_id.clone(),
                             frame_id,
                             authenticated_source_peer_id,
                             accepted_destination_peer_id: target_peer_id,
@@ -906,6 +932,26 @@ mod tests {
     use super::*;
     use keryx_proto::v1::TaskId as ProtoTaskId;
 
+    #[test]
+    fn relay_receipt_must_match_the_submitted_task_identity() {
+        let expected_task_id = TaskId::new("task-expected").unwrap();
+        let source = PeerId::new("source-peer").unwrap();
+        let destination = PeerId::new("destination-peer").unwrap();
+        let receipt = RelayRouteReceipt {
+            task_id: TaskId::new("task-other").unwrap(),
+            frame_id: "relay-frame".to_string(),
+            authenticated_source_peer_id: source.clone(),
+            accepted_destination_peer_id: destination.clone(),
+            accepted_route: "relay".to_string(),
+            accepted_at_ms: 1,
+        };
+
+        assert!(matches!(
+            validate_relay_receipt(&receipt, &expected_task_id, &source, &destination),
+            Err(RoutingError::RelayFailed { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn relay_publisher_rejects_remote_plaintext_endpoint() {
         let publisher = GrpcRelayTaskPublisher::new(
@@ -1056,6 +1102,7 @@ pub mod test_support {
                 .await
                 .push((target_peer_id.to_string(), task_id.clone()));
             Ok(RelayRouteReceipt {
+                task_id: TaskId::new(&task_id)?,
                 frame_id: format!("relay-test-{task_id}"),
                 authenticated_source_peer_id: PeerId::new("peer-local")?,
                 accepted_destination_peer_id: target_peer_id.clone(),

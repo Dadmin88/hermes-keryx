@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use keryx_core::PeerId;
+use keryx_core::{PeerId, TaskId};
 use keryx_daemon::{
     serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime, RelayRouteReceipt, RelayTaskPublisher,
     RoutingError,
@@ -154,6 +154,7 @@ impl RelayTaskPublisher for MockRelayPublisher {
             .await
             .push((target_peer_id.as_str().to_string(), task_id.clone()));
         Ok(RelayRouteReceipt {
+            task_id: TaskId::new(&task_id)?,
             frame_id: format!("relay-test-{task_id}"),
             authenticated_source_peer_id: PeerId::new("peer-local")?,
             accepted_destination_peer_id: target_peer_id.clone(),

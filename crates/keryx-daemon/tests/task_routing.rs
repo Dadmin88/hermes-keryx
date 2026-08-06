@@ -668,7 +668,7 @@ async fn grpc_relay_task_publisher_publishes_to_relay_mailbox() {
 }
 
 #[tokio::test]
-async fn grpc_relay_task_publisher_maps_publish_failure() {
+async fn grpc_relay_task_publisher_rejects_missing_task_identity_before_publish() {
     let runtime = RelayRuntime::new("relay-publisher-failure-test");
     runtime.mark_transport_listening();
     let addr = spawn_relay(Arc::clone(&runtime)).await;
@@ -687,7 +687,7 @@ async fn grpc_relay_task_publisher_maps_publish_failure() {
         .unwrap_err();
     assert!(matches!(
         error,
-        keryx_daemon::RoutingError::RelayFailed { .. }
+        keryx_daemon::RoutingError::InvalidEnvelope { .. }
     ));
     assert_eq!(runtime.mailbox_depth(remote.as_str()), 0);
 }
