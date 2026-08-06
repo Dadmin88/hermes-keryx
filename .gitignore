@@ -23,6 +23,7 @@ evidence-bundles/
 .env
 .env.*
 *.env
+*.env.*
 !*.env.example
 *.pem
 *.key
