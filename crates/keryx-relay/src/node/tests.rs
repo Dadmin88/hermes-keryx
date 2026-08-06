@@ -384,33 +384,63 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
         })
         .await
         .unwrap();
-    let unrelated_now = unix_ms_now().saturating_add(1);
+    let first_unrelated_attempt_at = unix_ms_now().saturating_add(1);
+    for prior_failures in 0..MAX_RESULT_DELIVERY_ATTEMPTS.saturating_sub(1) {
+        let now_ms = first_unrelated_attempt_at.saturating_add(i64::from(prior_failures) * 10);
+        let (delivery, _) = runtime
+            .store()
+            .claim_next_result_delivery(WORKER, now_ms, 1_000)
+            .await
+            .unwrap()
+            .expect("unrelated result must remain retryable before its final allowed attempt");
+        assert_eq!(delivery.task_id, unrelated_id);
+        assert_eq!(delivery.attempt_count, prior_failures);
+        runtime
+            .store()
+            .fail_result_delivery(
+                &delivery.delivery_id,
+                (WORKER, delivery.lease_expires_at_ms.unwrap()),
+                now_ms,
+                now_ms.saturating_add(1),
+                "temporary outage before final allowed attempt",
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let final_attempt_at =
+        first_unrelated_attempt_at.saturating_add(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS) * 10);
     let (unrelated_delivery, _) = runtime
         .store()
-        .claim_next_result_delivery(WORKER, unrelated_now, 1_000)
+        .claim_next_result_delivery(WORKER, final_attempt_at, 1_000)
         .await
         .unwrap()
-        .expect("dead-lettered row must not block later unrelated result traffic");
+        .expect("the final allowed result-delivery attempt must remain claimable");
     assert_eq!(unrelated_delivery.task_id, unrelated_id);
+    assert_eq!(
+        unrelated_delivery.attempt_count,
+        MAX_RESULT_DELIVERY_ATTEMPTS - 1
+    );
     runtime
         .store()
         .ack_result_delivery(
             &unrelated_delivery.delivery_id,
             WORKER,
             unrelated_delivery.lease_expires_at_ms.unwrap(),
-            unrelated_now,
+            final_attempt_at,
         )
         .await
         .unwrap();
+    let final_delivery = runtime
+        .store()
+        .result_delivery_for_task(&unrelated_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_delivery.state, ResultDeliveryState::Delivered);
     assert_eq!(
-        runtime
-            .store()
-            .result_delivery_for_task(&unrelated_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ResultDeliveryState::Delivered
+        final_delivery.attempt_count,
+        MAX_RESULT_DELIVERY_ATTEMPTS - 1
     );
 
     relay_server.abort();
