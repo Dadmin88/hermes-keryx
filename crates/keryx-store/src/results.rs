@@ -220,6 +220,21 @@ fn ensure_context_task(context: &TaskTransportContextRecord, task_id: &TaskId) -
     }
 }
 
+fn same_delivered_envelope(left: &TaskEnvelopeRecord, right: &TaskEnvelopeRecord) -> bool {
+    left.task_id == right.task_id && left.encoded_envelope == right.encoded_envelope
+}
+
+fn same_transport_identity(
+    left: &TaskTransportContextRecord,
+    right: &TaskTransportContextRecord,
+) -> bool {
+    left.task_id == right.task_id
+        && left.authenticated_sender_peer_id == right.authenticated_sender_peer_id
+        && left.expected_executor_peer_id == right.expected_executor_peer_id
+        && left.destination_peer_id == right.destination_peer_id
+        && left.relay_frame_id == right.relay_frame_id
+}
+
 impl InMemoryStore {
     pub fn cancel_task_with_result(
         &self,
@@ -296,22 +311,49 @@ impl InMemoryStore {
         envelope: TaskEnvelopeRecord,
         context: TaskTransportContextRecord,
     ) -> StoreResult<TaskRecord> {
+        validate_accepted_task_status(&task)?;
+        ensure_pending_accept(&task)?;
+        ensure_matching_envelope_task_id(&task, &envelope)?;
         ensure_context_task(&context, task.task_id())?;
-        let accepted = self.accept_task_with_envelope(task, envelope)?;
         let mut state = self.lock()?;
-        match state.transport_contexts.get(accepted.task_id()) {
-            Some(existing) if existing == &context => return Ok(accepted),
-            Some(_) => {
-                return Err(StoreError::TransportContextConflict(
-                    accepted.task_id().clone(),
-                ))
+        if let Some(existing) = state.tasks.get(task.task_id()).cloned() {
+            if existing == task
+                && state
+                    .envelopes
+                    .get(task.task_id())
+                    .is_some_and(|stored| same_delivered_envelope(stored, &envelope))
+                && state
+                    .transport_contexts
+                    .get(task.task_id())
+                    .is_some_and(|stored| same_transport_identity(stored, &context))
+            {
+                return Ok(existing);
             }
-            None => {}
+            return Err(StoreError::TransportContextConflict(task.task_id().clone()));
         }
-        state
-            .transport_contexts
-            .insert(accepted.task_id().clone(), context);
-        Ok(accepted)
+        if let Some(key) = &task.idempotency_key {
+            if let Some(existing_task_id) = state.idempotency.get(key) {
+                return Err(StoreError::IdempotencyConflict {
+                    key: key.clone(),
+                    existing_task_id: existing_task_id.clone(),
+                });
+            }
+        }
+        let task_id = task.task_id().clone();
+        if let Some(key) = &task.idempotency_key {
+            state.idempotency.insert(key.clone(), task_id.clone());
+        }
+        append_in_memory_event(
+            &mut state,
+            &task_id,
+            KeryxEventType::TaskAccepted,
+            None,
+            task.status,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        state.envelopes.insert(task_id.clone(), envelope);
+        state.transport_contexts.insert(task_id, context);
+        Ok(task)
     }
 
     pub fn get_transport_context(
@@ -601,8 +643,12 @@ impl SqliteStore {
             let existing_context =
                 fetch_transport_context_optional(&mut tx, task.task_id()).await?;
             if existing == task
-                && existing_envelope.as_ref() == Some(&envelope)
-                && existing_context.as_ref() == Some(&context)
+                && existing_envelope
+                    .as_ref()
+                    .is_some_and(|stored| same_delivered_envelope(stored, &envelope))
+                && existing_context
+                    .as_ref()
+                    .is_some_and(|stored| same_transport_identity(stored, &context))
             {
                 tx.commit().await?;
                 return Ok(existing);

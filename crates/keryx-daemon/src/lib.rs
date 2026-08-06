@@ -841,6 +841,16 @@ impl KeryxDaemonRuntime {
             .check_envelope_bytes(envelope.encoded_envelope.len() as u64)
             .map_err(|error| StoreError::Validation(error.into()))?;
         let _guard = self.submit_backpressure_lock.lock().await;
+        match self.store.get_task(record.task_id()).await {
+            Ok(_) => {
+                return self
+                    .store
+                    .accept_task_with_envelope_and_context(record, envelope, context)
+                    .await;
+            }
+            Err(StoreError::TaskNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
         let pending_count = self
             .store
             .count_tasks_by_status(TaskStatus::Pending)

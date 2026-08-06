@@ -66,6 +66,61 @@ async fn incoming_task_accepted_into_store() {
         other => panic!("expected accepted, got {other:?}"),
     }
 
+    let task_id = CoreTaskId::new("incoming-task-1").unwrap();
+    let context = runtime
+        .store()
+        .get_transport_context(&task_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        context.authenticated_sender_peer_id.unwrap().as_str(),
+        "node-trusted"
+    );
+    assert_eq!(
+        context.expected_executor_peer_id.as_ref(),
+        Some(runtime.config().local_peer_id())
+    );
+    assert_eq!(
+        context.destination_peer_id,
+        *runtime.config().local_peer_id()
+    );
+    assert_eq!(context.relay_frame_id.as_deref(), Some("frame-accept"));
+    assert!(context.received_at_ms > 0);
+
+    let replay = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new("frame-accept", "node-trusted", envelope("incoming-task-1")),
+    )
+    .await;
+    assert!(matches!(replay, IncomingHandleResult::Accepted { .. }));
+    assert_eq!(
+        runtime
+            .store()
+            .get_transport_context(&task_id)
+            .await
+            .unwrap()
+            .received_at_ms,
+        context.received_at_ms
+    );
+
+    let conflicting_frame = handle_incoming_task(
+        runtime.as_ref(),
+        &allowlist,
+        &IncomingDispatchConfig::default(),
+        IncomingRelayTask::new(
+            "frame-conflict",
+            "node-trusted",
+            envelope("incoming-task-1"),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        conflicting_frame,
+        IncomingHandleResult::Store(keryx_store::StoreError::TransportContextConflict(_))
+    ));
+
     let data_dir = dir.path().join("incoming-home");
     drop(runtime);
     let mut harness = RpcTestHarness::start_with_data_dir(data_dir).await;
