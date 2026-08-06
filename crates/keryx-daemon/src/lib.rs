@@ -609,21 +609,6 @@ impl KeryxDaemonRuntime {
         Ok(response)
     }
 
-    async fn peer_supports_protocol_feature(
-        &self,
-        peer_id: &PeerId,
-        feature: &str,
-    ) -> Result<bool, Status> {
-        let handle = self.discovery.read().await.clone().ok_or_else(|| {
-            Status::failed_precondition(
-                "relay registry is unavailable for destination capability verification",
-            )
-        })?;
-        handle
-            .peer_supports_protocol_feature(peer_id, feature)
-            .await
-    }
-
     /// Reject new RPC handlers while keeping the listener up (used by integration tests).
     pub fn mark_shutting_down(&self) {
         self.shutdown.mark_shutting_down();
@@ -1449,24 +1434,18 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
-        validate_worker_result_artifacts(inner.output_artifacts.clone())?;
+        let (_, has_content) = validate_worker_result_artifacts(inner.output_artifacts.clone())?;
         let return_peer_id = return_peer_for_task(self.runtime.store(), &task_id).await;
-        if inner
-            .output_artifacts
-            .iter()
-            .any(|artifact| !artifact.content.is_empty())
-        {
+        if has_content {
             if let Some(return_peer_id) = return_peer_id.as_ref() {
-                if !self
-                    .runtime
-                    .peer_supports_protocol_feature(
-                        return_peer_id,
-                        discovery::RESULT_ARTIFACT_BYTES_FEATURE,
-                    )
-                    .await?
+                let source_features =
+                    authenticated_source_features_for_task(self.runtime.store(), &task_id).await?;
+                if !source_features
+                    .iter()
+                    .any(|feature| feature == discovery::RESULT_ARTIFACT_BYTES_FEATURE)
                 {
                     return Err(Status::failed_precondition(format!(
-                        "destination peer {} does not support protocol feature {}",
+                        "destination peer {} did not advertise protocol feature {} when the task was accepted",
                         return_peer_id.as_str(),
                         discovery::RESULT_ARTIFACT_BYTES_FEATURE
                     )));
@@ -2082,6 +2061,32 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let response = self.runtime.discover_skills(request.into_inner()).await?;
         Ok(Response::new(response))
     }
+}
+
+const AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY: &str =
+    "keryx.authenticated_source_protocol_features";
+
+async fn authenticated_source_features_for_task(
+    store: &SqliteStore,
+    task_id: &TaskId,
+) -> Result<Vec<String>, Status> {
+    let envelope_record = store
+        .get_task_envelope(task_id)
+        .await
+        .map_err(store_error_to_status)?;
+    let envelope = TaskEnvelope::decode(envelope_record.encoded_envelope.as_slice())
+        .map_err(|error| Status::data_loss(format!("invalid stored task envelope: {error}")))?;
+    let Some(encoded_features) = envelope
+        .metadata
+        .get(AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY)
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(encoded_features).map_err(|error| {
+        Status::data_loss(format!(
+            "invalid authenticated source feature snapshot: {error}"
+        ))
+    })
 }
 
 async fn return_peer_for_task(store: &SqliteStore, task_id: &TaskId) -> Option<PeerId> {

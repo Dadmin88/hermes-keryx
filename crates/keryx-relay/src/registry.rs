@@ -325,6 +325,18 @@ impl SkillRegistry {
         self.inner.read().await.nodes.get(peer_id).cloned()
     }
 
+    /// Return the owner-authenticated protocol features currently registered for a peer.
+    pub async fn protocol_features(&self, peer_id: &PeerId) -> Vec<String> {
+        self.purge_expired().await;
+        self.inner
+            .read()
+            .await
+            .nodes
+            .get(peer_id)
+            .map(|record| record.protocol_features.clone())
+            .unwrap_or_default()
+    }
+
     /// Count active (non-expired) peer registrations.
     pub async fn registration_count(&self) -> usize {
         self.purge_expired().await;

@@ -47,6 +47,8 @@ const TARGET_NODE_METADATA_KEYS: &[&str] = &[
 
 const ABSOLUTE_DEADLINES_FEATURE: &str = "absolute_deadlines_v1";
 const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
+const AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY: &str =
+    "keryx.authenticated_source_protocol_features";
 
 pub struct RelayHealthService {
     runtime: Arc<RelayRuntime>,
@@ -273,9 +275,22 @@ impl KeryxRelay for RelayHealthService {
             frame_id: new_relay_frame_id(),
             accepted_at_ms: unix_ms_now(),
         };
+        let source_peer_id = PeerId::new(source_node_id.clone())
+            .map_err(|error| Status::unauthenticated(error.to_string()))?;
+        let source_features = if let Some(registry) = self.registry.as_ref() {
+            registry.protocol_features(&source_peer_id).await
+        } else {
+            Vec::new()
+        };
+        let mut delivered_task = task.clone();
+        delivered_task.metadata.insert(
+            AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string(),
+            serde_json::to_string(&source_features)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        );
         let frame = RelayFrame {
             frame_id: proposed_receipt.frame_id.clone(),
-            task: Some(task.clone()),
+            task: Some(delivered_task),
             result: None,
             authenticated_source_node_id: source_node_id.clone(),
             destination_node_id: target_node_id.clone(),

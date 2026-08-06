@@ -1625,6 +1625,7 @@ dependencies = [
  "keryx-relay",
  "keryx-store",
  "prost",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
