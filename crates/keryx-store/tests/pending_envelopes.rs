@@ -157,7 +157,7 @@ async fn peer_guard_and_lease_transition_are_atomic() {
 }
 
 #[tokio::test]
-async fn relay_receipt_is_immutable_and_survives_restart() {
+async fn relay_receipt_survives_restart_and_new_delivery_replaces_stale_generation() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("keryx.db");
     let local = PeerId::new("peer-local").unwrap();
@@ -198,10 +198,14 @@ async fn relay_receipt_is_immutable_and_survives_restart() {
         .record_relay_receipt(record.task_id(), &local, &remote, "relay-receipt-1", 42)
         .await
         .unwrap();
-    assert!(matches!(
-        reopened
-            .record_relay_receipt(record.task_id(), &local, &remote, "relay-receipt-2", 43)
-            .await,
-        Err(StoreError::TransportContextConflict(_))
-    ));
+    reopened
+        .record_relay_receipt(record.task_id(), &local, &remote, "relay-receipt-2", 43)
+        .await
+        .unwrap();
+    let refreshed = reopened
+        .get_transport_context(record.task_id())
+        .await
+        .unwrap();
+    assert_eq!(refreshed.relay_frame_id.as_deref(), Some("relay-receipt-2"));
+    assert_eq!(refreshed.received_at_ms, 43);
 }
