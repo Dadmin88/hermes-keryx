@@ -40,6 +40,7 @@ from keryx.task import (
     SubmissionReceipt,
     Task,
     TaskHandle,
+    TaskResultUnavailableError,
     TaskStatus as LegacyTaskStatus,
 )
 
@@ -50,6 +51,7 @@ if str(_PROTO_ROOT) not in sys.path:
 from hermes.keryx.v1 import common_pb2, daemon_pb2, daemon_pb2_grpc, task_pb2  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
 
 TaskHandler = Callable[[IncomingTask], Awaitable[None]]
 
@@ -800,6 +802,15 @@ class KeryxNode:
                 status=response.status,
                 routed_to=response.routed_to,
                 delivery_route=response.delivery_route,
+                relay_frame_id=response.relay_frame_id or None,
+                authenticated_source_peer_id=(
+                    response.authenticated_source_peer_id or None
+                ),
+                accepted_destination_peer_id=(
+                    response.accepted_destination_peer_id or None
+                ),
+                accepted_route=response.accepted_route or None,
+                accepted_at_ms=response.accepted_at_ms or None,
             ),
         )
 
@@ -826,6 +837,11 @@ class KeryxNode:
             assert self._client is not None
             result_response = await self._client.get_task_result(task.task_id)
             task.status = _legacy_status(result_response.status)
+            if result_response.terminal_result_unavailable:
+                raise TaskResultUnavailableError(
+                    result_response.data_unavailable_reason
+                    or "terminal_result_unavailable"
+                )
             if result_response.found and result_response.HasField("result"):
                 result = result_response.result
                 task.status = _legacy_status(result_response.status, outcome=result.outcome)

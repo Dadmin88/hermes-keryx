@@ -1,15 +1,18 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use keryx_core::PeerId;
+use keryx_core::{NodeId, PeerId};
 use keryx_daemon::{GrpcRelayTaskPublisher, KeryxDaemonConfig, RelayTaskPublisher};
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::{
     AgentId, ClaimNextTaskRequest, ClaimTaskRequest, ListPeersRequest, NodeFrame, SendTaskRequest,
     SubmitRemoteTaskRequest, TaskEnvelope, TaskId,
 };
-use keryx_relay::health_server::{serve_grpc_health, NODE_ID_METADATA_KEY};
+use keryx_relay::health_server::{serve_grpc_health_with_auth, NODE_ID_METADATA_KEY};
+use keryx_relay::registry::SkillRegistry;
+use keryx_relay::security::NodeTokenAuth;
 use keryx_relay::RelayRuntime;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -120,12 +123,148 @@ async fn send_task_routes_to_relay_peer() {
         .into_inner();
 
     assert_eq!(response.delivery_route, "relay");
-    assert_eq!(response.status, "delivered");
+    assert_eq!(response.status, "relay_accepted");
     assert_eq!(response.routed_to, remote.to_string());
+    assert_eq!(response.relay_frame_id, "relay-test-route-relay-1");
+    assert_eq!(response.authenticated_source_peer_id, "peer-local");
+    assert_eq!(response.accepted_destination_peer_id, remote.to_string());
+    assert_eq!(response.accepted_route, "relay");
+    assert_eq!(response.accepted_at_ms, 1);
+    let claim_error = harness
+        .client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: "route-relay-1".to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: "worker-local-thief".to_string(),
+            }),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(claim_error.code(), Code::FailedPrecondition);
     let deliveries = mock.deliveries().await;
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].0, remote.to_string());
     assert_eq!(deliveries[0].1, "route-relay-1");
+}
+
+#[tokio::test]
+async fn accepted_remote_task_retry_returns_durable_receipt_without_republishing() {
+    let mut harness = RpcTestHarness::start().await;
+    let mock = Arc::new(MockRelayPublisher::new());
+    harness.runtime.router().set_publisher(mock.clone()).await;
+    let remote = PeerId::new("node-remote-retry").unwrap();
+    harness
+        .runtime
+        .router()
+        .set_peer_connected(&remote, true)
+        .await;
+    let request = SendTaskRequest {
+        target_peer_id: remote.to_string(),
+        envelope: Some(envelope("route-relay-retry")),
+        timeout_ms: 5_000,
+    };
+
+    let first = harness
+        .client
+        .send_task(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let second = harness
+        .client
+        .send_task(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.relay_frame_id, first.relay_frame_id);
+    assert_eq!(second.accepted_at_ms, first.accepted_at_ms);
+    assert_eq!(mock.call_count(), 1);
+}
+
+#[tokio::test]
+async fn remote_target_is_not_claimable_while_publish_is_in_flight() {
+    let mut harness = RpcTestHarness::start().await;
+    let mock =
+        Arc::new(MockRelayPublisher::new().with_delay(std::time::Duration::from_millis(100)));
+    harness.runtime.router().set_publisher(mock.clone()).await;
+    let remote = PeerId::new("node-remote-in-flight").unwrap();
+    harness
+        .runtime
+        .router()
+        .set_peer_connected(&remote, true)
+        .await;
+
+    let mut send_client = harness.client.clone();
+    let remote_value = remote.to_string();
+    let send = tokio::spawn(async move {
+        send_client
+            .send_task(SendTaskRequest {
+                target_peer_id: remote_value,
+                envelope: Some(envelope("route-relay-in-flight")),
+                timeout_ms: 5_000,
+            })
+            .await
+    });
+    while mock.call_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let claim_error = harness
+        .client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: "route-relay-in-flight".to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: "local-thief".to_string(),
+            }),
+            lease_duration_ms: 30_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(claim_error.code(), Code::FailedPrecondition);
+    assert!(send.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn remote_target_remains_not_claimable_after_publish_failure() {
+    let mut harness = RpcTestHarness::start().await;
+    let mock = Arc::new(MockRelayPublisher::new().failing());
+    harness.runtime.router().set_publisher(mock).await;
+    let remote = PeerId::new("node-remote-failed-publish").unwrap();
+    harness
+        .runtime
+        .router()
+        .set_peer_connected(&remote, true)
+        .await;
+
+    assert!(harness
+        .client
+        .send_task(SendTaskRequest {
+            target_peer_id: remote.to_string(),
+            envelope: Some(envelope("route-relay-failed-publish")),
+            timeout_ms: 5_000,
+        })
+        .await
+        .is_err());
+
+    let claim_error = harness
+        .client
+        .claim_task(ClaimTaskRequest {
+            task_id: Some(TaskId {
+                value: "route-relay-failed-publish".to_string(),
+            }),
+            worker_id: Some(AgentId {
+                value: "local-thief".to_string(),
+            }),
+            lease_duration_ms: 30_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(claim_error.code(), Code::FailedPrecondition);
 }
 
 #[tokio::test]
@@ -147,6 +286,14 @@ async fn remote_task_deadline_survives_relay_delivery_into_destination_claim_res
             .with_local_peer_id(destination_peer.clone()),
     )
     .await;
+    source
+        .runtime
+        .router()
+        .set_publisher(Arc::new(
+            GrpcRelayTaskPublisher::new(relay_endpoint.clone(), source_peer.clone())
+                .with_node_token("node-deadline-source-test-token"),
+        ))
+        .await;
 
     let (_node_tx, node_rx) = mpsc::channel::<NodeFrame>(1);
     let mut relay_client = KeryxRelayClient::connect(relay_endpoint).await.unwrap();
@@ -154,6 +301,10 @@ async fn remote_task_deadline_survives_relay_delivery_into_destination_claim_res
     connect_request.metadata_mut().insert(
         NODE_ID_METADATA_KEY,
         destination_peer.as_str().parse().unwrap(),
+    );
+    connect_request.metadata_mut().insert(
+        "x-keryx-node-token",
+        "node-deadline-destination-test-token".parse().unwrap(),
     );
     let mut relay_stream = relay_client
         .connect_node(connect_request)
@@ -356,7 +507,7 @@ async fn send_task_routes_to_relay_routable_peer_without_connected_peerstore_ent
         .into_inner();
 
     assert_eq!(response.delivery_route, "relay");
-    assert_eq!(response.status, "delivered");
+    assert_eq!(response.status, "relay_accepted");
     assert_eq!(response.routed_to, remote.to_string());
     let deliveries = mock.deliveries().await;
     assert_eq!(deliveries.len(), 1);
@@ -446,7 +597,7 @@ async fn send_task_with_configured_relay_publisher_routes_unconnected_peer() {
         .into_inner();
 
     assert_eq!(response.delivery_route, "relay");
-    assert_eq!(response.status, "delivered");
+    assert_eq!(response.status, "relay_accepted");
     assert_eq!(mock.call_count(), 1);
     let peers = harness
         .client
@@ -481,6 +632,15 @@ async fn send_task_relay_failure_maps_to_unavailable() {
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable);
     assert_eq!(mock.call_count(), 1);
+    let context = harness
+        .runtime
+        .store()
+        .get_transport_context(&keryx_core::TaskId::new("route-relay-failure").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(context.expected_executor_peer_id.as_ref(), Some(&remote));
+    assert_eq!(context.destination_peer_id, remote);
+    assert!(context.relay_frame_id.is_none());
 }
 
 #[tokio::test]
@@ -491,7 +651,8 @@ async fn grpc_relay_task_publisher_publishes_to_relay_mailbox() {
     let publisher = GrpcRelayTaskPublisher::new(
         format!("http://{addr}"),
         PeerId::new("node-grpc-source").unwrap(),
-    );
+    )
+    .with_node_token("node-grpc-source-test-token");
     let remote = PeerId::new("node-grpc-mailbox").unwrap();
 
     publisher
@@ -514,7 +675,8 @@ async fn grpc_relay_task_publisher_maps_publish_failure() {
     let publisher = GrpcRelayTaskPublisher::new(
         format!("http://{addr}"),
         PeerId::new("node-grpc-source").unwrap(),
-    );
+    )
+    .with_node_token("node-grpc-source-test-token");
     let remote = PeerId::new("node-grpc-failure").unwrap();
     let mut bad_envelope = envelope("route-grpc-failure");
     bad_envelope.task_id = None;
@@ -534,8 +696,36 @@ async fn spawn_relay(runtime: Arc<RelayRuntime>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
+    let registry = Arc::new(SkillRegistry::new());
+    registry
+        .register_with_features(
+            PeerId::new("node-deadline-destination").unwrap(),
+            Vec::new(),
+            "node-deadline-destination".to_string(),
+            String::new(),
+            vec!["absolute_deadlines_v1".to_string()],
+            None,
+        )
+        .await;
+    let node_auth = Arc::new(NodeTokenAuth::new(
+        HashMap::from([
+            (
+                NodeId::new("node-deadline-source").unwrap(),
+                "node-deadline-source-test-token".to_string(),
+            ),
+            (
+                NodeId::new("node-deadline-destination").unwrap(),
+                "node-deadline-destination-test-token".to_string(),
+            ),
+            (
+                NodeId::new("node-grpc-source").unwrap(),
+                "node-grpc-source-test-token".to_string(),
+            ),
+        ]),
+        HashSet::new(),
+    ));
     tokio::spawn(async move {
-        let _ = serve_grpc_health(runtime, None, addr).await;
+        let _ = serve_grpc_health_with_auth(runtime, registry, node_auth, addr).await;
     });
     for _ in 0..40 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {

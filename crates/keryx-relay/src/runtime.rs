@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keryx_observe::RelayMetrics;
-use keryx_proto::v1::RelayFrame;
+use keryx_proto::v1::{RelayFrame, TaskEnvelope};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -20,6 +20,29 @@ pub enum FrameDelivery {
     Delivered,
     /// The target node is not currently reachable, so the frame is held in its mailbox.
     Mailboxed,
+    /// A still-active or recently acknowledged frame already owns this identity.
+    RejectedDuplicate,
+    /// The bounded ownership table cannot accept another unacknowledged frame.
+    RejectedCapacity,
+}
+
+/// Result of acknowledging a relay frame as an authenticated destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAcknowledgement {
+    /// The destination owns the frame and the acknowledgement was recorded.
+    Accepted,
+    /// The frame identifier is known, but not for the authenticated destination.
+    WrongDestination,
+    /// The relay has no record of this frame identifier.
+    UnknownFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedTaskIdentity {
+    New,
+    Retry,
+    Conflict,
+    RejectedCapacity,
 }
 
 /// Snapshot of a node identity tracked by the relay runtime.
@@ -36,8 +59,15 @@ struct PeerState {
     connected_nodes: HashMap<String, RelayFrameSender>,
     libp2p_connected_peers: HashSet<String>,
     mailboxes: HashMap<String, VecDeque<RelayFrame>>,
-    acked_frame_ids: HashSet<String>,
+    frame_destinations: HashSet<(String, String)>,
+    acknowledged_frames: HashSet<(String, String)>,
+    acknowledged_frame_order: VecDeque<(String, String)>,
+    frame_accepted_at_ms: HashMap<(String, String), i64>,
+    published_task_envelopes: HashMap<(String, String), TaskEnvelope>,
 }
+
+const MAX_TRACKED_FRAMES: usize = 8_192;
+const MAX_RECENT_ACKNOWLEDGEMENTS: usize = 8_192;
 
 /// Live operational state surfaced by health checks and metrics.
 #[derive(Debug)]
@@ -122,7 +152,7 @@ impl RelayRuntime {
             .remove(&node_id)
             .unwrap_or_default()
             .into_iter()
-            .filter(|frame| !is_acked(frame, &guard.acked_frame_ids))
+            .filter(|frame| !is_acked(&node_id, frame, &guard.acknowledged_frames))
             .collect();
         self.sync_connected_peer_metric(&guard);
         pending
@@ -145,8 +175,16 @@ impl RelayRuntime {
         let mut guard = self.lock_peers();
         guard.registered.insert(target_node_id.clone());
 
-        if is_acked(&frame, &guard.acked_frame_ids) {
-            return FrameDelivery::Delivered;
+        let frame_id = frame.frame_id.trim();
+        if !frame_id.is_empty() {
+            let key = (target_node_id.clone(), frame_id.to_string());
+            if guard.frame_destinations.contains(&key) || guard.acknowledged_frames.contains(&key) {
+                return FrameDelivery::RejectedDuplicate;
+            }
+            if guard.frame_destinations.len() >= MAX_TRACKED_FRAMES {
+                return FrameDelivery::RejectedCapacity;
+            }
+            guard.frame_destinations.insert(key);
         }
 
         if let Some(sender) = guard.connected_nodes.get(&target_node_id).cloned() {
@@ -185,31 +223,40 @@ impl RelayRuntime {
         FrameDelivery::Mailboxed
     }
 
-    /// Acknowledge a frame and remove any undelivered mailbox copies.
-    pub fn ack_frame(&self, frame_id: &str) -> bool {
+    /// Acknowledge a destination-owned frame and remove only its mailbox copy.
+    pub fn ack_frame(&self, destination_node_id: &str, frame_id: &str) -> FrameAcknowledgement {
+        let destination_node_id = destination_node_id.trim();
         let frame_id = frame_id.trim();
-        if frame_id.is_empty() {
-            return false;
+        if destination_node_id.is_empty() || frame_id.is_empty() {
+            return FrameAcknowledgement::UnknownFrame;
         }
         let mut guard = self.lock_peers();
-        guard.acked_frame_ids.insert(frame_id.to_string());
-        for mailbox in guard.mailboxes.values_mut() {
-            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        if guard.acknowledged_frames.contains(&key) {
+            return FrameAcknowledgement::Accepted;
         }
-        true
-    }
-
-    /// Compatibility acknowledgement for older task-id callers.
-    pub fn ack_task(&self, task_id: &str) -> bool {
-        let task_id = task_id.trim();
-        if task_id.is_empty() {
-            return false;
+        if !guard.frame_destinations.contains(&key) {
+            return if guard
+                .frame_destinations
+                .iter()
+                .any(|(_, known_frame_id)| known_frame_id == frame_id)
+            {
+                FrameAcknowledgement::WrongDestination
+            } else {
+                FrameAcknowledgement::UnknownFrame
+            };
         }
-        let mut guard = self.lock_peers();
-        for mailbox in guard.mailboxes.values_mut() {
-            mailbox.retain(|frame| frame_task_id(frame).as_deref() != Some(task_id));
+        guard.frame_destinations.remove(&key);
+        if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+            if let Some(position) = mailbox
+                .iter()
+                .position(|frame| frame.frame_id.trim() == frame_id)
+            {
+                mailbox.remove(position);
+            }
         }
-        true
+        remember_acknowledgement(&mut guard, key);
+        FrameAcknowledgement::Accepted
     }
 
     #[must_use]
@@ -218,6 +265,55 @@ impl RelayRuntime {
             .mailboxes
             .get(node_id)
             .map_or(0, VecDeque::len)
+    }
+
+    /// Record the immutable envelope associated with a relay-issued task frame identity.
+    pub fn classify_published_task(
+        &self,
+        destination_node_id: &str,
+        frame_id: &str,
+        task: &TaskEnvelope,
+    ) -> PublishedTaskIdentity {
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        let mut guard = self.lock_peers();
+        if let Some(existing) = guard.published_task_envelopes.get(&key) {
+            return if existing == task {
+                PublishedTaskIdentity::Retry
+            } else {
+                PublishedTaskIdentity::Conflict
+            };
+        }
+        if guard.published_task_envelopes.len() >= MAX_TRACKED_FRAMES {
+            return PublishedTaskIdentity::RejectedCapacity;
+        }
+        guard.published_task_envelopes.insert(key, task.clone());
+        PublishedTaskIdentity::New
+    }
+
+    pub fn forget_published_task(&self, destination_node_id: &str, frame_id: &str) {
+        self.lock_peers()
+            .published_task_envelopes
+            .remove(&(destination_node_id.to_string(), frame_id.to_string()));
+    }
+
+    /// Return the stable relay-acceptance time for an active or recently acknowledged frame.
+    pub fn frame_accepted_at_ms(
+        &self,
+        destination_node_id: &str,
+        frame_id: &str,
+        candidate_ms: i64,
+    ) -> Option<i64> {
+        let mut guard = self.lock_peers();
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        if !guard.frame_destinations.contains(&key) && !guard.acknowledged_frames.contains(&key) {
+            return None;
+        }
+        Some(
+            *guard
+                .frame_accepted_at_ms
+                .entry(key)
+                .or_insert(candidate_ms),
+        )
     }
 
     #[must_use]
@@ -264,15 +360,103 @@ impl RelayRuntime {
     }
 }
 
-fn is_acked(frame: &RelayFrame, acked: &HashSet<String>) -> bool {
-    !frame.frame_id.trim().is_empty() && acked.contains(frame.frame_id.trim())
+fn remember_acknowledgement(state: &mut PeerState, key: (String, String)) {
+    if state.acknowledged_frames.insert(key.clone()) {
+        state.acknowledged_frame_order.push_back(key);
+    }
+    while state.acknowledged_frame_order.len() > MAX_RECENT_ACKNOWLEDGEMENTS {
+        if let Some(expired) = state.acknowledged_frame_order.pop_front() {
+            state.acknowledged_frames.remove(&expired);
+            state.frame_accepted_at_ms.remove(&expired);
+            state.published_task_envelopes.remove(&expired);
+        }
+    }
 }
 
-fn frame_task_id(frame: &RelayFrame) -> Option<String> {
-    frame
-        .task
-        .as_ref()
-        .and_then(|task| task.task_id.as_ref())
-        .map(|task_id| task_id.value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn is_acked(
+    destination_node_id: &str,
+    frame: &RelayFrame,
+    acknowledged: &HashSet<(String, String)>,
+) -> bool {
+    let frame_id = frame.frame_id.trim();
+    !frame_id.is_empty()
+        && acknowledged.contains(&(destination_node_id.to_string(), frame_id.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(frame_id: impl Into<String>) -> RelayFrame {
+        RelayFrame {
+            frame_id: frame_id.into(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+        }
+    }
+
+    #[test]
+    fn duplicate_frame_identity_is_rejected_without_replacing_mailbox_entry() {
+        let runtime = RelayRuntime::new("relay");
+        assert_eq!(
+            runtime.route_frame("destination", frame("duplicate")),
+            FrameDelivery::Mailboxed
+        );
+        assert_eq!(
+            runtime.route_frame("destination", frame("duplicate")),
+            FrameDelivery::RejectedDuplicate
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), 1);
+    }
+
+    #[test]
+    fn frame_acknowledgement_retention_is_bounded_and_recent_duplicates_are_stable() {
+        let runtime = RelayRuntime::new("relay");
+        for index in 0..=MAX_RECENT_ACKNOWLEDGEMENTS {
+            let frame_id = format!("frame-{index}");
+            assert_eq!(
+                runtime.route_frame("destination", frame(&frame_id)),
+                FrameDelivery::Mailboxed
+            );
+            assert_eq!(
+                runtime.ack_frame("destination", &frame_id),
+                FrameAcknowledgement::Accepted
+            );
+        }
+        assert_eq!(
+            runtime.ack_frame("destination", "frame-0"),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert_eq!(
+            runtime.ack_frame(
+                "destination",
+                &format!("frame-{MAX_RECENT_ACKNOWLEDGEMENTS}")
+            ),
+            FrameAcknowledgement::Accepted
+        );
+        let guard = runtime.lock_peers();
+        assert_eq!(guard.acknowledged_frames.len(), MAX_RECENT_ACKNOWLEDGEMENTS);
+        assert_eq!(
+            guard.acknowledged_frame_order.len(),
+            MAX_RECENT_ACKNOWLEDGEMENTS
+        );
+    }
+
+    #[test]
+    fn unacknowledged_frame_ownership_is_bounded() {
+        let runtime = RelayRuntime::new("relay");
+        for index in 0..MAX_TRACKED_FRAMES {
+            assert_eq!(
+                runtime.route_frame("destination", frame(format!("frame-{index}"))),
+                FrameDelivery::Mailboxed
+            );
+        }
+        assert_eq!(
+            runtime.route_frame("destination", frame("over-capacity")),
+            FrameDelivery::RejectedCapacity
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), MAX_TRACKED_FRAMES);
+    }
 }

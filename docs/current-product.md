@@ -7,10 +7,10 @@ This page is the repository-wide map of what is implemented today. Older RFCs an
 | Component | Implemented surface |
 |---|---|
 | `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, durable task envelopes, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
-| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; authenticated terminal-result publication; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
+| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; fail-closed authenticated task/result publication; recipient-owned frame acknowledgement; relay-issued acceptance receipts; capability-gated deadline and byte-result delivery; in-memory offline mailboxes and skill registry with TTL cleanup/gossipsub sync; peer allowlist and node token authentication. |
 | `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
 | `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; durable remote worker/result loop; public task reattachment by ID for refresh/wait with fail-closed reattached cancellation; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
+| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry and protocol-feature helpers; durable remote worker/result loop; public task reattachment by ID for refresh/wait/cancel; explicit `TaskResultUnavailableError` for pre-v7 terminal rows without durable result data; verified artifact retrieval and explicit-path atomic download; AgentAnycast-compatible transition helpers. |
 | Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
 
 ## Canonical lifecycle
@@ -25,8 +25,10 @@ Operational outcomes are metadata/events rather than extra task status values:
 
 - retry requeue: `running -> pending`, increments `retry_count`, appends `RecoveryAction`
 - dead-letter: `running -> failed`, sets `dead_lettered` and `dead_letter_reason`
-- cancel: `pending` or `running` -> `failed`, marks cancellation counters and reason metadata
-- deadline expiry: `TaskEnvelope.deadline_ms` carries an absolute Unix epoch deadline across local, relay, and offline-mailbox routes; destination ingestion persists positive values into `TaskRecord.deadline_ms`, rejects negative values, and prevents expired `pending`/`running` work from being claimed
+- cancel: `pending` or `running` -> canonical durable terminal state with a persisted `Canceled` outcome; reattachment maps that outcome back to `canceled` and never reopens it as generic failure
+- deadline expiry: `TaskEnvelope.deadline_ms` carries an absolute Unix epoch deadline across local, relay, and offline-mailbox routes only when the destination advertises `absolute_deadlines_v1`; unknown or older destinations fail before relay acceptance
+- byte-bearing remote result artifacts require the origin destination to advertise `result_artifact_bytes_v1`; descriptor-only results remain compatible with older peers
+- relay acceptance receipts use authenticated source and destination identities plus a relay-issued frame ID and report `relay_accepted`; they prove relay acceptance, not execution
 - routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
 
 ## Daemon gRPC API

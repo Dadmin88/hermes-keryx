@@ -17,9 +17,8 @@ use std::time::{Duration, Instant};
 
 use keryx_core::{
     origin_result_artifact_id, should_inline, AgentId, ArtifactId, ArtifactMeta, Digest,
-    IdempotencyKey, KeryxEventType, LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId,
-    RetryPolicy, TaskId, TaskStatus, ValidationError, MAX_BLOB_BYTES,
-    MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
+    IdempotencyKey, LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId,
+    TaskStatus, ValidationError, MAX_BLOB_BYTES, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
 use keryx_proto::v1::{
@@ -70,8 +69,8 @@ pub use incoming::{
 pub use lease_recovery_loop::{LeaseRecoveryLoop, LeaseRecoveryLoopHandle};
 pub use routing::{
     routing_error_to_status, DeliveryRoute, GrpcRelayTaskPublisher, NoopRelayPublisher,
-    PeerDirectory, PeerInfo, RelayTaskPublisher, RoutingError, SendTaskOutcome, TaskRouter,
-    DEFAULT_SEND_TASK_TIMEOUT_MS,
+    PeerDirectory, PeerInfo, RelayRouteReceipt, RelayTaskPublisher, RoutingError, SendTaskOutcome,
+    TaskRouter, DEFAULT_SEND_TASK_TIMEOUT_MS,
 };
 
 const CLAIM_NEXT_SCAN_LIMIT: usize = 256;
@@ -951,7 +950,10 @@ impl KeryxDaemonRpcService {
         let candidates = self
             .runtime
             .store()
-            .pending_task_envelopes(CLAIM_NEXT_SCAN_LIMIT)
+            .claimable_pending_task_envelopes(
+                self.runtime.config().local_peer_id(),
+                CLAIM_NEXT_SCAN_LIMIT,
+            )
             .await
             .map_err(store_error_to_status)?;
         for candidate in candidates {
@@ -983,7 +985,11 @@ impl KeryxDaemonRpcService {
             match self
                 .runtime
                 .store()
-                .lease_task(candidate.task.task_id(), lease)
+                .lease_task_for_peer(
+                    candidate.task.task_id(),
+                    lease,
+                    self.runtime.config().local_peer_id(),
+                )
                 .await
             {
                 Ok(task) => {
@@ -1245,6 +1251,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
+
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
         let lease_duration_ms =
@@ -1267,7 +1274,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task = self
             .runtime
             .store()
-            .lease_task(&task_id, lease)
+            .lease_task_for_peer(&task_id, lease, self.runtime.config().local_peer_id())
             .await
             .map_err(store_error_to_status)?;
         self.runtime.metrics().increment_tasks_claimed();
@@ -1513,17 +1520,41 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("reason", tracing::field::display(&reason));
         self.runtime.cancellation().increment_cancel_requests();
+        let now_ms = unix_ms_now();
+        let result = TaskResultEnvelope {
+            protocol_version: 2,
+            task_id: Some(proto_task_id(&task_id)),
+            correlation_id: None,
+            outcome: TerminalOutcome::Canceled as i32,
+            executor_peer_id: self.runtime.config().local_peer_id().to_string(),
+            duration_ms: 0,
+            completed_at_ms: now_ms,
+            error_reason: reason.clone(),
+            result_metadata: inner.metadata,
+            output_artifacts: vec![],
+        };
         let task = self
             .runtime
             .store()
-            .accept_legacy_event(&task_id, KeryxEventType::TaskCanceled)
+            .cancel_task_with_result(
+                &task_id,
+                &reason,
+                now_ms,
+                TerminalResultRecord {
+                    task_id: task_id.clone(),
+                    encoded_result: result.encode_to_vec(),
+                    terminal_status: TaskStatus::Failed,
+                    return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+                    executor_peer_id: self.runtime.config().local_peer_id().clone(),
+                    created_at_ms: now_ms,
+                },
+            )
             .await
             .map_err(store_error_to_status)?;
         self.runtime.cancellation().increment_tasks_canceled();
-        self.runtime.metrics().increment_tasks_failed();
         Ok(Response::new(CancelTaskResponse {
             task_id: Some(proto_task_id(task.task_id())),
-            status: task_status_label(task.status).to_string(),
+            status: "canceled".to_string(),
             reason,
             canceled: true,
         }))
@@ -1686,9 +1717,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 )?;
                 Ok(Response::new(GetTaskResultResponse {
                     found: true,
-                    status: task_status_label(task.status).to_string(),
+                    status: terminal_result_status(&result)?.to_string(),
                     result: Some(result),
                     update_sequence: events.len() as u64,
+                    terminal_result_unavailable: false,
+                    data_unavailable_reason: String::new(),
                 }))
             }
             Err(StoreError::TerminalResultNotFound(_)) => {
@@ -1697,6 +1730,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                     status: task_status_label(task.status).to_string(),
                     result: None,
                     update_sequence: events.len() as u64,
+                    terminal_result_unavailable: task.status.is_terminal(),
+                    data_unavailable_reason: if task.status.is_terminal() {
+                        "terminal_result_unavailable".to_string()
+                    } else {
+                        String::new()
+                    },
                 }))
             }
             Err(error) => Err(store_error_to_status(error)),
@@ -1884,11 +1923,32 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         if outcome.route == DeliveryRoute::Local {
             self.runtime.metrics().increment_tasks_submitted();
         }
+        let route = outcome.relay_receipt;
         Ok(Response::new(SendTaskResponse {
             task_id: Some(proto_task_id(&outcome.task_id)),
             status: outcome.status,
             routed_to: outcome.routed_to.to_string(),
             delivery_route: outcome.route.as_str().to_string(),
+            relay_frame_id: route
+                .as_ref()
+                .map(|receipt| receipt.frame_id.clone())
+                .unwrap_or_default(),
+            authenticated_source_peer_id: route
+                .as_ref()
+                .map(|receipt| receipt.authenticated_source_peer_id.to_string())
+                .unwrap_or_default(),
+            accepted_destination_peer_id: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_destination_peer_id.to_string())
+                .unwrap_or_default(),
+            accepted_route: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_route.clone())
+                .unwrap_or_default(),
+            accepted_at_ms: route
+                .as_ref()
+                .map(|receipt| receipt.accepted_at_ms)
+                .unwrap_or_default(),
         }))
     }
 
@@ -2109,6 +2169,19 @@ fn canonicalize_origin_result_artifacts(
         });
     }
     Ok(stored)
+}
+
+fn terminal_result_status(result: &TaskResultEnvelope) -> Result<&'static str, Status> {
+    match TerminalOutcome::try_from(result.outcome).unwrap_or(TerminalOutcome::Unspecified) {
+        TerminalOutcome::Completed => Ok("completed"),
+        TerminalOutcome::Failed => Ok("failed"),
+        TerminalOutcome::Canceled => Ok("canceled"),
+        TerminalOutcome::TimedOut => Ok("timed_out"),
+        TerminalOutcome::Rejected => Ok("rejected"),
+        TerminalOutcome::Unspecified => Err(Status::data_loss(
+            "stored terminal result has no terminal outcome",
+        )),
+    }
 }
 
 fn terminal_outcome_status(outcome: i32) -> Result<TaskStatus, Status> {
@@ -2426,6 +2499,16 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
         StoreError::TransportContextConflict(task_id) => Status::already_exists(format!(
             "transport context conflicts for task {}",
             task_id.as_str()
+        )),
+        StoreError::TaskExecutorMismatch {
+            task_id,
+            expected,
+            actual,
+        } => Status::failed_precondition(format!(
+            "task {} targets executor {}, not local peer {}",
+            task_id.as_str(),
+            expected.as_str(),
+            actual.as_str()
         )),
         StoreError::TransportContextTaskMismatch {
             task_id,

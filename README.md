@@ -10,6 +10,7 @@ It provides:
 - operator CLI (`keryx`)
 - Python SDK (`keryx`) for Hermes Agency and standalone clients
 - cancellation, deadlines, artifacts, backpressure, routing policy, and migration tooling
+- fail-closed relay mutation authentication, recipient-bound acknowledgements, relay-acceptance receipts, negotiated deadline/byte-result features, and explicit historical-result unavailability
 
 **Hermes Agency** uses Keryx as its primary transport. The Keryx Python SDK may also be vendored into Hermes Agency under `src/keryx/` for packaging; this repository remains the source of truth for Rust crates, protobufs, and SDK evolution.
 

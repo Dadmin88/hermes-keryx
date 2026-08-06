@@ -242,7 +242,10 @@ async fn dispatch_to_local_worker(
         leased_at_ms,
         expires_at_ms,
     );
-    runtime.store().lease_task(task_id, lease).await?;
+    runtime
+        .store()
+        .lease_task_for_peer(task_id, lease, runtime.config().local_peer_id())
+        .await?;
     Ok(lease_id)
 }
 

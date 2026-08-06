@@ -37,6 +37,7 @@ pub struct Registration {
     pub skills: Vec<StoredSkill>,
     pub name: String,
     pub description: String,
+    pub protocol_features: Vec<String>,
     pub expires_at: Instant,
     pub expires_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -62,6 +63,8 @@ struct GossipRegistration {
     skills: Vec<StoredSkill>,
     name: String,
     description: String,
+    #[serde(default)]
+    protocol_features: Vec<String>,
     expires_at_unix_ms: u64,
     updated_at_unix_ms: u64,
 }
@@ -123,8 +126,33 @@ impl SkillRegistry {
         description: String,
         ttl: Option<Duration>,
     ) {
-        let registration = self.registration_for(peer_id, skills, name, description, ttl);
+        self.register_with_features(peer_id, skills, name, description, Vec::new(), ttl)
+            .await;
+    }
+
+    pub async fn register_with_features(
+        &self,
+        peer_id: PeerId,
+        skills: Vec<StoredSkill>,
+        name: String,
+        description: String,
+        protocol_features: Vec<String>,
+        ttl: Option<Duration>,
+    ) {
+        let mut registration = self.registration_for(peer_id, skills, name, description, ttl);
+        registration.protocol_features = protocol_features;
         self.upsert_registration(registration, true).await;
+    }
+
+    pub async fn supports_protocol_feature(&self, peer_id: &PeerId, feature: &str) -> bool {
+        let mut guard = self.inner.write().await;
+        guard.purge_expired_locked();
+        guard.nodes.get(peer_id).is_some_and(|registration| {
+            registration
+                .protocol_features
+                .iter()
+                .any(|candidate| candidate == feature)
+        })
     }
 
     /// Ensure a peer appears in the registry even before it has published skills.
@@ -380,6 +408,7 @@ impl SkillRegistry {
             skills,
             name,
             description,
+            protocol_features: Vec::new(),
             expires_at: Instant::now() + ttl,
             expires_at_unix_ms: now_ms + millis_u64(ttl),
             updated_at_unix_ms: now_ms,
@@ -477,6 +506,7 @@ impl From<&Registration> for GossipRegistration {
             skills: reg.skills.clone(),
             name: reg.name.clone(),
             description: reg.description.clone(),
+            protocol_features: reg.protocol_features.clone(),
             expires_at_unix_ms: reg.expires_at_unix_ms,
             updated_at_unix_ms: reg.updated_at_unix_ms,
         }
@@ -491,6 +521,7 @@ impl GossipRegistration {
             skills: self.skills,
             name: self.name,
             description: self.description,
+            protocol_features: self.protocol_features,
             expires_at: instant_from_unix_ms(self.expires_at_unix_ms),
             expires_at_unix_ms: self.expires_at_unix_ms,
             updated_at_unix_ms: self.updated_at_unix_ms,

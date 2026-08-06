@@ -15,6 +15,9 @@ message Registration {
   string name = 3;
   string description = 4;
   Timestamp expires_at = 5;
+  // Additive transport features supported by this peer (for example,
+  // "absolute_deadlines_v1" or "result_artifact_bytes_v1").
+  repeated string protocol_features = 6;
 }
 
 message RegisterSkillsRequest {
@@ -23,6 +26,7 @@ message RegisterSkillsRequest {
   string name = 3;
   string description = 4;
   uint64 ttl_seconds = 5;
+  repeated string protocol_features = 6;
 }
 
 message RegisterSkillsResponse {

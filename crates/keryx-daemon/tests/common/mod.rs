@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use keryx_core::PeerId;
 use keryx_daemon::{
-    serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime, RelayTaskPublisher, RoutingError,
+    serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime, RelayRouteReceipt, RelayTaskPublisher,
+    RoutingError,
 };
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::TaskEnvelope;
@@ -132,7 +133,7 @@ impl RelayTaskPublisher for MockRelayPublisher {
         target_peer_id: &PeerId,
         envelope: TaskEnvelope,
         _timeout: Duration,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<RelayRouteReceipt, RoutingError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         if self.delay > Duration::ZERO {
             tokio::time::sleep(self.delay).await;
@@ -151,7 +152,13 @@ impl RelayTaskPublisher for MockRelayPublisher {
         self.deliveries
             .lock()
             .await
-            .push((target_peer_id.as_str().to_string(), task_id));
-        Ok(())
+            .push((target_peer_id.as_str().to_string(), task_id.clone()));
+        Ok(RelayRouteReceipt {
+            frame_id: format!("relay-test-{task_id}"),
+            authenticated_source_peer_id: PeerId::new("peer-local")?,
+            accepted_destination_peer_id: target_peer_id.clone(),
+            accepted_route: "relay".to_string(),
+            accepted_at_ms: 1,
+        })
     }
 }

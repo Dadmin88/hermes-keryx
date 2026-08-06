@@ -93,6 +93,8 @@ message GetTaskResultResponse {
   string status = 2;
   TaskResultEnvelope result = 3;
   uint64 update_sequence = 4;
+  bool terminal_result_unavailable = 5;
+  string data_unavailable_reason = 6;
 }
 message ClaimNextResultDeliveryRequest {
   string worker_id = 1;
@@ -264,6 +266,11 @@ message SendTaskResponse {
   string status = 2;
   string routed_to = 3;
   string delivery_route = 4;
+  string relay_frame_id = 5;
+  string authenticated_source_peer_id = 6;
+  string accepted_destination_peer_id = 7;
+  string accepted_route = 8;
+  int64 accepted_at_ms = 9;
 }
 
 message ListPeersRequest {}

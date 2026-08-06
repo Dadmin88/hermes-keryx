@@ -46,7 +46,14 @@ message PublishTaskRequest {
   string target_node_id = 2;
   string source_node_id = 3;
 }
-message PublishTaskResponse { TaskId task_id = 1; string frame_id = 2; }
+message PublishTaskResponse {
+  TaskId task_id = 1;
+  string frame_id = 2;
+  string authenticated_source_peer_id = 3;
+  string accepted_destination_peer_id = 4;
+  string accepted_route = 5;
+  int64 accepted_at_ms = 6;
+}
 message PublishResultRequest {
   TaskResultEnvelope result = 1;
   string target_node_id = 2;

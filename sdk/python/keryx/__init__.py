@@ -12,10 +12,18 @@ from keryx.models import (
 )
 from keryx.node import KeryxNode
 from keryx.registration import deregister_agent, register_agent
-from keryx.task import IncomingTask, SubmissionReceipt, Task, TaskHandle, TaskStatus
+from keryx.task import (
+    IncomingTask,
+    SubmissionReceipt,
+    Task,
+    TaskHandle,
+    TaskResultUnavailableError,
+    TaskStatus,
+)
 
 __all__ = [
     "KeryxNode",
+    "TaskResultUnavailableError",
     "KeryxConfig",
     "load_config",
     "TaskState",

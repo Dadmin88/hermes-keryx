@@ -1682,6 +1682,7 @@ dependencies = [
  "rcgen 0.13.2",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1689,6 +1690,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

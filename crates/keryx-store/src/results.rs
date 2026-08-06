@@ -221,6 +221,70 @@ fn ensure_context_task(context: &TaskTransportContextRecord, task_id: &TaskId) -
 }
 
 impl InMemoryStore {
+    pub fn cancel_task_with_result(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+        result: TerminalResultRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_result_task(&result, task_id)?;
+        result.validate()?;
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        if task.status == TaskStatus::Running {
+            let active = state
+                .leases
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        if state.terminal_results.contains_key(task_id) {
+            return Err(StoreError::TerminalResultConflict(task_id.clone()));
+        }
+        if result.terminal_status != transition.to {
+            return Err(StoreError::TerminalResultNotTerminal(task_id.clone()));
+        }
+        let mut updated = task;
+        updated.status = transition.to;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            &mut state,
+            task_id,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), updated.clone());
+        state.terminal_results.insert(task_id.clone(), result);
+        Ok(updated)
+    }
+
+    pub fn put_transport_context(
+        &self,
+        context: TaskTransportContextRecord,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let mut state = self.lock()?;
+        if !state.tasks.contains_key(&context.task_id) {
+            return Err(StoreError::TaskNotFound(context.task_id));
+        }
+        match state.transport_contexts.get(&context.task_id) {
+            Some(existing) if existing == &context => return Ok(existing.clone()),
+            Some(_) => return Err(StoreError::TransportContextConflict(context.task_id)),
+            None => {}
+        }
+        state
+            .transport_contexts
+            .insert(context.task_id.clone(), context.clone());
+        Ok(context)
+    }
+
     pub fn accept_task_with_envelope_and_context(
         &self,
         task: TaskRecord,
@@ -384,6 +448,136 @@ impl InMemoryStore {
 }
 
 impl SqliteStore {
+    pub async fn cancel_task_with_result(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+        result: TerminalResultRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_result_task(&result, task_id)?;
+        result.validate()?;
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        if task.status == TaskStatus::Running {
+            let active = fetch_active_lease_with_executor(&mut tx, task_id)
+                .await?
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        if fetch_terminal_result_optional(&mut tx, task_id)
+            .await?
+            .is_some()
+        {
+            return Err(StoreError::TerminalResultConflict(task_id.clone()));
+        }
+        if result.terminal_status != transition.to {
+            return Err(StoreError::TerminalResultNotTerminal(task_id.clone()));
+        }
+        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+        deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
+        update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
+        insert_event(
+            &mut tx,
+            task_id,
+            sequence,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        )
+        .await?;
+        insert_terminal_result_only(&mut tx, &result).await?;
+        tx.commit().await?;
+        self.get_task(task_id).await
+    }
+
+    pub async fn put_transport_context(
+        &self,
+        context: TaskTransportContextRecord,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let mut tx = self.pool.begin().await?;
+        match fetch_task_with_executor(&mut tx, &context.task_id).await {
+            Ok(_) => {}
+            Err(StoreError::TaskNotFound(_)) => {
+                return Err(StoreError::TaskNotFound(context.task_id));
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(existing) = fetch_transport_context_optional(&mut tx, &context.task_id).await? {
+            if existing == context {
+                tx.commit().await?;
+                return Ok(existing);
+            }
+            return Err(StoreError::TransportContextConflict(context.task_id));
+        }
+        insert_transport_context(&mut tx, &context).await?;
+        tx.commit().await?;
+        Ok(context)
+    }
+
+    pub async fn record_relay_receipt(
+        &self,
+        task_id: &TaskId,
+        authenticated_source_peer_id: &PeerId,
+        accepted_destination_peer_id: &PeerId,
+        relay_frame_id: &str,
+        accepted_at_ms: i64,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let frame_id = relay_frame_id.trim();
+        if frame_id.is_empty() {
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut context = fetch_transport_context_optional(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TransportContextNotFound(task_id.clone()))?;
+        if context.expected_executor_peer_id.as_ref() != Some(accepted_destination_peer_id)
+            || context.destination_peer_id != *accepted_destination_peer_id
+        {
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        if let Some(existing_frame_id) = context.relay_frame_id.as_deref() {
+            if existing_frame_id == frame_id
+                && context.authenticated_sender_peer_id.as_ref()
+                    == Some(authenticated_source_peer_id)
+                && context.received_at_ms == accepted_at_ms
+            {
+                tx.commit().await?;
+                return Ok(context);
+            }
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        let update = sqlx::query(
+            "UPDATE task_transport_context SET authenticated_sender_peer_id = ?, relay_frame_id = ?, received_at_ms = ? WHERE task_id = ? AND relay_frame_id IS NULL",
+        )
+        .bind(authenticated_source_peer_id.as_str())
+        .bind(frame_id)
+        .bind(accepted_at_ms)
+        .bind(task_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if update.rows_affected() != 1 {
+            let existing = fetch_transport_context_optional(&mut tx, task_id)
+                .await?
+                .ok_or_else(|| StoreError::TransportContextNotFound(task_id.clone()))?;
+            if existing.relay_frame_id.as_deref() == Some(frame_id)
+                && existing.authenticated_sender_peer_id.as_ref()
+                    == Some(authenticated_source_peer_id)
+                && existing.received_at_ms == accepted_at_ms
+            {
+                tx.commit().await?;
+                return Ok(existing);
+            }
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        context.authenticated_sender_peer_id = Some(authenticated_source_peer_id.clone());
+        context.relay_frame_id = Some(frame_id.to_string());
+        context.received_at_ms = accepted_at_ms;
+        tx.commit().await?;
+        Ok(context)
+    }
+
     pub async fn accept_task_with_envelope_and_context(
         &self,
         task: TaskRecord,

@@ -52,6 +52,7 @@ async def test_discover_falls_back_to_bounded_full_registry_scan() -> None:
             "agent_name": "Local Agent",
             "agent_description": "local",
             "skills": ["other", "hermes-chat"],
+            "protocol_features": [],
         }
     ]
     assert [request.skill_id for request in registry.requests] == ["hermes-chat", ""]

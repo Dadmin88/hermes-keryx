@@ -357,9 +357,6 @@ async fn register_node_skills(registry_peer_id: &str) -> Result<()> {
         return Ok(());
     };
     let skills = skills_from_env();
-    if skills.is_empty() {
-        return Ok(());
-    }
 
     let mut client = connect_registry_client(&endpoint).await?;
     let mut request = Request::new(RegisterSkillsRequest {
@@ -371,6 +368,10 @@ async fn register_node_skills(registry_peer_id: &str) -> Result<()> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(300),
+        protocol_features: vec![
+            "absolute_deadlines_v1".to_string(),
+            "result_artifact_bytes_v1".to_string(),
+        ],
     });
     add_node_auth_metadata(&mut request, registry_peer_id, node_token().as_deref())?;
     client

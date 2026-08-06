@@ -50,6 +50,17 @@ pub struct SendTaskOutcome {
     pub status: String,
     pub routed_to: PeerId,
     pub route: DeliveryRoute,
+    pub relay_receipt: Option<RelayRouteReceipt>,
+}
+
+/// Relay-issued evidence that an exact frame was accepted for an exact destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRouteReceipt {
+    pub frame_id: String,
+    pub authenticated_source_peer_id: PeerId,
+    pub accepted_destination_peer_id: PeerId,
+    pub accepted_route: String,
+    pub accepted_at_ms: i64,
 }
 
 /// Connected peer snapshot returned by [`PeerDirectory::list_peers`].
@@ -92,7 +103,7 @@ pub trait RelayTaskPublisher: Send + Sync {
         target_peer_id: &PeerId,
         envelope: TaskEnvelope,
         timeout: Duration,
-    ) -> Result<(), RoutingError>;
+    ) -> Result<RelayRouteReceipt, RoutingError>;
 }
 
 /// No-op publisher used when the daemon has no relay session.
@@ -110,7 +121,7 @@ impl RelayTaskPublisher for NoopRelayPublisher {
         _target_peer_id: &PeerId,
         _envelope: TaskEnvelope,
         _timeout: Duration,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<RelayRouteReceipt, RoutingError> {
         Err(RoutingError::RelayUnavailable)
     }
 }
@@ -136,6 +147,13 @@ impl GrpcRelayTaskPublisher {
                 .filter(|value| !value.is_empty()),
             ca_cert_path: ca_cert_path_from_env(),
         }
+    }
+
+    #[must_use]
+    pub fn with_node_token(mut self, node_token: impl Into<String>) -> Self {
+        let node_token = node_token.into();
+        self.node_token = (!node_token.trim().is_empty()).then_some(node_token);
+        self
     }
 
     async fn connect(
@@ -166,7 +184,7 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         target_peer_id: &PeerId,
         mut envelope: TaskEnvelope,
         _timeout: Duration,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<RelayRouteReceipt, RoutingError> {
         envelope.metadata.insert(
             "target_node_id".to_string(),
             target_peer_id.as_str().to_string(),
@@ -196,10 +214,9 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
                 })?,
             );
         }
-        client
+        let response = client
             .publish_task(request)
             .await
-            .map(|_| ())
             .map_err(|status| RoutingError::RelayFailed {
                 peer_id: target_peer_id.to_string(),
                 reason: format!(
@@ -207,8 +224,41 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
                     status.code(),
                     status.message()
                 ),
-            })
+            })?
+            .into_inner();
+        let receipt = RelayRouteReceipt {
+            frame_id: response.frame_id.trim().to_string(),
+            authenticated_source_peer_id: PeerId::new(
+                response.authenticated_source_peer_id.trim(),
+            )?,
+            accepted_destination_peer_id: PeerId::new(
+                response.accepted_destination_peer_id.trim(),
+            )?,
+            accepted_route: response.accepted_route.trim().to_string(),
+            accepted_at_ms: response.accepted_at_ms,
+        };
+        validate_relay_receipt(&receipt, &self.source_peer_id, target_peer_id)?;
+        Ok(receipt)
     }
+}
+
+fn validate_relay_receipt(
+    receipt: &RelayRouteReceipt,
+    expected_source: &PeerId,
+    expected_destination: &PeerId,
+) -> Result<(), RoutingError> {
+    if receipt.frame_id.is_empty()
+        || receipt.authenticated_source_peer_id != *expected_source
+        || receipt.accepted_destination_peer_id != *expected_destination
+        || receipt.accepted_route != "relay"
+        || receipt.accepted_at_ms <= 0
+    {
+        return Err(RoutingError::RelayFailed {
+            peer_id: expected_destination.to_string(),
+            reason: "relay returned an invalid route receipt".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Tracks the local peer id and relay-connected remote peers.
@@ -591,6 +641,7 @@ impl TaskRouter {
                     status: "awaiting_approval".to_string(),
                     routed_to: target_peer_id,
                     route: DeliveryRoute::AwaitingApproval,
+                    relay_receipt: None,
                 });
             }
         }
@@ -602,6 +653,7 @@ impl TaskRouter {
                 status: outcome.status,
                 routed_to: target_peer_id,
                 route: DeliveryRoute::Local,
+                relay_receipt: None,
             });
         }
 
@@ -618,17 +670,60 @@ impl TaskRouter {
         record.deadline_ms = deadline_ms;
         let now_ms = unix_ms_now();
         let envelope_record = TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, now_ms);
-        let context = TaskTransportContextRecord {
-            task_id: task_id.clone(),
-            authenticated_sender_peer_id: None,
-            expected_executor_peer_id: Some(target_peer_id.clone()),
-            destination_peer_id: self.peers.local_peer_id().clone(),
-            relay_frame_id: Some(format!("relay-{}", task_id.as_str())),
-            received_at_ms: now_ms,
+        let existing_intent = match store.get_task(&task_id).await {
+            Ok(existing) => {
+                if existing != record {
+                    return Err(StoreError::TaskAlreadyExists(task_id.clone()).into());
+                }
+                let stored_envelope = store.get_task_envelope(&task_id).await?;
+                if stored_envelope.encoded_envelope != envelope_record.encoded_envelope {
+                    return Err(StoreError::TaskEnvelopeConflict(task_id.clone()).into());
+                }
+                let context = store.get_transport_context(&task_id).await?;
+                if context.expected_executor_peer_id.as_ref() != Some(&target_peer_id)
+                    || context.destination_peer_id != target_peer_id
+                {
+                    return Err(StoreError::TransportContextConflict(task_id.clone()).into());
+                }
+                if let Some(frame_id) = context.relay_frame_id {
+                    let authenticated_source_peer_id = context
+                        .authenticated_sender_peer_id
+                        .ok_or_else(|| StoreError::TransportContextConflict(task_id.clone()))?;
+                    return Ok(SendTaskOutcome {
+                        task_id,
+                        status: "relay_accepted".to_string(),
+                        routed_to: target_peer_id.clone(),
+                        route: DeliveryRoute::Relay,
+                        relay_receipt: Some(RelayRouteReceipt {
+                            frame_id,
+                            authenticated_source_peer_id,
+                            accepted_destination_peer_id: target_peer_id,
+                            accepted_route: "relay".to_string(),
+                            accepted_at_ms: context.received_at_ms,
+                        }),
+                    });
+                }
+                true
+            }
+            Err(StoreError::TaskNotFound(_)) => false,
+            Err(error) => return Err(error.into()),
         };
-        store
-            .accept_task_with_envelope_and_context(record, envelope_record, context)
-            .await?;
+        if !existing_intent {
+            store
+                .accept_task_with_envelope_and_context(
+                    record,
+                    envelope_record,
+                    TaskTransportContextRecord {
+                        task_id: task_id.clone(),
+                        authenticated_sender_peer_id: Some(self.peers.local_peer_id().clone()),
+                        expected_executor_peer_id: Some(target_peer_id.clone()),
+                        destination_peer_id: target_peer_id.clone(),
+                        relay_frame_id: None,
+                        received_at_ms: now_ms,
+                    },
+                )
+                .await?;
+        }
 
         let timeout = normalize_timeout(timeout_ms, self.default_timeout_ms);
         let delivery = tokio::time::timeout(
@@ -638,12 +733,24 @@ impl TaskRouter {
         .await;
 
         match delivery {
-            Ok(Ok(())) => Ok(SendTaskOutcome {
-                task_id,
-                status: "delivered".to_string(),
-                routed_to: target_peer_id,
-                route: DeliveryRoute::Relay,
-            }),
+            Ok(Ok(receipt)) => {
+                store
+                    .record_relay_receipt(
+                        &task_id,
+                        &receipt.authenticated_source_peer_id,
+                        &receipt.accepted_destination_peer_id,
+                        &receipt.frame_id,
+                        receipt.accepted_at_ms,
+                    )
+                    .await?;
+                Ok(SendTaskOutcome {
+                    task_id,
+                    status: "relay_accepted".to_string(),
+                    routed_to: target_peer_id,
+                    route: DeliveryRoute::Relay,
+                    relay_receipt: Some(receipt),
+                })
+            }
             Ok(Err(error)) => Err(error),
             Err(_elapsed) => Err(RoutingError::Timeout {
                 peer_id: target_peer_id.to_string(),
@@ -928,7 +1035,7 @@ pub mod test_support {
             target_peer_id: &PeerId,
             envelope: TaskEnvelope,
             _timeout: Duration,
-        ) -> Result<(), RoutingError> {
+        ) -> Result<RelayRouteReceipt, RoutingError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             if self.delay > Duration::ZERO {
                 tokio::time::sleep(self.delay).await;
@@ -947,8 +1054,14 @@ pub mod test_support {
             self.deliveries
                 .lock()
                 .await
-                .push((target_peer_id.to_string(), task_id));
-            Ok(())
+                .push((target_peer_id.to_string(), task_id.clone()));
+            Ok(RelayRouteReceipt {
+                frame_id: format!("relay-test-{task_id}"),
+                authenticated_source_peer_id: PeerId::new("peer-local")?,
+                accepted_destination_peer_id: target_peer_id.clone(),
+                accepted_route: "relay".to_string(),
+                accepted_at_ms: 1,
+            })
         }
     }
 }

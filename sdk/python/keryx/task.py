@@ -35,6 +35,15 @@ class SubmissionReceipt:
     status: str
     routed_to: str
     delivery_route: str
+    relay_frame_id: str | None = None
+    authenticated_source_peer_id: str | None = None
+    accepted_destination_peer_id: str | None = None
+    accepted_route: str | None = None
+    accepted_at_ms: int | None = None
+
+
+class TaskResultUnavailableError(RuntimeError):
+    """A terminal lifecycle exists but its durable result was never stored."""
 
 
 @dataclass
@@ -126,6 +135,7 @@ class TaskHandle:
         self._poll_interval = max(0.01, poll_interval)
         self._max_poll_interval = max(self._poll_interval, max_poll_interval)
         self._done = asyncio.Event()
+        self._terminal_error: TaskResultUnavailableError | None = None
         if task.status.is_terminal:
             self._done.set()
 
@@ -142,8 +152,15 @@ class TaskHandle:
         return self._receipt
 
     async def refresh(self) -> Task:
+        if self._terminal_error is not None:
+            raise self._terminal_error
         if self._refresh_fn is not None and not self._task.status.is_terminal:
-            self._task = await self._refresh_fn()
+            try:
+                self._task = await self._refresh_fn()
+            except TaskResultUnavailableError as error:
+                self._terminal_error = error
+                self._done.set()
+                raise
             if self._task.status.is_terminal:
                 self._done.set()
         return self._task

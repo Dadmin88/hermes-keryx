@@ -8,7 +8,13 @@ import pytest
 
 from hermes.keryx.v1 import common_pb2, daemon_pb2
 
-from keryx import AgentCard, KeryxNode, Skill, SubmissionReceipt
+from keryx import (
+    AgentCard,
+    KeryxNode,
+    Skill,
+    SubmissionReceipt,
+    TaskResultUnavailableError,
+)
 from keryx.client import DaemonClient
 
 
@@ -24,7 +30,12 @@ def started_node(monkeypatch: pytest.MonkeyPatch) -> tuple[KeryxNode, AsyncMock]
             task_id=common_pb2.TaskId(value="task-abc"),
             status="submitted",
             routed_to="peer-remote",
-            delivery_route="local",
+            delivery_route="relay",
+            relay_frame_id="relay-frame-abc",
+            authenticated_source_peer_id="peer-sender",
+            accepted_destination_peer_id="peer-remote",
+            accepted_route="relay",
+            accepted_at_ms=1_800_000_000_000,
         )
     )
     monkeypatch.setattr("keryx.node.DaemonClient", lambda **kwargs: client)
@@ -46,7 +57,12 @@ async def test_send_task_to_mock_daemon(
         task_id="task-abc",
         status="submitted",
         routed_to="peer-remote",
-        delivery_route="local",
+        delivery_route="relay",
+        relay_frame_id="relay-frame-abc",
+        authenticated_source_peer_id="peer-sender",
+        accepted_destination_peer_id="peer-remote",
+        accepted_route="relay",
+        accepted_at_ms=1_800_000_000_000,
     )
     assert handle.receipt == expected_receipt
     with pytest.raises(FrozenInstanceError):
@@ -55,6 +71,37 @@ async def test_send_task_to_mock_daemon(
     kwargs = client.send_task.await_args.kwargs
     assert kwargs["target_peer_id"] == "peer-remote"
     assert kwargs["message_text"] == "hi"
+    await node.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_terminal_without_durable_result_raises_stable_error(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    client.get_task_result = AsyncMock(
+        return_value=daemon_pb2.GetTaskResultResponse(
+            found=False,
+            status="completed",
+            terminal_result_unavailable=True,
+            data_unavailable_reason="terminal_result_unavailable",
+        )
+    )
+    await node.start()
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "legacy"}]},
+        peer_id="peer-remote",
+    )
+    with pytest.raises(
+        TaskResultUnavailableError,
+        match="terminal_result_unavailable",
+    ):
+        await handle.wait(timeout=1)
+    assert handle.status.value == "completed"
+    with pytest.raises(TaskResultUnavailableError):
+        await handle.wait(timeout=1)
+    with pytest.raises(TaskResultUnavailableError):
+        await handle.refresh()
     await node.stop()
 
 

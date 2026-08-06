@@ -23,6 +23,10 @@ pub const DEFAULT_REGISTRATION_TTL_SECONDS: u64 = 60;
 
 /// Seconds before expiry to re-register when TTL is [`DEFAULT_REGISTRATION_TTL_SECONDS`].
 pub const DEFAULT_REFRESH_LEAD_SECONDS: u64 = 5;
+pub const ABSOLUTE_DEADLINES_FEATURE: &str = "absolute_deadlines_v1";
+pub const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
+pub const SUPPORTED_PROTOCOL_FEATURES: &[&str] =
+    &[ABSOLUTE_DEADLINES_FEATURE, RESULT_ARTIFACT_BYTES_FEATURE];
 
 /// A skill advertised by this daemon in the relay registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +128,6 @@ impl DiscoveryHandle {
         let Some(registration) = self.registration.clone() else {
             return Ok(());
         };
-        if registration.skills.is_empty() {
-            return Ok(());
-        }
 
         self.register_now(&registration).await?;
 
@@ -295,6 +296,10 @@ async fn register_peer(
             name: registration.name.clone(),
             description: registration.description.clone(),
             ttl_seconds: registration.ttl_seconds,
+            protocol_features: SUPPORTED_PROTOCOL_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
         },
         peer_id,
         node_token,

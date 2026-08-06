@@ -74,7 +74,7 @@ Native `KeryxNode` daemon methods:
 
 Public exports include:
 
-- `KeryxNode`, `KeryxConfig`, `load_config`
+- `KeryxNode`, `KeryxConfig`, `load_config`, `TaskResultUnavailableError`
 - `AgentCard`, `Skill`
 - `Task`, `TaskHandle`, `IncomingTask`, `TaskStatus`
 - `TaskState`, `TaskResult`, `TaskArtifact`
@@ -103,12 +103,13 @@ Compatibility notes:
 - `send_task(..., skill="...")` resolves the first registry match.
 - `send_task(..., deadline_ms=...)` accepts `0` for no execution deadline or a positive signed 64-bit absolute Unix epoch timestamp. It is not the relay delivery `timeout_ms`.
 - `send_task(..., url="...")` is not implemented.
-- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. `node.task_handle(task_id)` reopens the durable status/result view after controller restart; reopened handles intentionally have no submission receipt and fail closed on `cancel()` because the four-state store cannot distinguish persisted cancellation from failure. Bounded artifact bytes traverse the authenticated result route and can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact(..., path=...)`.
+- The returned compatibility `TaskHandle` polls the origin daemon's durable result record; `wait()` receives remote terminal state and canonical artifact descriptors. `node.task_handle(task_id)` reopens the durable status/result view after controller restart. Canceled and rejected outcomes remain stable during reattachment. Pre-v7 terminal rows that lack durable result data raise `TaskResultUnavailableError` instead of fabricating a result or reopening the task. Bounded artifact bytes traverse the authenticated result route only when the origin advertises `result_artifact_bytes_v1`; they can be retrieved with `get_artifact()` or written only to an explicit caller-selected path with `download_artifact(..., path=...)`.
 - `serve_forever()` claims compatible durable tasks, invokes registered `on_task()` handlers, heartbeats active leases, and persists completion/failure.
 - Authenticated relay task/result routing and the permanent two-node proof were completed in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) by [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29).
 - `Skill.tags` round-trips through card dictionaries, registry publication, and discovery.
 - Registry registration and deregistration are owner-authenticated. The SDK sends the local peer ID and `node_token=` (or `HERMES_KERYX_NODE_TOKEN`) only as gRPC metadata; the relay rejects missing, invalid, revoked, or body/metadata-mismatched credentials. Remote registry endpoints must use `https://`; plaintext is accepted only on loopback. Set `HERMES_KERYX_REGISTRY_CA_CERT` to a PEM CA file for a private certificate authority. Credential-bearing clients cannot inject an arbitrary registry channel; provide the endpoint and optional CA so the SDK can enforce transport security. Skill discovery remains read-only and does not require node credentials.
-- `send_task()` retains the daemon's exact `status`, `routed_to`, and `delivery_route` fields in an immutable `SubmissionReceipt` on the returned handle.
+- `send_task()` retains the daemon's exact routing fields and relay acceptance metadata in an immutable `SubmissionReceipt`. A `relay_accepted` receipt proves relay acceptance only, not remote execution. Absolute deadlines require destination feature `absolute_deadlines_v1`; incapable or unknown peers fail explicitly rather than silently dropping the deadline.
+- `AgentCard.protocol_features` round-trips through dictionaries, registration, discovery, and `get_card()`; current clients advertise `absolute_deadlines_v1` and `result_artifact_bytes_v1`.
 - `register_skills()` remains a one-shot primitive. `start_registration()` registers immediately, then makes best-effort refresh attempts before TTL expiry and retries after rejection or registry errors. `registration_status()` reports lifecycle health and pending cleanup; a prolonged outage can still let the registry lease expire. Registry mutations use finite RPC deadlines. One stop budget spans refresh cancellation acknowledgement and deregistration. Work exceeding that budget continues as tracked cleanup, blocks restart, and preserves refresh-before-deregister ordering. During node shutdown, ownership of the registry client transfers to pending cleanup so accepted deregistration and client close can finish in order.
 - `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
 

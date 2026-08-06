@@ -132,6 +132,7 @@ async fn grpc_registry_tls_accepts_authenticated_mutation() {
                 name: "TLS worker".into(),
                 description: "encrypted registry mutation".into(),
                 ttl_seconds: 60,
+                protocol_features: Vec::new(),
             },
             "p1",
         ))
@@ -156,6 +157,7 @@ async fn grpc_registry_mutations_fail_closed_without_node_auth() {
             name: "Unauthenticated".into(),
             description: "must not be stored".into(),
             ttl_seconds: 60,
+            protocol_features: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -187,6 +189,7 @@ async fn grpc_registry_mutations_require_authenticated_owner_identity() {
                 name: "owner".into(),
                 description: "".into(),
                 ttl_seconds: 300,
+                protocol_features: Vec::new(),
             },
             "p2",
         ))
@@ -200,6 +203,7 @@ async fn grpc_registry_mutations_require_authenticated_owner_identity() {
             name: "missing".into(),
             description: "".into(),
             ttl_seconds: 300,
+            protocol_features: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -212,6 +216,7 @@ async fn grpc_registry_mutations_require_authenticated_owner_identity() {
             name: "invalid".into(),
             description: "".into(),
             ttl_seconds: 300,
+            protocol_features: Vec::new(),
         },
         "p1",
     );
@@ -227,6 +232,7 @@ async fn grpc_registry_mutations_require_authenticated_owner_identity() {
         name: "malformed".into(),
         description: "".into(),
         ttl_seconds: 300,
+        protocol_features: Vec::new(),
     });
     malformed_register
         .metadata_mut()
@@ -264,6 +270,7 @@ async fn grpc_registry_mutations_require_authenticated_owner_identity() {
                 name: "forged".into(),
                 description: "".into(),
                 ttl_seconds: 300,
+                protocol_features: Vec::new(),
             },
             "p1",
         ))
@@ -312,6 +319,7 @@ async fn grpc_register_and_discover_skill() {
                 name: "Py Agent".into(),
                 description: "runs python".into(),
                 ttl_seconds: 60,
+                protocol_features: Vec::new(),
             },
             "peer-grpc",
         ))
@@ -351,6 +359,7 @@ async fn grpc_discover_filters_tags_and_limit() {
                     name: peer.into(),
                     description: "".into(),
                     ttl_seconds: 0,
+                    protocol_features: Vec::new(),
                 },
                 peer,
             ))
@@ -397,6 +406,7 @@ async fn grpc_unregister_and_ttl() {
                 name: "tmp".into(),
                 description: "".into(),
                 ttl_seconds: 1,
+                protocol_features: Vec::new(),
             },
             "peer-ttl-grpc",
         ))
@@ -423,6 +433,7 @@ async fn grpc_unregister_and_ttl() {
                 name: "x".into(),
                 description: "".into(),
                 ttl_seconds: 300,
+                protocol_features: Vec::new(),
             },
             "peer-drop",
         ))

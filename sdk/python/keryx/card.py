@@ -62,6 +62,7 @@ class AgentCard:
     version: str = "1.0.0"
     protocol_version: str = "a2a/0.3"
     skills: list[Skill] = field(default_factory=list)
+    protocol_features: list[str] = field(default_factory=list)
     peer_id: str | None = None
     did_key: str | None = None
 
@@ -72,6 +73,7 @@ class AgentCard:
             "version": self.version,
             "protocol_version": self.protocol_version,
             "skills": [skill.to_dict() for skill in self.skills],
+            "protocol_features": list(self.protocol_features),
         }
         if self.peer_id or self.did_key:
             payload["agentanycast"] = {
@@ -88,6 +90,11 @@ class AgentCard:
         if not isinstance(name, str) or not name:
             raise ValueError("AgentCard requires non-empty name")
         raw_skills = data.get("skills", [])
+        protocol_features = data.get("protocol_features", [])
+        if not isinstance(protocol_features, list) or any(
+            not isinstance(feature, str) or not feature for feature in protocol_features
+        ):
+            raise ValueError("AgentCard protocol_features must be non-empty strings")
         if not isinstance(raw_skills, list):
             raise ValueError("AgentCard skills must be a list")
         skills = [Skill.from_dict(item) for item in raw_skills]
@@ -100,6 +107,7 @@ class AgentCard:
             version=data.get("version", "1.0.0"),
             protocol_version=data.get("protocol_version", "a2a/0.3"),
             skills=skills,
+            protocol_features=list(protocol_features),
             peer_id=p2p.get("peer_id") if isinstance(p2p.get("peer_id"), str) else None,
             did_key=p2p.get("did_key") if isinstance(p2p.get("did_key"), str) else None,
         )

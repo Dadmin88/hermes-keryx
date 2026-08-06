@@ -256,6 +256,42 @@ async def test_node_reopens_existing_task_result_by_id(sample_card: AgentCard) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        ("canceled", result_pb2.TERMINAL_OUTCOME_CANCELED),
+        ("rejected", result_pb2.TERMINAL_OUTCOME_REJECTED),
+    ],
+)
+async def test_node_reopens_canceled_and_rejected_without_collapsing_to_failed(
+    sample_card: AgentCard,
+    status: str,
+    outcome: int,
+) -> None:
+    peer_id = _make_peer_id(bytes(range(32)))
+    fake_client = FakeDaemonClient(local_peer_id=peer_id)
+    node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
+    await node.start()
+    fake_client._fake_daemon.result_response = daemon_pb2.GetTaskResultResponse(
+        found=True,
+        status=status,
+        result=result_pb2.TaskResultEnvelope(
+            protocol_version=2,
+            task_id=common_pb2.TaskId(value=f"task-{status}"),
+            outcome=outcome,
+            executor_peer_id="peer-worker",
+            error_reason=status,
+        ),
+    )
+
+    handle = node.task_handle(f"task-{status}")
+    result = await handle.wait(timeout=1)
+
+    assert handle.status.value == status
+    assert result.status.value == status
+
+
+@pytest.mark.asyncio
 async def test_node_rejects_cancel_on_reattached_task(sample_card: AgentCard) -> None:
     peer_id = _make_peer_id(bytes(range(32)))
     fake_client = FakeDaemonClient(local_peer_id=peer_id)

@@ -177,6 +177,7 @@ fn registration_to_proto(reg: &crate::registry::Registration) -> ProtoRegistrati
         name: reg.name.clone(),
         description: reg.description.clone(),
         expires_at: Some(proto_timestamp_from_unix_ms(expires_ms)),
+        protocol_features: reg.protocol_features.clone(),
     }
 }
 
@@ -203,7 +204,14 @@ impl RegistryService for RegistryRpcService {
             Some(Duration::from_secs(inner.ttl_seconds))
         };
         self.registry
-            .register(peer_id, skills, inner.name, inner.description, ttl)
+            .register_with_features(
+                peer_id,
+                skills,
+                inner.name,
+                inner.description,
+                inner.protocol_features,
+                ttl,
+            )
             .await;
         self.sync_registry_metric().await;
         Ok(Response::new(RegisterSkillsResponse { accepted: true }))

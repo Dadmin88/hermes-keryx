@@ -383,6 +383,7 @@ class DaemonClient:
                 "agent_name": registration.name,
                 "agent_description": registration.description,
                 "skills": [skill.skill_id for skill in registration.skills],
+                "protocol_features": list(registration.protocol_features),
             }
             for registration in registrations
         ]
@@ -395,6 +396,7 @@ class DaemonClient:
         description: str,
         skills: list[tuple[str, str, list[str]]],
         ttl_seconds: int = 300,
+        protocol_features: list[str] | None = None,
     ) -> bool:
         ttl_seconds = _validate_registration_ttl(ttl_seconds)
         if self._registry is None:
@@ -405,6 +407,11 @@ class DaemonClient:
             name=name,
             description=description,
             ttl_seconds=ttl_seconds,
+            protocol_features=(
+                protocol_features
+                if protocol_features is not None
+                else ["absolute_deadlines_v1", "result_artifact_bytes_v1"]
+            ),
             skills=[
                 registry_pb2.SkillInfo(
                     skill_id=skill_id,
@@ -464,6 +471,7 @@ class DaemonClient:
                         for skill in registration.skills
                     ],
                     peer_id=registration.peer_id,
+                    protocol_features=list(registration.protocol_features),
                 )
         raise RuntimeError(f"No agent card for peer {peer_id}")
 
