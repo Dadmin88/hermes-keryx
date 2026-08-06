@@ -19,7 +19,7 @@ use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
 use libp2p::swarm::SwarmEvent;
 use libp2p::Multiaddr;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tonic::Request;
@@ -41,6 +41,73 @@ const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+struct RelayReconnectPolicy {
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RelayReconnectPolicy {
+    const fn new(initial_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            initial_delay,
+            max_delay,
+        }
+    }
+}
+
+impl Default for RelayReconnectPolicy {
+    fn default() -> Self {
+        Self::new(RELAY_RECONNECT_INITIAL_DELAY, RELAY_RECONNECT_MAX_DELAY)
+    }
+}
+
+fn next_reconnect_delay(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+async fn supervise_relay_stream<F, Fut>(
+    mut run_once: F,
+    mut shutdown: watch::Receiver<bool>,
+    policy: RelayReconnectPolicy,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delay = policy.initial_delay.min(policy.max_delay);
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let outcome = tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            outcome = run_once() => outcome,
+        };
+        match outcome {
+            Ok(()) => tracing::warn!("relay stream closed cleanly; reconnecting"),
+            Err(error) => tracing::warn!(error = %error, "relay stream failed; reconnecting"),
+        }
+        tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = next_reconnect_delay(delay, policy.max_delay);
+    }
+}
 
 /// Run an edge node until SIGINT: listen, dial bootstrap peers, optionally register skills.
 pub async fn run_edge_node() -> Result<()> {
@@ -75,21 +142,24 @@ pub async fn run_edge_node() -> Result<()> {
 
     register_node_skills(&registry_peer_id).await?;
 
-    let relay_stream_task = match (relay_endpoint(), daemon_endpoint()) {
+    let mut relay_stream_task = match (relay_endpoint(), daemon_endpoint()) {
         (Some(relay_endpoint), Some(daemon_endpoint)) => {
             let registry_peer_id = registry_peer_id.clone();
-            Some(tokio::spawn(async move {
-                if let Err(error) = run_relay_stream(
-                    relay_endpoint,
-                    registry_peer_id,
-                    node_token(),
-                    daemon_endpoint,
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "relay stream task exited");
-                }
-            }))
+            let node_token = node_token();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(supervise_relay_stream(
+                move || {
+                    run_relay_stream(
+                        relay_endpoint.clone(),
+                        registry_peer_id.clone(),
+                        node_token.clone(),
+                        daemon_endpoint.clone(),
+                    )
+                },
+                shutdown_rx,
+                RelayReconnectPolicy::default(),
+            ));
+            Some((shutdown_tx, task))
         }
         (Some(_), None) => {
             info!(
@@ -112,8 +182,16 @@ pub async fn run_edge_node() -> Result<()> {
         tokio::select! {
             _ = signal::ctrl_c() => {
                 info!(component = "keryx-node", "shutdown signal received");
-                if let Some(task) = &relay_stream_task {
-                    task.abort();
+                if let Some((shutdown_tx, mut task)) = relay_stream_task.take() {
+                    let _ = shutdown_tx.send(true);
+                    if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("relay stream supervisor did not stop before timeout; aborting");
+                        task.abort();
+                        let _ = task.await;
+                    }
                 }
                 break;
             }
@@ -443,26 +521,4 @@ fn skills_from_env() -> Vec<SkillInfo> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn remote_plaintext_registry_endpoint_fails_closed() {
-        let error = connect_registry_client("http://192.0.2.1:50053")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("require TLS"));
-    }
-
-    #[test]
-    fn remote_plaintext_relay_control_endpoint_fails_closed() {
-        let error = secure_endpoint_builder("http://192.0.2.1:50052").unwrap_err();
-        assert!(error.to_string().contains("require TLS"));
-    }
-
-    #[test]
-    fn https_relay_control_endpoint_uses_tls() {
-        let endpoint = secure_endpoint_builder("https://relay.example:50052").unwrap();
-        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
-    }
-}
+mod tests;

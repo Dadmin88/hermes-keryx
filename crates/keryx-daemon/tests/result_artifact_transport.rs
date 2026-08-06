@@ -8,7 +8,9 @@ use keryx_proto::v1::{
     GetArtifactRequest, GetTaskResultRequest, IngestRemoteResultRequest, ResultArtifact,
     TaskArtifact, TaskEnvelope, TaskId, TaskResultEnvelope, TerminalOutcome,
 };
-use keryx_store::{StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord};
+use keryx_store::{
+    StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
+};
 use prost::Message;
 use tonic::Code;
 
@@ -46,12 +48,22 @@ async fn origin_harness() -> RpcTestHarness {
 }
 
 async fn seed_origin_task(harness: &RpcTestHarness, id: &TaskId) {
+    seed_origin_task_with_deadline(harness, id, None).await;
+}
+
+async fn seed_origin_task_with_deadline(
+    harness: &RpcTestHarness,
+    id: &TaskId,
+    deadline_ms: Option<i64>,
+) {
     let core_id = CoreTaskId::new(id.value.clone()).unwrap();
     let task_envelope = envelope(id);
+    let mut task = TaskRecord::new(core_id.clone(), TaskStatus::Pending, None);
+    task.deadline_ms = deadline_ms;
     harness
         .runtime
         .accept_pending_remote_task_with_backpressure(
-            TaskRecord::new(core_id.clone(), TaskStatus::Pending, None),
+            task,
             TaskEnvelopeRecord::new(core_id.clone(), task_envelope.encode_to_vec(), 1),
             TaskTransportContextRecord {
                 task_id: core_id,
@@ -389,6 +401,205 @@ async fn worker_rejects_artifact_length_digest_and_absence_mismatches_before_com
             "{suffix} must not terminalize the task"
         );
     }
+}
+
+#[tokio::test]
+async fn authenticated_late_result_after_deadline_returns_success_without_terminal_mutation() {
+    let mut harness = origin_harness().await;
+    let id = task_id("origin-rpc-late-after-deadline");
+    let core_id = CoreTaskId::new(id.value.clone()).unwrap();
+    seed_origin_task_with_deadline(&harness, &id, Some(5)).await;
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .fail_expired_deadlines(10, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let before_events = harness
+        .runtime
+        .store()
+        .events_for_task(&core_id)
+        .await
+        .unwrap();
+
+    ingest(
+        &mut harness,
+        result(&id, 2, vec![present_artifact(b"late bytes".to_vec())]),
+        ORIGIN,
+        EXECUTOR,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_task(&core_id)
+            .await
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .events_for_task(&core_id)
+            .await
+            .unwrap(),
+        before_events
+    );
+    assert!(matches!(
+        harness.runtime.store().get_terminal_result(&core_id).await,
+        Err(StoreError::TerminalResultNotFound(_))
+    ));
+    assert!(harness
+        .runtime
+        .store()
+        .list_artifacts_for_task(&core_id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let forged = ingest(
+        &mut harness,
+        result(&id, 2, vec![]),
+        ORIGIN,
+        "forged-executor",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(forged.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn authenticated_result_after_cancellation_is_settled_without_reopening_task() {
+    let mut harness = origin_harness().await;
+    let id = task_id("origin-rpc-late-after-cancellation");
+    let core_id = CoreTaskId::new(id.value.clone()).unwrap();
+    seed_origin_task(&harness, &id).await;
+    let canceled = TaskResultEnvelope {
+        protocol_version: 1,
+        task_id: Some(id.clone()),
+        correlation_id: None,
+        outcome: TerminalOutcome::Canceled as i32,
+        executor_peer_id: ORIGIN.to_string(),
+        duration_ms: 0,
+        completed_at_ms: 8,
+        error_reason: "owner canceled".to_string(),
+        result_metadata: Default::default(),
+        output_artifacts: Vec::new(),
+    };
+    harness
+        .runtime
+        .store()
+        .cancel_task_with_result(
+            &core_id,
+            "owner canceled",
+            8,
+            TerminalResultRecord {
+                task_id: core_id.clone(),
+                encoded_result: canceled.encode_to_vec(),
+                terminal_status: TaskStatus::Failed,
+                return_peer_id: None,
+                executor_peer_id: peer(ORIGIN),
+                created_at_ms: 8,
+            },
+        )
+        .await
+        .unwrap();
+    let before_result = harness
+        .runtime
+        .store()
+        .get_terminal_result(&core_id)
+        .await
+        .unwrap();
+    let before_events = harness
+        .runtime
+        .store()
+        .events_for_task(&core_id)
+        .await
+        .unwrap();
+
+    ingest(&mut harness, result(&id, 1, Vec::new()), ORIGIN, EXECUTOR)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_task(&core_id)
+            .await
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_terminal_result(&core_id)
+            .await
+            .unwrap(),
+        before_result
+    );
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .events_for_task(&core_id)
+            .await
+            .unwrap(),
+        before_events
+    );
+}
+
+#[tokio::test]
+async fn corrupt_cancellation_result_fails_closed_instead_of_settling_late_frame() {
+    let mut harness = origin_harness().await;
+    let id = task_id("origin-rpc-corrupt-cancellation");
+    let core_id = CoreTaskId::new(id.value.clone()).unwrap();
+    seed_origin_task(&harness, &id).await;
+    harness
+        .runtime
+        .store()
+        .cancel_task_with_result(
+            &core_id,
+            "owner canceled",
+            8,
+            TerminalResultRecord {
+                task_id: core_id.clone(),
+                encoded_result: b"not-a-result-envelope".to_vec(),
+                terminal_status: TaskStatus::Failed,
+                return_peer_id: None,
+                executor_peer_id: peer(ORIGIN),
+                created_at_ms: 8,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = ingest(&mut harness, result(&id, 1, Vec::new()), ORIGIN, EXECUTOR)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::DataLoss);
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_task(&core_id)
+            .await
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
 }
 
 #[tokio::test]

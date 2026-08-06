@@ -20,6 +20,32 @@ pub(super) const MIGRATION_007: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS result_outbox_due_idx ON result_outbox(state, next_attempt_at_ms, created_at_ms, delivery_id)",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteResultTerminalReason {
+    DeadlineExpired,
+    Canceled,
+}
+
+impl std::fmt::Display for RemoteResultTerminalReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::DeadlineExpired => "deadline_expired",
+            Self::Canceled => "canceled",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteResultIngestOutcome {
+    Applied(TaskRecord),
+    Duplicate(TaskRecord),
+    SettledTerminal {
+        task: TaskRecord,
+        reason: RemoteResultTerminalReason,
+        canonical_result: Option<TerminalResultRecord>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTransportContextRecord {
     pub task_id: TaskId,
@@ -964,6 +990,32 @@ impl SqliteStore {
         authenticated_executor_peer_id: &PeerId,
         blob_dir: impl AsRef<Path>,
     ) -> StoreResult<TaskRecord> {
+        let task_id = result.task_id.clone();
+        match self
+            .ingest_remote_result_with_artifacts(
+                result,
+                artifacts,
+                authenticated_executor_peer_id,
+                blob_dir,
+            )
+            .await?
+        {
+            RemoteResultIngestOutcome::Applied(task)
+            | RemoteResultIngestOutcome::Duplicate(task) => Ok(task),
+            RemoteResultIngestOutcome::SettledTerminal { reason, .. } => {
+                Err(StoreError::RemoteResultTerminallySettled { task_id, reason })
+            }
+        }
+    }
+
+    /// Applies, deduplicates, or safely settles an authenticated remote terminal result.
+    pub async fn ingest_remote_result_with_artifacts(
+        &self,
+        result: TerminalResultRecord,
+        artifacts: &[OriginResultArtifact],
+        authenticated_executor_peer_id: &PeerId,
+        blob_dir: impl AsRef<Path>,
+    ) -> StoreResult<RemoteResultIngestOutcome> {
         result.validate()?;
         if &result.executor_peer_id != authenticated_executor_peer_id {
             return Err(StoreError::RemoteResultExecutorMismatch {
@@ -988,10 +1040,10 @@ impl SqliteStore {
             });
         }
 
-        if let Some(existing) = fetch_terminal_result_optional(&mut tx, &result.task_id).await? {
-            if existing != result {
-                return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
-            }
+        let task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
+        let terminal_reason = remote_result_terminal_reason_with_executor(&mut tx, &task).await?;
+        let existing = fetch_terminal_result_optional(&mut tx, &result.task_id).await?;
+        if existing.as_ref().is_some_and(|stored| stored == &result) {
             let stored = fetch_artifacts_for_task_with_executor(&mut tx, &result.task_id).await?;
             if stored.len() != records.len() || stored.iter().any(|row| !records.contains(row)) {
                 return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
@@ -1007,7 +1059,10 @@ impl SqliteStore {
                     ));
                 }
             }
-            return self.get_task(&result.task_id).await;
+            return self
+                .get_task(&result.task_id)
+                .await
+                .map(RemoteResultIngestOutcome::Duplicate);
         }
 
         for record in &records {
@@ -1019,6 +1074,27 @@ impl SqliteStore {
                     record.artifact_id.clone(),
                 ));
             }
+        }
+
+        let settlement_reason = match (terminal_reason, existing.as_ref()) {
+            (Some(RemoteResultTerminalReason::DeadlineExpired), None) => {
+                Some(RemoteResultTerminalReason::DeadlineExpired)
+            }
+            (Some(RemoteResultTerminalReason::Canceled), Some(_)) => {
+                Some(RemoteResultTerminalReason::Canceled)
+            }
+            _ => None,
+        };
+        if let Some(reason) = settlement_reason {
+            tx.commit().await?;
+            return Ok(RemoteResultIngestOutcome::SettledTerminal {
+                task,
+                reason,
+                canonical_result: existing,
+            });
+        }
+        if existing.is_some() {
+            return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
         }
 
         let mut prepared = Vec::new();
@@ -1046,7 +1122,7 @@ impl SqliteStore {
         }
 
         let apply_result = async {
-            let mut task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
+            let mut task = task;
             if task.status == TaskStatus::Pending {
                 let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
                 update_task_status_with_executor(&mut tx, &result.task_id, TaskStatus::Running)
@@ -1098,8 +1174,38 @@ impl SqliteStore {
             }
             return Err(error.into());
         }
-        self.get_task(&result.task_id).await
+        self.get_task(&result.task_id)
+            .await
+            .map(RemoteResultIngestOutcome::Applied)
     }
+}
+
+async fn remote_result_terminal_reason_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &TaskRecord,
+) -> StoreResult<Option<RemoteResultTerminalReason>> {
+    if task.status != TaskStatus::Failed {
+        return Ok(None);
+    }
+    let rows = sqlx::query(
+        "SELECT task_id, sequence, event_type, from_status, to_status FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
+    )
+    .bind(task.task_id().as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    let events = rows
+        .into_iter()
+        .map(row_to_event)
+        .collect::<StoreResult<Vec<_>>>()?;
+    replay_task_from_snapshot_and_events(task, &events)?;
+    Ok(events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type {
+            KeryxEventType::TaskTimedOut => Some(RemoteResultTerminalReason::DeadlineExpired),
+            KeryxEventType::TaskCanceled => Some(RemoteResultTerminalReason::Canceled),
+            _ => None,
+        }))
 }
 
 async fn insert_transport_context(

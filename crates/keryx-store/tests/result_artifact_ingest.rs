@@ -3,8 +3,8 @@ use keryx_core::{
     TaskStatus,
 };
 use keryx_store::{
-    OriginResultArtifact, SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord,
-    TaskTransportContextRecord, TerminalResultRecord,
+    OriginResultArtifact, RemoteResultIngestOutcome, RemoteResultTerminalReason, SqliteStore,
+    StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
 };
 use tempfile::tempdir;
 
@@ -552,4 +552,211 @@ async fn origin_ingest_cleans_prepared_blob_when_terminal_transition_is_rejected
         store.get_task(&task_id).await.unwrap().status,
         TaskStatus::Completed
     );
+}
+
+#[tokio::test]
+async fn authenticated_late_result_after_deadline_is_settled_without_mutation() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::connect(dir.path().join("keryx.db"))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+    let blob_dir = dir.path().join("blobs");
+    let task_id = TaskId::new("origin-late-after-deadline").unwrap();
+    let mut task = TaskRecord::new(task_id.clone(), TaskStatus::Pending, None);
+    task.deadline_ms = Some(15);
+    store
+        .accept_task_with_envelope_and_context(
+            task,
+            TaskEnvelopeRecord::new(task_id.clone(), b"envelope".to_vec(), 10),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(peer("origin-sender")),
+                expected_executor_peer_id: Some(peer("remote-executor")),
+                destination_peer_id: peer("remote-executor"),
+                relay_frame_id: Some("frame-deadline".to_owned()),
+                received_at_ms: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fail_expired_deadlines(20, None).await.unwrap().len(),
+        1
+    );
+    let before_events = store.events_for_task(&task_id).await.unwrap();
+    let late_artifact = artifact(&task_id, 0, b"late bytes".to_vec());
+
+    let outcome = store
+        .ingest_remote_result_with_artifacts(
+            result(&task_id),
+            std::slice::from_ref(&late_artifact),
+            &peer("remote-executor"),
+            &blob_dir,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        RemoteResultIngestOutcome::SettledTerminal {
+            reason: RemoteResultTerminalReason::DeadlineExpired,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store.events_for_task(&task_id).await.unwrap(),
+        before_events
+    );
+    assert!(matches!(
+        store.get_terminal_result(&task_id).await,
+        Err(StoreError::TerminalResultNotFound(_))
+    ));
+    assert!(store
+        .list_artifacts_for_task(&task_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!blob_dir.join(late_artifact.meta.digest.as_str()).exists());
+}
+
+#[tokio::test]
+async fn authenticated_late_result_after_cancellation_preserves_canonical_outcome() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::connect(dir.path().join("keryx.db"))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+    let blob_dir = dir.path().join("blobs");
+    let task_id = TaskId::new("origin-late-after-cancel").unwrap();
+    remote_task(&store, &task_id).await;
+    let canceled = TerminalResultRecord {
+        task_id: task_id.clone(),
+        encoded_result: b"canonical-canceled-result".to_vec(),
+        terminal_status: TaskStatus::Failed,
+        return_peer_id: None,
+        executor_peer_id: peer("origin-sender"),
+        created_at_ms: 15,
+    };
+    store
+        .cancel_task_with_result(&task_id, "owner canceled", 15, canceled.clone())
+        .await
+        .unwrap();
+    let before_events = store.events_for_task(&task_id).await.unwrap();
+    let late_artifact = artifact(&task_id, 0, b"late bytes".to_vec());
+
+    let outcome = store
+        .ingest_remote_result_with_artifacts(
+            result(&task_id),
+            std::slice::from_ref(&late_artifact),
+            &peer("remote-executor"),
+            &blob_dir,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        RemoteResultIngestOutcome::SettledTerminal {
+            reason: RemoteResultTerminalReason::Canceled,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store.events_for_task(&task_id).await.unwrap(),
+        before_events
+    );
+    assert_eq!(store.get_terminal_result(&task_id).await.unwrap(), canceled);
+    assert!(store
+        .list_artifacts_for_task(&task_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!blob_dir.join(late_artifact.meta.digest.as_str()).exists());
+}
+
+#[tokio::test]
+async fn duplicate_remote_result_is_reported_as_idempotent() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::connect(dir.path().join("keryx.db"))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+    let blob_dir = dir.path().join("blobs");
+    let task_id = TaskId::new("origin-typed-duplicate").unwrap();
+    remote_task(&store, &task_id).await;
+    let record = result(&task_id);
+
+    let first = store
+        .ingest_remote_result_with_artifacts(
+            record.clone(),
+            &[],
+            &peer("remote-executor"),
+            &blob_dir,
+        )
+        .await
+        .unwrap();
+    let before_events = store.events_for_task(&task_id).await.unwrap();
+    let duplicate = store
+        .ingest_remote_result_with_artifacts(record, &[], &peer("remote-executor"), &blob_dir)
+        .await
+        .unwrap();
+
+    assert!(matches!(first, RemoteResultIngestOutcome::Applied(_)));
+    assert!(matches!(duplicate, RemoteResultIngestOutcome::Duplicate(_)));
+    assert_eq!(
+        store.events_for_task(&task_id).await.unwrap(),
+        before_events
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_late_result_is_not_terminally_settled() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::connect(dir.path().join("keryx.db"))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+    let task_id = TaskId::new("origin-unauthorized-late").unwrap();
+    let mut task = TaskRecord::new(task_id.clone(), TaskStatus::Pending, None);
+    task.deadline_ms = Some(15);
+    store
+        .accept_task_with_envelope_and_context(
+            task,
+            TaskEnvelopeRecord::new(task_id.clone(), b"envelope".to_vec(), 10),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(peer("origin-sender")),
+                expected_executor_peer_id: Some(peer("remote-executor")),
+                destination_peer_id: peer("remote-executor"),
+                relay_frame_id: Some("frame-unauthorized".to_owned()),
+                received_at_ms: 10,
+            },
+        )
+        .await
+        .unwrap();
+    store.fail_expired_deadlines(20, None).await.unwrap();
+
+    let error = store
+        .ingest_remote_result_with_artifacts(
+            result(&task_id),
+            &[],
+            &peer("forged-executor"),
+            dir.path().join("blobs"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::RemoteResultExecutorMismatch { .. }
+    ));
 }

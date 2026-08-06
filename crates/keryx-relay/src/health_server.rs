@@ -171,7 +171,8 @@ impl KeryxRelay for RelayHealthService {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
 
-        let pending_count = self.runtime.connect_node(node_id.clone(), tx.clone());
+        let (pending_count, connection_generation) =
+            self.runtime.connect_node_fenced(node_id.clone(), tx);
 
         let runtime = Arc::clone(&self.runtime);
         let source_node_id = node_id.clone();
@@ -179,14 +180,18 @@ impl KeryxRelay for RelayHealthService {
             if let Some(next) = inbound.next().await {
                 match next {
                     Ok(_) => {
-                        let error = Status::failed_precondition(
-                            "ConnectNode is receive-only; publish through authenticated PublishTask or PublishResult",
-                        );
                         tracing::warn!(
                             source_node_id = %source_node_id,
                             "rejecting mutation frame on receive-only node stream"
                         );
-                        let _ = tx.send(Err(error)).await;
+                        runtime.disconnect_node_with_status_if_current(
+                            &source_node_id,
+                            connection_generation,
+                            Status::failed_precondition(
+                                "ConnectNode is receive-only; publish through authenticated PublishTask or PublishResult",
+                            ),
+                        );
+                        return;
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -197,7 +202,7 @@ impl KeryxRelay for RelayHealthService {
                     }
                 }
             }
-            runtime.disconnect_node(&source_node_id);
+            runtime.disconnect_node_if_current(&source_node_id, connection_generation);
         });
 
         tracing::debug!(%node_id, pending_count, "node connected to relay stream");
