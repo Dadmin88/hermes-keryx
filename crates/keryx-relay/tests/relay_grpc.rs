@@ -303,7 +303,7 @@ async fn legacy_task_acknowledgement_is_rejected() {
 }
 
 #[tokio::test]
-async fn connect_node_relays_node_frames_to_connected_target() {
+async fn connect_node_rejects_inbound_mutation_frames() {
     let runtime = RelayRuntime::new("relay-grpc-frame-test");
     runtime.mark_transport_listening();
     let addr = spawn_relay(Arc::clone(&runtime)).await;
@@ -323,7 +323,7 @@ async fn connect_node_relays_node_frames_to_connected_target() {
 
     let (a_tx, a_rx) = mpsc::channel(4);
     let mut node_a = KeryxRelayClient::new(channel);
-    let mut _a_stream = node_a
+    let mut a_stream = node_a
         .connect_node(connect_request("node-a", a_rx))
         .await
         .expect("connect node-a")
@@ -338,16 +338,18 @@ async fn connect_node_relays_node_frames_to_connected_target() {
     .await
     .expect("send node frame");
 
-    let delivered = tokio::time::timeout(Duration::from_secs(3), b_stream.next())
+    let stream_error = tokio::time::timeout(Duration::from_secs(3), a_stream.next())
         .await
-        .expect("relay frame timeout")
-        .expect("relay stream ended")
-        .expect("relay frame status");
-
-    assert_ne!(delivered.frame_id, "frame-a-to-b");
-    assert!(!delivered.frame_id.trim().is_empty());
-    assert_eq!(task_id(&delivered.task.unwrap()), "task-a-to-b");
-    assert_eq!(runtime.metrics().snapshot().tasks_routed, 1);
+        .expect("source stream must receive rejection")
+        .expect("source stream ended without rejection")
+        .expect_err("ConnectNode inbound mutation must fail closed");
+    assert_eq!(stream_error.code(), Code::FailedPrecondition);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), b_stream.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(runtime.metrics().snapshot().tasks_routed, 0);
 }
 
 #[tokio::test]
@@ -765,7 +767,7 @@ async fn register_node_appears_in_skill_registry() {
 }
 
 #[tokio::test]
-async fn publish_task_skill_metadata_is_discoverable_for_target_node() {
+async fn publish_task_cannot_mutate_target_owned_registry_skills() {
     let runtime = RelayRuntime::new("relay-grpc-registry-skill-test");
     runtime.mark_transport_listening();
     let registry = Arc::new(SkillRegistry::new());
@@ -787,9 +789,12 @@ async fn publish_task_skill_metadata_is_discoverable_for_target_node() {
         .expect("publish task with skill metadata");
 
     let found = registry.discover(Some("python"), &[], 10).await;
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].peer_id.as_str(), "node-python");
-    assert_eq!(found[0].skills[0].skill_id, "python");
+    assert!(found.is_empty());
+    let registration = registry
+        .get(&PeerId::new("node-python").unwrap())
+        .await
+        .expect("target registration remains present");
+    assert!(registration.skills.is_empty());
 }
 
 #[tokio::test]

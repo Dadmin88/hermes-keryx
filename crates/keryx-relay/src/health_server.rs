@@ -2,7 +2,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -22,7 +21,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::health::RelayHealthReport;
-use crate::registry::{SkillRegistry, StoredSkill};
+use crate::registry::SkillRegistry;
 use crate::runtime::{FrameAcknowledgement, FrameDelivery, PublishedTaskIdentity, RelayRuntime};
 use crate::security::NodeTokenAuth;
 use keryx_core::{PeerId, RESULT_ARTIFACT_FRAME_MAX_BYTES};
@@ -42,13 +41,7 @@ const TARGET_NODE_METADATA_KEYS: &[&str] = &[
     "node_id",
     "keryx.target_node_id",
 ];
-const SKILL_METADATA_KEYS: &[&str] = &[
-    "keryx.capability_id",
-    "capability_id",
-    "capability",
-    "skill_id",
-    "skill",
-];
+
 const ABSOLUTE_DEADLINES_FEATURE: &str = "absolute_deadlines_v1";
 const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
 
@@ -183,16 +176,17 @@ impl KeryxRelay for RelayHealthService {
         let runtime = Arc::clone(&self.runtime);
         let source_node_id = node_id.clone();
         tokio::spawn(async move {
-            while let Some(next) = inbound.next().await {
+            if let Some(next) = inbound.next().await {
                 match next {
-                    Ok(frame) => {
-                        if let Err(err) = route_node_frame(&runtime, &source_node_id, frame) {
-                            tracing::warn!(
-                                source_node_id = %source_node_id,
-                                error = %err,
-                                "dropping malformed node relay frame"
-                            );
-                        }
+                    Ok(_) => {
+                        let error = Status::failed_precondition(
+                            "ConnectNode is receive-only; publish through authenticated PublishTask or PublishResult",
+                        );
+                        tracing::warn!(
+                            source_node_id = %source_node_id,
+                            "rejecting mutation frame on receive-only node stream"
+                        );
+                        let _ = tx.send(Err(error)).await;
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -200,7 +194,6 @@ impl KeryxRelay for RelayHealthService {
                             error = %err,
                             "node relay stream ended with error"
                         );
-                        break;
                     }
                 }
             }
@@ -267,25 +260,7 @@ impl KeryxRelay for RelayHealthService {
             self.require_destination_feature(&target_node_id, ABSOLUTE_DEADLINES_FEATURE)
                 .await?;
         }
-        if let Some(registry) = &self.registry {
-            let peer_id = parse_registry_peer_id(&target_node_id)?;
-            if let Some(skill) = skill_from_task(&task) {
-                registry
-                    .add_skills(
-                        peer_id,
-                        vec![skill],
-                        target_node_id.clone(),
-                        String::new(),
-                        Some(Duration::from_secs(300)),
-                    )
-                    .await;
-            } else {
-                registry
-                    .touch_node(peer_id, Some(Duration::from_secs(300)))
-                    .await;
-            }
-            self.refresh_registry_metric().await;
-        }
+
         let task_id = task
             .task_id
             .clone()
@@ -485,33 +460,6 @@ fn parse_registry_peer_id(value: &str) -> Result<PeerId, Status> {
     })
 }
 
-fn route_node_frame(
-    runtime: &RelayRuntime,
-    source_node_id: &str,
-    frame: NodeFrame,
-) -> Result<(), Status> {
-    let target_node_id = required_node_value(&frame.target_node_id, "target_node_id")?;
-    let has_task = frame.task.is_some();
-    let has_result = frame.result.is_some();
-    if has_task == has_result {
-        return Err(Status::invalid_argument(
-            "NodeFrame must contain exactly one of task or result",
-        ));
-    }
-    let frame_id = new_relay_frame_id();
-    ensure_frame_routed(runtime.route_frame(
-        target_node_id.clone(),
-        RelayFrame {
-            frame_id,
-            task: frame.task,
-            result: frame.result,
-            authenticated_source_node_id: source_node_id.to_string(),
-            destination_node_id: target_node_id,
-        },
-    ))?;
-    Ok(())
-}
-
 fn ensure_frame_routed(delivery: crate::runtime::FrameDelivery) -> Result<(), Status> {
     match delivery {
         crate::runtime::FrameDelivery::Delivered | crate::runtime::FrameDelivery::Mailboxed => {
@@ -537,30 +485,6 @@ fn target_node_id_from_task(task: &TaskEnvelope) -> Result<String, Status> {
                 "task metadata must include one of: {}",
                 TARGET_NODE_METADATA_KEYS.join(", ")
             ))
-        })
-}
-
-fn skill_from_task(task: &TaskEnvelope) -> Option<StoredSkill> {
-    SKILL_METADATA_KEYS
-        .iter()
-        .find_map(|key| task.metadata.get(*key))
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(|skill_id| StoredSkill {
-            skill_id: skill_id.to_string(),
-            description: String::new(),
-            tags: task
-                .metadata
-                .get("skill_tags")
-                .or_else(|| task.metadata.get("keryx.skill_tags"))
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|tag| !tag.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
         })
 }
 

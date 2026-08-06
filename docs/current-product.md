@@ -91,8 +91,11 @@ Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC healt
 Current registry limits:
 
 - Registry registration and deregistration require configured node-token authentication. The relay derives the mutation owner from authenticated node metadata, rejects request-body identity mismatches, and fails closed when node authentication is absent. Plaintext authenticated relay control and registry gRPC are accepted only on loopback. Non-loopback control or registry binds use the configured TLS certificate/key, and remote Rust/Python clients require `https://` with optional private-CA trust. Skill discovery remains unauthenticated and read-only.
+- Task publication cannot create, refresh, or alter the destination peer's registry entry; registry state is mutated only through owner-authenticated registration APIs.
 - `max_skills_per_peer` is parsed from relay configuration but is not currently enforced.
 - Registry state is in-memory and TTL-based.
+
+`ConnectNode` is a receive-only delivery stream. Task and result mutations use the authenticated unary `PublishTask` and `PublishResult` RPCs so the relay applies the same identity and compatibility admission boundary to every accepted mutation.
 
 Terminal-result publication requires configured node-token authentication and fails closed when the relay has no `NodeTokenAuth`. This prevents descriptor-only and byte-bearing results from using a claimed `source_node_id` as an authenticated executor identity.
 
