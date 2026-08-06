@@ -262,6 +262,11 @@ impl InMemoryStore {
             transition.to,
         );
         state.tasks.insert(task_id.clone(), updated.clone());
+        if let Some(outbox) = make_outbox(&result) {
+            state
+                .result_outbox
+                .insert(outbox.delivery_id.clone(), outbox);
+        }
         state.terminal_results.insert(task_id.clone(), result);
         Ok(updated)
     }
@@ -487,7 +492,7 @@ impl SqliteStore {
             transition.to,
         )
         .await?;
-        insert_terminal_result_only(&mut tx, &result).await?;
+        insert_terminal_result_and_outbox(&mut tx, &result).await?;
         tx.commit().await?;
         self.get_task(task_id).await
     }

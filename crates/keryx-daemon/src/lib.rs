@@ -935,6 +935,33 @@ impl KeryxDaemonRpcService {
         }
     }
 
+    async fn existing_canceled_response(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<CancelTaskResponse>, Status> {
+        let stored = match self.runtime.store().get_terminal_result(task_id).await {
+            Ok(stored) => stored,
+            Err(StoreError::TerminalResultNotFound(_)) => return Ok(None),
+            Err(error) => return Err(store_error_to_status(error)),
+        };
+        let result =
+            TaskResultEnvelope::decode(stored.encoded_result.as_slice()).map_err(|error| {
+                Status::data_loss(format!(
+                    "stored terminal result for task {} is invalid: {error}",
+                    task_id.as_str()
+                ))
+            })?;
+        if result.outcome != TerminalOutcome::Canceled as i32 {
+            return Ok(None);
+        }
+        Ok(Some(CancelTaskResponse {
+            task_id: Some(proto_task_id(task_id)),
+            status: "canceled".to_string(),
+            reason: result.error_reason,
+            canceled: true,
+        }))
+    }
+
     async fn try_claim_next_task(
         &self,
         worker_id: &AgentId,
@@ -1534,6 +1561,9 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             Err(error) => return Err(store_error_to_status(error)),
         }
         self.runtime.cancellation().increment_cancel_requests();
+        if let Some(response) = self.existing_canceled_response(&task_id).await? {
+            return Ok(Response::new(response));
+        }
         let now_ms = unix_ms_now();
         let result = TaskResultEnvelope {
             protocol_version: 2,
@@ -1547,7 +1577,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             result_metadata: inner.metadata,
             output_artifacts: vec![],
         };
-        let task = self
+        let task = match self
             .runtime
             .store()
             .cancel_task_with_result(
@@ -1564,7 +1594,15 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 },
             )
             .await
-            .map_err(store_error_to_status)?;
+        {
+            Ok(task) => task,
+            Err(error) => {
+                if let Ok(Some(response)) = self.existing_canceled_response(&task_id).await {
+                    return Ok(Response::new(response));
+                }
+                return Err(store_error_to_status(error));
+            }
+        };
         self.runtime.cancellation().increment_tasks_canceled();
         Ok(Response::new(CancelTaskResponse {
             task_id: Some(proto_task_id(task.task_id())),

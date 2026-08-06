@@ -6,8 +6,9 @@ use keryx_core::{
     TaskStatus,
 };
 use keryx_proto::v1::{
-    AgentId, CancelTaskRequest, ClaimTaskRequest, CompleteTaskRequest, GetTaskResultRequest,
-    SubmitTaskRequest, TaskEnvelope, TaskId, TerminalOutcome,
+    AckResultDeliveryRequest, AgentId, CancelTaskRequest, ClaimNextResultDeliveryRequest,
+    ClaimTaskRequest, CompleteTaskRequest, GetTaskResultRequest, SubmitTaskRequest, TaskEnvelope,
+    TaskId, TerminalOutcome,
 };
 use keryx_store::{
     LeaseRecord, StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
@@ -137,6 +138,106 @@ async fn remote_target_cancel_fails_closed_without_mutating_origin_state() {
         harness.runtime.store().get_terminal_result(&task_id).await,
         Err(StoreError::TerminalResultNotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn destination_cancel_emits_one_idempotent_canceled_result_delivery() {
+    let mut harness = RpcTestHarness::start().await;
+    let task_id = CoreTaskId::new("cancel-remote-origin").unwrap();
+    let origin = PeerId::new("peer-origin").unwrap();
+    let local = harness.runtime.config().local_peer_id().clone();
+    harness
+        .runtime
+        .store()
+        .accept_task_with_envelope_and_context(
+            TaskRecord::new(task_id.clone(), TaskStatus::Pending, None),
+            TaskEnvelopeRecord::new(
+                task_id.clone(),
+                envelope(task_id.as_str()).encode_to_vec(),
+                1,
+            ),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(origin.clone()),
+                expected_executor_peer_id: Some(local.clone()),
+                destination_peer_id: local,
+                relay_frame_id: Some("relay-cancel-origin".to_string()),
+                received_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+    let first = harness
+        .client
+        .cancel_task(CancelTaskRequest {
+            task_id: Some(TaskId {
+                value: task_id.to_string(),
+            }),
+            reason: "first durable reason".to_string(),
+            metadata: [("request".to_string(), "first".to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.reason, "first durable reason");
+
+    let delivery = harness
+        .client
+        .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+            worker_id: "cancel-delivery-worker".to_string(),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(delivery.has_delivery);
+    assert_eq!(delivery.target_peer_id, origin.as_str());
+    let result = delivery.result.unwrap();
+    assert_eq!(result.outcome, TerminalOutcome::Canceled as i32);
+    assert_eq!(result.error_reason, "first durable reason");
+    assert!(
+        harness
+            .client
+            .ack_result_delivery(AckResultDeliveryRequest {
+                delivery_id: delivery.delivery_id,
+                worker_id: "cancel-delivery-worker".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted
+    );
+
+    let duplicate = harness
+        .client
+        .cancel_task(CancelTaskRequest {
+            task_id: Some(TaskId {
+                value: task_id.to_string(),
+            }),
+            reason: "second reason must not replace the first".to_string(),
+            metadata: [("request".to_string(), "second".to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(duplicate.canceled);
+    assert_eq!(duplicate.reason, "first durable reason");
+
+    let no_duplicate = harness
+        .client
+        .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+            worker_id: "cancel-delivery-worker".to_string(),
+            lease_duration_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!no_duplicate.has_delivery);
 }
 
 #[tokio::test]
