@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::health::RelayHealthReport;
 use crate::registry::SkillRegistry;
 use crate::runtime::{
-    FrameAcknowledgement, FrameDelivery, PublishedTaskIdentity, PublishedTaskReceipt, RelayRuntime,
+    FrameAcknowledgement, PublishedTaskDelivery, PublishedTaskReceipt, RelayRuntime,
 };
 use crate::security::NodeTokenAuth;
 use keryx_core::{PeerId, RESULT_ARTIFACT_FRAME_MAX_BYTES};
@@ -280,61 +280,35 @@ impl KeryxRelay for RelayHealthService {
             frame_id: new_relay_frame_id(),
             accepted_at_ms: unix_ms_now(),
         };
-        let task_identity = self.runtime.classify_published_task(
+        let frame = RelayFrame {
+            frame_id: proposed_receipt.frame_id.clone(),
+            task: Some(task.clone()),
+            result: None,
+            authenticated_source_node_id: source_node_id.clone(),
+            destination_node_id: target_node_id.clone(),
+        };
+        let receipt = match self.runtime.publish_task_frame(
             &source_node_id,
             &target_node_id,
             task_id.value.trim(),
             &task,
+            frame,
             proposed_receipt,
-        );
-        let (receipt, is_new) = match task_identity {
-            PublishedTaskIdentity::New(receipt) => (receipt, true),
-            PublishedTaskIdentity::Retry(receipt) => (receipt, false),
-            PublishedTaskIdentity::Conflict => {
+        ) {
+            PublishedTaskDelivery::New { receipt, .. } | PublishedTaskDelivery::Retry(receipt) => {
+                receipt
+            }
+            PublishedTaskDelivery::Conflict => {
                 return Err(Status::already_exists(
                     "task identity was already accepted with a different envelope",
                 ));
             }
-            PublishedTaskIdentity::RejectedCapacity => {
+            PublishedTaskDelivery::RejectedCapacity => {
                 return Err(Status::resource_exhausted(
-                    "relay task identity table is at capacity",
+                    "relay task or frame identity table is at capacity",
                 ));
             }
         };
-        if is_new {
-            let frame = RelayFrame {
-                frame_id: receipt.frame_id.clone(),
-                task: Some(task),
-                result: None,
-                authenticated_source_node_id: source_node_id.clone(),
-                destination_node_id: target_node_id.clone(),
-            };
-            match self.runtime.route_frame(target_node_id.clone(), frame) {
-                FrameDelivery::Delivered | FrameDelivery::Mailboxed => {}
-                FrameDelivery::RejectedDuplicate => {
-                    self.runtime.forget_published_task(
-                        &source_node_id,
-                        &target_node_id,
-                        task_id.value.trim(),
-                        &receipt.frame_id,
-                    );
-                    return Err(Status::internal(
-                        "relay generated a duplicate frame identity",
-                    ));
-                }
-                FrameDelivery::RejectedCapacity => {
-                    self.runtime.forget_published_task(
-                        &source_node_id,
-                        &target_node_id,
-                        task_id.value.trim(),
-                        &receipt.frame_id,
-                    );
-                    return Err(Status::resource_exhausted(
-                        "relay frame capacity is exhausted",
-                    ));
-                }
-            }
-        }
         Ok(Response::new(PublishTaskResponse {
             task_id: Some(task_id),
             frame_id: receipt.frame_id,

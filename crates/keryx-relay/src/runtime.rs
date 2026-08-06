@@ -51,6 +51,17 @@ pub enum PublishedTaskIdentity {
     RejectedCapacity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishedTaskDelivery {
+    New {
+        receipt: PublishedTaskReceipt,
+        delivery: FrameDelivery,
+    },
+    Retry(PublishedTaskReceipt),
+    Conflict,
+    RejectedCapacity,
+}
+
 type FrameKey = (String, String);
 type TaskPublishKey = (String, String, String);
 
@@ -192,54 +203,15 @@ impl RelayRuntime {
     ) -> FrameDelivery {
         let target_node_id = target_node_id.into();
         let mut guard = self.lock_peers();
-
-        let frame_id = frame.frame_id.trim();
-        if !frame_id.is_empty() {
-            let key = (target_node_id.clone(), frame_id.to_string());
-            if guard.frame_destinations.contains(&key) || guard.acknowledged_frames.contains(&key) {
-                return FrameDelivery::RejectedDuplicate;
-            }
-            if guard.frame_destinations.len() >= MAX_TRACKED_FRAMES {
-                return FrameDelivery::RejectedCapacity;
-            }
-            guard.frame_destinations.insert(key);
+        let delivery = route_frame_locked(&mut guard, target_node_id, frame);
+        self.sync_connected_peer_metric(&guard);
+        if matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ) {
+            self.metrics.increment_tasks_routed();
         }
-        guard.registered.insert(target_node_id.clone());
-
-        if let Some(sender) = guard.connected_nodes.get(&target_node_id).cloned() {
-            match sender.try_send(Ok(frame.clone())) {
-                Ok(()) => {
-                    self.metrics.increment_tasks_routed();
-                    return FrameDelivery::Delivered;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(frame)))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(frame))) => {
-                    guard.connected_nodes.remove(&target_node_id);
-                    guard
-                        .mailboxes
-                        .entry(target_node_id)
-                        .or_default()
-                        .push_back(frame);
-                    self.sync_connected_peer_metric(&guard);
-                    self.metrics.increment_tasks_routed();
-                    return FrameDelivery::Mailboxed;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(Err(_)))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(Err(_))) => {
-                    guard.connected_nodes.remove(&target_node_id);
-                    self.sync_connected_peer_metric(&guard);
-                    return FrameDelivery::Mailboxed;
-                }
-            }
-        }
-
-        guard
-            .mailboxes
-            .entry(target_node_id)
-            .or_default()
-            .push_back(frame);
-        self.metrics.increment_tasks_routed();
-        FrameDelivery::Mailboxed
+        delivery
     }
 
     /// Acknowledge a destination-owned frame and remove only its mailbox copy.
@@ -285,6 +257,74 @@ impl RelayRuntime {
             .mailboxes
             .get(node_id)
             .map_or(0, VecDeque::len)
+    }
+
+    /// Atomically admit a task identity and acquire bounded frame ownership before delivery.
+    pub fn publish_task_frame(
+        &self,
+        source_node_id: &str,
+        destination_node_id: &str,
+        task_id: &str,
+        task: &TaskEnvelope,
+        frame: RelayFrame,
+        proposed_receipt: PublishedTaskReceipt,
+    ) -> PublishedTaskDelivery {
+        let task_key = (
+            source_node_id.to_string(),
+            destination_node_id.to_string(),
+            task_id.to_string(),
+        );
+        let mut guard = self.lock_peers();
+        if let Some(existing) = guard.published_tasks.get(&task_key) {
+            return if existing.envelope == *task {
+                PublishedTaskDelivery::Retry(existing.receipt.clone())
+            } else {
+                PublishedTaskDelivery::Conflict
+            };
+        }
+
+        let frame_key = (
+            destination_node_id.to_string(),
+            proposed_receipt.frame_id.clone(),
+        );
+        if guard.frame_destinations.contains(&frame_key)
+            || guard.acknowledged_frames.contains(&frame_key)
+            || guard.frame_destinations.len() >= MAX_TRACKED_FRAMES
+        {
+            return PublishedTaskDelivery::RejectedCapacity;
+        }
+        while guard.published_tasks.len() >= MAX_RETAINED_PUBLISHED_TASKS {
+            let Some(expired_key) = guard.acknowledged_published_task_order.pop_front() else {
+                return PublishedTaskDelivery::RejectedCapacity;
+            };
+            if let Some(expired) = guard.published_tasks.remove(&expired_key) {
+                guard
+                    .published_frame_index
+                    .remove(&(expired_key.1.clone(), expired.receipt.frame_id));
+            }
+        }
+        guard
+            .published_frame_index
+            .insert(frame_key, task_key.clone());
+        guard.published_tasks.insert(
+            task_key,
+            PublishedTaskRecord {
+                envelope: task.clone(),
+                receipt: proposed_receipt.clone(),
+                acknowledged: false,
+            },
+        );
+        let delivery = route_frame_locked(&mut guard, destination_node_id.to_string(), frame);
+        debug_assert!(matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ));
+        self.sync_connected_peer_metric(&guard);
+        self.metrics.increment_tasks_routed();
+        PublishedTaskDelivery::New {
+            receipt: proposed_receipt,
+            delivery,
+        }
     }
 
     /// Retain an immutable envelope and relay-issued receipt for a bounded task identity history.
@@ -435,6 +475,51 @@ fn mark_published_task_acknowledged(
         record.acknowledged = true;
         state.acknowledged_published_task_order.push_back(task_key);
     }
+}
+
+fn route_frame_locked(
+    state: &mut PeerState,
+    target_node_id: String,
+    frame: RelayFrame,
+) -> FrameDelivery {
+    let frame_id = frame.frame_id.trim();
+    if !frame_id.is_empty() {
+        let key = (target_node_id.clone(), frame_id.to_string());
+        if state.frame_destinations.contains(&key) || state.acknowledged_frames.contains(&key) {
+            return FrameDelivery::RejectedDuplicate;
+        }
+        if state.frame_destinations.len() >= MAX_TRACKED_FRAMES {
+            return FrameDelivery::RejectedCapacity;
+        }
+        state.frame_destinations.insert(key);
+    }
+    state.registered.insert(target_node_id.clone());
+    if let Some(sender) = state.connected_nodes.get(&target_node_id).cloned() {
+        match sender.try_send(Ok(frame.clone())) {
+            Ok(()) => return FrameDelivery::Delivered,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(frame)))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(frame))) => {
+                state.connected_nodes.remove(&target_node_id);
+                state
+                    .mailboxes
+                    .entry(target_node_id)
+                    .or_default()
+                    .push_back(frame);
+                return FrameDelivery::Mailboxed;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(Err(_)))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(Err(_))) => {
+                state.connected_nodes.remove(&target_node_id);
+                return FrameDelivery::Mailboxed;
+            }
+        }
+    }
+    state
+        .mailboxes
+        .entry(target_node_id)
+        .or_default()
+        .push_back(frame);
+    FrameDelivery::Mailboxed
 }
 
 fn is_acked(
@@ -650,6 +735,85 @@ mod tests {
         assert_eq!(
             guard.published_frame_index.len(),
             MAX_RETAINED_PUBLISHED_TASKS
+        );
+    }
+
+    #[test]
+    fn full_frame_capacity_rejects_new_task_without_evicting_retry_history() {
+        let runtime = RelayRuntime::new("relay");
+        for index in 0..MAX_RETAINED_PUBLISHED_TASKS {
+            let task = task(format!("retained-{index}"));
+            let receipt = receipt(index);
+            assert_eq!(
+                runtime.classify_published_task(
+                    "source",
+                    "destination",
+                    task.task_id.as_ref().unwrap().value.as_str(),
+                    &task,
+                    receipt.clone(),
+                ),
+                PublishedTaskIdentity::New(receipt.clone())
+            );
+            assert_eq!(
+                runtime.route_frame(
+                    "destination",
+                    RelayFrame {
+                        frame_id: receipt.frame_id.clone(),
+                        task: Some(task),
+                        result: None,
+                        authenticated_source_node_id: "source".into(),
+                        destination_node_id: "destination".into(),
+                    },
+                ),
+                FrameDelivery::Mailboxed
+            );
+            assert_eq!(
+                runtime.ack_frame("destination", &receipt.frame_id),
+                FrameAcknowledgement::Accepted
+            );
+        }
+        for index in 0..MAX_TRACKED_FRAMES {
+            assert_eq!(
+                runtime.route_frame("other-destination", frame(format!("active-{index}"))),
+                FrameDelivery::Mailboxed
+            );
+        }
+
+        let overflow_task = task("capacity-overflow");
+        let overflow_receipt = PublishedTaskReceipt {
+            frame_id: "capacity-overflow-frame".into(),
+            accepted_at_ms: 9_999,
+        };
+        assert_eq!(
+            runtime.publish_task_frame(
+                "source",
+                "destination",
+                "capacity-overflow",
+                &overflow_task,
+                RelayFrame {
+                    frame_id: overflow_receipt.frame_id.clone(),
+                    task: Some(overflow_task.clone()),
+                    result: None,
+                    authenticated_source_node_id: "source".into(),
+                    destination_node_id: "destination".into(),
+                },
+                overflow_receipt,
+            ),
+            PublishedTaskDelivery::RejectedCapacity
+        );
+        let oldest = task("retained-0");
+        assert_eq!(
+            runtime.classify_published_task(
+                "source",
+                "destination",
+                "retained-0",
+                &oldest,
+                PublishedTaskReceipt {
+                    frame_id: "discarded-candidate".into(),
+                    accepted_at_ms: i64::MAX,
+                },
+            ),
+            PublishedTaskIdentity::Retry(receipt(0))
         );
     }
 
