@@ -257,16 +257,19 @@ async def test_node_reopens_existing_task_result_by_id(sample_card: AgentCard) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "outcome"),
+    ("status", "outcome", "expected_status"),
     [
-        ("canceled", result_pb2.TERMINAL_OUTCOME_CANCELED),
-        ("rejected", result_pb2.TERMINAL_OUTCOME_REJECTED),
+        ("canceled", result_pb2.TERMINAL_OUTCOME_CANCELED, "canceled"),
+        ("rejected", result_pb2.TERMINAL_OUTCOME_REJECTED, "rejected"),
+        ("failed", result_pb2.TERMINAL_OUTCOME_CANCELED, "canceled"),
+        ("failed", result_pb2.TERMINAL_OUTCOME_REJECTED, "rejected"),
     ],
 )
 async def test_node_reopens_canceled_and_rejected_without_collapsing_to_failed(
     sample_card: AgentCard,
     status: str,
     outcome: int,
+    expected_status: str,
 ) -> None:
     peer_id = _make_peer_id(bytes(range(32)))
     fake_client = FakeDaemonClient(local_peer_id=peer_id)
@@ -287,8 +290,8 @@ async def test_node_reopens_canceled_and_rejected_without_collapsing_to_failed(
     handle = node.task_handle(f"task-{status}")
     result = await handle.wait(timeout=1)
 
-    assert handle.status.value == status
-    assert result.status.value == status
+    assert handle.status.value == expected_status
+    assert result.status.value == expected_status
 
 
 @pytest.mark.asyncio

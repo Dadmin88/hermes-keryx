@@ -1257,6 +1257,14 @@ class KeryxNode:
 
 
 def _legacy_status(status: str, *, outcome: int = 0) -> LegacyTaskStatus:
+    if outcome == 1:
+        return LegacyTaskStatus.COMPLETED
+    if outcome in {2, 4}:
+        return LegacyTaskStatus.FAILED
+    if outcome == 3:
+        return LegacyTaskStatus.CANCELED
+    if outcome == 5:
+        return LegacyTaskStatus.REJECTED
     normalized = status.strip().lower()
     if normalized == "completed":
         return LegacyTaskStatus.COMPLETED
@@ -1268,14 +1276,6 @@ def _legacy_status(status: str, *, outcome: int = 0) -> LegacyTaskStatus:
         return LegacyTaskStatus.REJECTED
     if normalized in {"running", "working", "leased"}:
         return LegacyTaskStatus.WORKING
-    if outcome == 1:
-        return LegacyTaskStatus.COMPLETED
-    if outcome in {2, 4}:
-        return LegacyTaskStatus.FAILED
-    if outcome == 3:
-        return LegacyTaskStatus.CANCELED
-    if outcome == 5:
-        return LegacyTaskStatus.REJECTED
     return LegacyTaskStatus.SUBMITTED
 
 
