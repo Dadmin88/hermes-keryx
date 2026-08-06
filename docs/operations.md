@@ -42,7 +42,7 @@ export HERMES_KERYX_DAEMON_ENDPOINT=http://127.0.0.1:50051
 1. Create `HERMES_KERYX_DATA_DIR` if missing.
 2. Open SQLite at `{data_dir}/keryx.db`.
 3. Run migrations.
-4. Read and check schema version (current supported: `5`).
+4. Read and check schema version (current supported: `7`).
 5. Run startup `recover_stale_leases`.
 6. Fail closed if recovery reports unrepaired corruption.
 7. Create the blob directory on artifact writes (`{data_dir}/blobs`).
