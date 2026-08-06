@@ -305,9 +305,20 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(outbox.delivery_id, format!("result-{TASK}"));
+    assert_eq!(outbox.task_id, task_id);
+    assert_eq!(outbox.target_peer_id, PeerId::new(ORIGIN).unwrap());
     assert_eq!(outbox.state, ResultDeliveryState::DeadLettered);
     assert_eq!(outbox.attempt_count, MAX_RESULT_DELIVERY_ATTEMPTS);
-    assert!(outbox.last_error.is_some());
+    assert!(outbox
+        .last_error
+        .as_deref()
+        .is_some_and(|error| !error.is_empty()));
+    assert!(outbox.created_at_ms > 0);
+    assert!(outbox.updated_at_ms >= outbox.created_at_ms);
+    assert!(outbox.next_attempt_at_ms >= outbox.created_at_ms);
+    assert!(outbox.lease_owner.is_none());
+    assert!(outbox.lease_expires_at_ms.is_none());
     assert!(runtime
         .store()
         .claim_next_result_delivery(WORKER, unix_ms_now() + 1_000, 1_000)
