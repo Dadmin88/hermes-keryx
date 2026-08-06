@@ -6,11 +6,16 @@ import "hermes/keryx/v1/task.proto";
 import "hermes/keryx/v1/result.proto";
 
 service KeryxRelay {
+  // Receive-only delivery stream. Task/result mutation frames sent by clients are rejected;
+  // use the authenticated unary PublishTask and PublishResult RPCs instead.
   rpc ConnectNode(stream NodeFrame) returns (stream RelayFrame);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  // Authenticated unary task publication.
   rpc PublishTask(PublishTaskRequest) returns (PublishTaskResponse);
+  // Authenticated unary terminal-result publication.
   rpc PublishResult(PublishResultRequest) returns (PublishResultResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
+  // Destination-owned acknowledgement; the authenticated caller must own the relay frame.
   rpc AckFrame(AckFrameRequest) returns (AckFrameResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }

@@ -241,6 +241,8 @@ message FailTaskResponse {
 }
 
 message CancelTaskRequest {
+  // A task targeted at another executor fails closed with FAILED_PRECONDITION;
+  // this RPC does not claim to stop remote work.
   TaskId task_id = 1;
   string reason = 2;
   map<string, string> metadata = 3;
@@ -266,6 +268,8 @@ message SendTaskResponse {
   string status = 2;
   string routed_to = 3;
   string delivery_route = 4;
+  // The following receipt fields prove relay acceptance only, not execution or
+  // durable destination acknowledgement.
   string relay_frame_id = 5;
   string authenticated_source_peer_id = 6;
   string accepted_destination_peer_id = 7;

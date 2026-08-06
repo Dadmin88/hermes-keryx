@@ -55,19 +55,22 @@ class RegistryServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def RegisterSkills(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """The registration owner is authenticated metadata; request peer_id must match it.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def UnregisterSkills(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """The deregistration owner is authenticated metadata; request peer_id must match it.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DiscoverBySkill(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Read-only discovery; it does not mutate registration ownership.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

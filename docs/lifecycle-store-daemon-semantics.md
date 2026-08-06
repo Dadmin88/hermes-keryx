@@ -175,7 +175,7 @@ Operation semantics:
 - Accepts `RetryPolicy` (Phase 7). When `max_retries > 0` and `should_retry_after_failure` holds, deactivates lease, increments `retry_count`, sets snapshot to `Pending`, and appends `RecoveryAction` (failure-driven requeue, not a core `Running -> Pending` transition).
 - When retries are exhausted, validates `Running -> Failed`, sets `dead_lettered` and `dead_letter_reason`, deactivates lease, and appends `TaskDeadLettered`.
 - When `max_retries == 0`, validates `Running -> Failed` immediately without dead-letter metadata (terminal fail).
-- Cancellation, timeout, rejection, and dead-letter at the API boundary are still represented as `Failed` plus typed reason metadata for this strict phase when those paths are used.
+- Cancellation, timeout, rejection, and dead-letter remain persisted as `Failed` in the strict four-state lifecycle, while terminal result APIs and reattached handles expose the truthful typed outcome (`Canceled`, `TimedOut`, `Rejected`, or failure/dead-letter detail).
 
 ### `recover_stale_leases`
 

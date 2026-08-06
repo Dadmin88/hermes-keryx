@@ -218,7 +218,7 @@ Hermes Agency treats Keryx as its primary transport:
 - Node/pool modules import `from keryx import ...` directly
 - AgentAnycast remains a legacy fallback only
 
-The current integration supports local lifecycle, registry discovery, authenticated relay publication, remote worker execution, durable terminal result/artifact-descriptor return, and `TaskHandle.wait()`. Returned artifacts contain descriptors and bounded text previews; artifact bytes remain destination-local. The permanent cross-process proof lives in `scripts/e2e_two_node.py` and `.github/workflows/phase17-e2e.yml`.
+The current integration supports local lifecycle, registry discovery, authenticated relay publication, remote worker execution, durable terminal result/artifact-descriptor return, and `TaskHandle.wait()`. Descriptor-only result return is the interoperability baseline; bounded artifact bytes traverse only when the authenticated origin advertises `result_artifact_bytes_v1`. The permanent cross-process proof lives in `scripts/e2e_two_node.py` and `.github/workflows/phase17-e2e.yml`.
 
 This repo stays independent so Keryx can be PR'd upstream without the full Agency product surface.
 

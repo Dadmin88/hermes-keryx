@@ -75,7 +75,9 @@ class KeryxRelayServicer:
     """Missing associated documentation comment in .proto file."""
 
     def ConnectNode(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Receive-only delivery stream. Task/result mutation frames sent by clients are rejected;
+        use the authenticated unary PublishTask and PublishResult RPCs instead.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -87,13 +89,15 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def PublishTask(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary task publication.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def PublishResult(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary terminal-result publication.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -105,7 +109,8 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AckFrame(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Destination-owned acknowledgement; the authenticated caller must own the relay frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

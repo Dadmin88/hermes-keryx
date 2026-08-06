@@ -53,7 +53,10 @@ message DiscoverBySkillResponse {
 }
 
 service RegistryService {
+  // The registration owner is authenticated metadata; request peer_id must match it.
   rpc RegisterSkills(RegisterSkillsRequest) returns (RegisterSkillsResponse);
+  // The deregistration owner is authenticated metadata; request peer_id must match it.
   rpc UnregisterSkills(UnregisterSkillsRequest) returns (UnregisterSkillsResponse);
+  // Read-only discovery; it does not mutate registration ownership.
   rpc DiscoverBySkill(DiscoverBySkillRequest) returns (DiscoverBySkillResponse);
 }

@@ -95,13 +95,16 @@ async def test_remote_terminal_without_durable_result_raises_stable_error(
     with pytest.raises(
         TaskResultUnavailableError,
         match="terminal_result_unavailable",
-    ):
+    ) as first_error:
         await handle.wait(timeout=1)
     assert handle.status.value == "completed"
-    with pytest.raises(TaskResultUnavailableError):
+    with pytest.raises(TaskResultUnavailableError) as second_error:
         await handle.wait(timeout=1)
-    with pytest.raises(TaskResultUnavailableError):
+    with pytest.raises(TaskResultUnavailableError) as refresh_error:
         await handle.refresh()
+    assert second_error.value is first_error.value
+    assert refresh_error.value is first_error.value
+    client.get_task_result.assert_awaited_once()
     await node.stop()
 
 

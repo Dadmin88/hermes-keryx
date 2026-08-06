@@ -32,7 +32,7 @@ The implementation includes:
 - authenticated sender and executor identities;
 - durable terminal results and retryable result delivery;
 - `TaskHandle.wait()` result observation and cancellation;
-- canonical origin-assigned artifact descriptors and bounded result bytes;
+- canonical origin-assigned artifact descriptors and capability-gated bounded result bytes (`result_artifact_bytes_v1`);
 - idempotent result ingestion and acknowledgement;
 - a real two-daemon/two-edge-node process harness.
 
@@ -60,7 +60,7 @@ The E2E proof uses isolated SQLite stores, dynamic loopback ports, separate node
 - [x] Python `serve_forever()` invokes the registered handler.
 - [x] Completion/failure results propagate to the origin.
 - [x] Sender `TaskHandle.wait()` receives terminal status and canonical artifact descriptors.
-- [x] Bounded artifact bytes traverse the authenticated result route and verify at origin.
+- [x] When the authenticated origin advertises `result_artifact_bytes_v1`, bounded artifact bytes traverse the result route and verify at origin; descriptor-only return remains compatible without it.
 - [x] Python retrieval and explicit-path download return the exact stored bytes.
 - [x] Sender and executor identities are transport-authenticated.
 - [x] Two-daemon/two-edge-node harness is repeatable.

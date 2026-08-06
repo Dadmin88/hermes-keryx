@@ -123,6 +123,8 @@ Artifact limits:
 
 ## Relay operations
 
+Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-receipt history are process-local in-memory state. They survive reconnect to the same relay process, but not relay restart; acknowledgement and retained task-receipt history are bounded to 8,192 entries. A relay acceptance receipt proves only authenticated relay acceptance, not execution or durable destination acknowledgement.
+
 ### JSON config (direct `RelayConfig`)
 
 ```json

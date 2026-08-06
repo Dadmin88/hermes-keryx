@@ -292,6 +292,26 @@ async def test_node_reopens_canceled_and_rejected_without_collapsing_to_failed(
 
 
 @pytest.mark.asyncio
+async def test_node_cancels_original_send_task_handle_once(sample_card: AgentCard) -> None:
+    peer_id = _make_peer_id(bytes(range(32)))
+    fake_client = FakeDaemonClient(local_peer_id=peer_id)
+    node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
+    await node.start()
+
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "cancel me"}]},
+        peer_id="12D3KooWRemote",
+    )
+    await handle.cancel()
+
+    assert len(fake_client._fake_daemon.canceled) == 1
+    request = fake_client._fake_daemon.canceled[0]
+    assert request.task_id.value == handle.task_id
+    assert request.reason == "canceled by TaskHandle"
+    assert handle.status.value == "canceled"
+
+
+@pytest.mark.asyncio
 async def test_node_rejects_cancel_on_reattached_task(sample_card: AgentCard) -> None:
     peer_id = _make_peer_id(bytes(range(32)))
     fake_client = FakeDaemonClient(local_peer_id=peer_id)

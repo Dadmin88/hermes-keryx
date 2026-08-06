@@ -5,14 +5,15 @@ use keryx_core::{
     AgentId as CoreAgentId, IdempotencyKey, LeaseId, PeerId, RetryPolicy, TaskId as CoreTaskId,
     TaskStatus,
 };
+use keryx_daemon::KeryxDaemonConfig;
 use keryx_proto::v1::{
     AckResultDeliveryRequest, AgentId, CancelTaskRequest, ClaimNextResultDeliveryRequest,
     ClaimTaskRequest, CompleteTaskRequest, GetTaskResultRequest, SubmitTaskRequest, TaskEnvelope,
     TaskId, TerminalOutcome,
 };
 use keryx_store::{
-    LeaseRecord, StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
-    TerminalResultRecord,
+    LeaseRecord, SqliteStore, StoreError, TaskEnvelopeRecord, TaskRecord,
+    TaskTransportContextRecord, TerminalResultRecord,
 };
 use prost::Message;
 use tonic::Code;
@@ -42,27 +43,55 @@ async fn submit(harness: &mut RpcTestHarness, task_id: &str) {
 }
 
 #[tokio::test]
-async fn pre_v7_terminal_row_without_durable_result_stays_terminal_and_signals_unavailable() {
-    let mut harness = RpcTestHarness::start().await;
+async fn genuine_v6_terminal_row_migrates_without_fabricated_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keryx.db");
     let task_id = CoreTaskId::new("legacy-terminal-without-result").unwrap();
-    harness
-        .runtime
-        .store()
+
+    let store = SqliteStore::connect(&db_path).await.unwrap();
+    store.migrate().await.unwrap();
+    store
         .accept_task(TaskRecord::new(task_id.clone(), TaskStatus::Pending, None))
         .await
         .unwrap();
-    harness
-        .runtime
-        .store()
+    store
         .transition_task(&task_id, TaskStatus::Running)
         .await
         .unwrap();
-    harness
-        .runtime
-        .store()
+    store
         .transition_task(&task_id, TaskStatus::Completed)
         .await
         .unwrap();
+    store.close().await;
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .unwrap();
+    for statement in [
+        "DROP TABLE result_outbox",
+        "DROP TABLE task_terminal_results",
+        "DROP TABLE task_transport_context",
+        "DELETE FROM schema_migrations WHERE version = 7",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 6);
+    pool.close().await;
+
+    let mut harness = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(dir.path(), 1)
+            .with_local_peer_id(PeerId::new("peer-local").unwrap()),
+    )
+    .await;
+    assert_eq!(harness.runtime.store().schema_version().await.unwrap(), 7);
+    assert!(matches!(
+        harness.runtime.store().get_terminal_result(&task_id).await,
+        Err(StoreError::TerminalResultNotFound(_))
+    ));
 
     let response = harness
         .client
