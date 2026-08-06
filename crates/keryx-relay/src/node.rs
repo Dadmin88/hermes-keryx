@@ -296,6 +296,12 @@ fn publish_result_failure_is_permanent(code: Code) -> bool {
     )
 }
 
+fn result_delivery_retry_delay_ms(attempt_count: u32) -> i64 {
+    const MAX_DELAY_MS: i64 = 60_000;
+    let multiplier = 1_i64 << attempt_count.min(6);
+    1_000_i64.saturating_mul(multiplier).min(MAX_DELAY_MS)
+}
+
 async fn run_result_delivery_worker(
     relay_endpoint: String,
     registry_peer_id: String,
@@ -351,7 +357,7 @@ async fn run_result_delivery_worker(
                         delivery_id: delivery.delivery_id,
                         worker_id: delivery_worker.clone(),
                         error_reason: error.message().to_string(),
-                        retry_delay_ms: 1_000,
+                        retry_delay_ms: result_delivery_retry_delay_ms(delivery.attempt_count),
                         dead_letter: publish_result_failure_is_permanent(error.code()),
                         lease_expires_at_ms: delivery.lease_expires_at_ms,
                     })

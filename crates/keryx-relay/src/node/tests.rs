@@ -118,6 +118,15 @@ fn permanent_publish_rejections_are_dead_lettered_without_acknowledgement() {
     }
 }
 
+#[test]
+fn result_delivery_retry_backoff_is_exponential_and_bounded() {
+    assert_eq!(result_delivery_retry_delay_ms(0), 1_000);
+    assert_eq!(result_delivery_retry_delay_ms(1), 2_000);
+    assert_eq!(result_delivery_retry_delay_ms(5), 32_000);
+    assert_eq!(result_delivery_retry_delay_ms(6), 60_000);
+    assert_eq!(result_delivery_retry_delay_ms(u32::MAX), 60_000);
+}
+
 #[tokio::test]
 async fn relay_stream_shutdown_interrupts_reconnect_backoff() {
     let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel();
