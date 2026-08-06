@@ -26,7 +26,6 @@ keryx-proto = { path = "../keryx-proto" }
 libp2p = { version = "0.54", features = ["tcp", "quic", "noise", "yamux", "relay", "autonat", "identify", "mdns", "ping", "gossipsub", "tokio", "serde", "dns", "macros"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 base64 = "0.22"
 toml = "0.8"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
