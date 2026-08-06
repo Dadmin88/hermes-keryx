@@ -12,7 +12,8 @@ service KeryxRelay {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   // Authenticated unary task publication.
   rpc PublishTask(PublishTaskRequest) returns (PublishTaskResponse);
-  // Authenticated unary terminal-result publication.
+  // Authenticated unary terminal-result publication. Success is returned only after the
+  // authenticated destination persists the result and acknowledges the relay-issued frame.
   rpc PublishResult(PublishResultRequest) returns (PublishResultResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
   // Destination-owned acknowledgement; the authenticated caller must own the relay frame.
@@ -65,7 +66,11 @@ message PublishResultRequest {
   string source_node_id = 3;
   string frame_id = 4;
 }
-message PublishResultResponse { bool accepted = 1; string frame_id = 2; }
+message PublishResultResponse {
+  // True only after authenticated destination acknowledgement of frame_id.
+  bool accepted = 1;
+  string frame_id = 2;
+}
 message AckTaskRequest { TaskId task_id = 1; }
 message AckTaskResponse { bool accepted = 1; }
 message AckFrameRequest { string frame_id = 1; }

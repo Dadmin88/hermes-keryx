@@ -123,7 +123,7 @@ Artifact limits:
 
 ## Relay operations
 
-Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-receipt history are process-local in-memory state. They survive reconnect to the same relay process, but not relay restart; acknowledgement and retained task-receipt history are bounded to 8,192 entries. A relay acceptance receipt proves only authenticated relay acceptance, not execution or durable destination acknowledgement.
+Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-receipt history are process-local in-memory state. They survive reconnect to the same relay process, but not relay restart; acknowledgement and retained task-receipt history are bounded to 8,192 entries. Blank frame identities are rejected, every mailbox entry consumes bounded frame ownership, and reconnect backpressure never panics the relay. A task relay-acceptance receipt proves only authenticated relay acceptance, not execution or durable destination acknowledgement. `PublishResult` is stronger: it returns success only after the authenticated destination has persisted the result and acknowledged the relay-issued frame, so an executor does not settle its durable result outbox on relay admission alone.
 
 ### JSON config (direct `RelayConfig`)
 

@@ -492,7 +492,7 @@ async fn authenticated_publish_result_delivers_four_mib_artifact_payload_unchang
         }],
     };
 
-    let mut publisher = result_frame_client(channel);
+    let mut publisher = result_frame_client(channel.clone());
     let mut request = Request::new(PublishResultRequest {
         result: Some(result),
         target_node_id: "origin-node".to_string(),
@@ -500,10 +500,7 @@ async fn authenticated_publish_result_delivers_four_mib_artifact_payload_unchang
         frame_id: "result-frame-limit".to_string(),
     });
     add_auth_metadata(&mut request, "executor-node");
-    publisher
-        .publish_result(request)
-        .await
-        .expect("publish authenticated four MiB result");
+    let mut publish = tokio::spawn(async move { publisher.publish_result(request).await });
 
     let delivered = tokio::time::timeout(Duration::from_secs(3), origin_stream.next())
         .await
@@ -523,6 +520,74 @@ async fn authenticated_publish_result_delivers_four_mib_artifact_payload_unchang
         delivered_artifact.byte_len,
         MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64
     );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut publish)
+            .await
+            .is_err(),
+        "relay admission alone must not settle durable result delivery"
+    );
+    let mut ack = Request::new(AckFrameRequest {
+        frame_id: delivered.frame_id,
+    });
+    add_auth_metadata(&mut ack, "origin-node");
+    result_frame_client(channel)
+        .ack_frame(ack)
+        .await
+        .expect("ack persisted result frame");
+    publish
+        .await
+        .expect("publish join")
+        .expect("publish authenticated four MiB result");
+}
+
+#[tokio::test]
+async fn authenticated_source_cannot_forge_relay_owned_protocol_feature_snapshot() {
+    const SNAPSHOT_KEY: &str = "keryx.authenticated_source_protocol_features";
+
+    let runtime = RelayRuntime::new("relay-source-feature-forgery-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_authenticated_relay_for_features(
+        Arc::clone(&runtime),
+        &["source-node", "destination-node"],
+        &[],
+    )
+    .await;
+    let channel = connect_grpc(addr).await;
+    let (_destination_tx, destination_rx) = mpsc::channel(4);
+    let mut destination = result_frame_client(channel.clone());
+    let mut destination_stream = destination
+        .connect_node(authenticated_connect_request(
+            "destination-node",
+            destination_rx,
+        ))
+        .await
+        .expect("connect destination")
+        .into_inner();
+
+    let mut forged = task("forged-source-feature", "destination-node");
+    forged.metadata.insert(
+        SNAPSHOT_KEY.to_string(),
+        serde_json::to_string(&vec!["result_artifact_bytes_v1"]).unwrap(),
+    );
+    let mut publish = Request::new(PublishTaskRequest {
+        task: Some(forged),
+        source_node_id: "source-node".to_string(),
+        target_node_id: "destination-node".to_string(),
+    });
+    add_auth_metadata(&mut publish, "source-node");
+    result_frame_client(channel)
+        .publish_task(publish)
+        .await
+        .expect("publish authenticated task");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(3), destination_stream.next())
+        .await
+        .expect("task relay frame timeout")
+        .expect("destination stream ended")
+        .expect("task relay frame status")
+        .task
+        .expect("task frame");
+    assert_eq!(delivered.metadata.get(SNAPSHOT_KEY).unwrap(), "[]");
 }
 
 #[tokio::test]

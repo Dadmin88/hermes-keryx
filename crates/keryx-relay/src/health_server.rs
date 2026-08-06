@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
@@ -283,13 +283,11 @@ impl KeryxRelay for RelayHealthService {
             Vec::new()
         };
         let mut delivered_task = task.clone();
-        delivered_task
-            .metadata
-            .entry(AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string())
-            .or_insert(
-                serde_json::to_string(&source_features)
-                    .map_err(|error| Status::internal(error.to_string()))?,
-            );
+        delivered_task.metadata.insert(
+            AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string(),
+            serde_json::to_string(&source_features)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        );
         let frame = RelayFrame {
             frame_id: proposed_receipt.frame_id.clone(),
             task: Some(delivered_task),
@@ -361,16 +359,34 @@ impl KeryxRelay for RelayHealthService {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Status::invalid_argument("PublishResult requires result.task_id"))?;
         let frame_id = new_relay_frame_id();
-        ensure_frame_routed(self.runtime.route_frame(
+        let (delivery, acknowledgement) = self.runtime.route_frame_waiting_for_ack(
             target_node_id.clone(),
             RelayFrame {
                 frame_id: frame_id.clone(),
                 task: None,
                 result: Some(result),
                 authenticated_source_node_id: source_node_id,
-                destination_node_id: target_node_id,
+                destination_node_id: target_node_id.clone(),
             },
-        ))?;
+        );
+        ensure_frame_routed(delivery)?;
+        let acknowledgement = acknowledgement
+            .ok_or_else(|| Status::internal("accepted result frame lacks acknowledgement state"))?;
+        match tokio::time::timeout(Duration::from_secs(25), acknowledgement).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.runtime.abandon_frame(&target_node_id, &frame_id);
+                return Err(Status::unavailable(
+                    "relay restarted before destination acknowledged result frame",
+                ));
+            }
+            Err(_) => {
+                self.runtime.abandon_frame(&target_node_id, &frame_id);
+                return Err(Status::deadline_exceeded(
+                    "destination did not acknowledge result frame before retry deadline",
+                ));
+            }
+        }
         Ok(Response::new(PublishResultResponse {
             accepted: true,
             frame_id,
@@ -475,6 +491,9 @@ fn ensure_frame_routed(delivery: crate::runtime::FrameDelivery) -> Result<(), St
         )),
         crate::runtime::FrameDelivery::RejectedCapacity => {
             Err(Status::resource_exhausted("relay frame capacity reached"))
+        }
+        crate::runtime::FrameDelivery::RejectedInvalid => {
+            Err(Status::invalid_argument("relay frame identity is required"))
         }
     }
 }

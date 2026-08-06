@@ -96,7 +96,8 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def PublishResult(self, request, context):
-        """Authenticated unary terminal-result publication.
+        """Authenticated unary terminal-result publication. Success is returned only after the
+        authenticated destination persists the result and acknowledges the relay-issued frame.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

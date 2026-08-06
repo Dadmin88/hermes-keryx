@@ -41,6 +41,7 @@ Operational outcomes are metadata/events rather than extra task status values:
 - worker lifecycle: `SubmitTask`, `SubmitRemoteTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
 - remote results: `GetTaskResult`, `ClaimNextResultDelivery`, `AckResultDelivery`, `FailResultDelivery`, `IngestRemoteResult`
 - result-delivery claims return `lease_expires_at_ms` as a claim-generation fence; ACK/failure callers must echo that exact active value, and stale or expired claims fail closed even when a later claimant reuses the same worker ID
+- the executor settles its durable result-delivery outbox only after `PublishResult` observes the authenticated destination's `AckFrame`, which the destination sends after `IngestRemoteResult` succeeds; relay restart, timeout, or response loss before that acknowledgement leaves/requeues the durable outbox delivery for an idempotent fresh-frame retry
 - artifacts: `PutArtifact`, `GetArtifact`, `ListArtifacts`, `DeleteArtifact`
 - routing/discovery: `SendTask`, `ListPeers`, `DiscoverSkills`
 

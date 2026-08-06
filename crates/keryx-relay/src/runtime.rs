@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use keryx_observe::RelayMetrics;
 use keryx_proto::v1::{RelayFrame, TaskEnvelope};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
 /// Sender used by the gRPC relay stream to push frames to a connected node.
@@ -24,6 +24,8 @@ pub enum FrameDelivery {
     RejectedDuplicate,
     /// The bounded ownership table cannot accept another unacknowledged frame.
     RejectedCapacity,
+    /// The frame lacks the non-empty relay identity required for bounded ownership.
+    RejectedInvalid,
 }
 
 /// Result of acknowledging a relay frame as an authenticated destination.
@@ -92,6 +94,7 @@ struct PeerState {
     published_tasks: HashMap<TaskPublishKey, PublishedTaskRecord>,
     published_frame_index: HashMap<FrameKey, TaskPublishKey>,
     acknowledged_published_task_order: VecDeque<TaskPublishKey>,
+    frame_ack_waiters: HashMap<FrameKey, oneshot::Sender<()>>,
 }
 
 pub const MAX_TRACKED_FRAMES: usize = 8_192;
@@ -179,14 +182,26 @@ impl RelayRuntime {
             .filter(|frame| !is_acked(&node_id, frame, &guard.acknowledged_frames))
             .cloned()
             .collect::<Vec<_>>();
+        let mut stream_open = true;
+        let mut replayed = 0;
         for frame in &pending {
-            sender
-                .try_send(Ok(frame.clone()))
-                .expect("relay stream buffer must cover the bounded frame table");
+            match sender.try_send(Ok(frame.clone())) {
+                Ok(()) => replayed += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stream_open = false;
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    stream_open = false;
+                    break;
+                }
+            }
         }
-        guard.connected_nodes.insert(node_id.clone(), sender);
+        if stream_open {
+            guard.connected_nodes.insert(node_id.clone(), sender);
+        }
         self.sync_connected_peer_metric(&guard);
-        pending.len()
+        replayed
     }
 
     /// Mark a node stream disconnected. A reconnect with the same node id replaces this state.
@@ -213,6 +228,48 @@ impl RelayRuntime {
             self.metrics.increment_tasks_routed();
         }
         delivery
+    }
+
+    /// Route a result frame and return a waiter that resolves only after the authenticated
+    /// destination acknowledges the exact relay-issued frame.
+    pub fn route_frame_waiting_for_ack(
+        &self,
+        target_node_id: impl Into<String>,
+        frame: RelayFrame,
+    ) -> (FrameDelivery, Option<oneshot::Receiver<()>>) {
+        let target_node_id = target_node_id.into();
+        let frame_id = frame.frame_id.trim().to_string();
+        let mut guard = self.lock_peers();
+        let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
+        let receiver = if matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ) {
+            let (sender, receiver) = oneshot::channel();
+            guard
+                .frame_ack_waiters
+                .insert((target_node_id, frame_id), sender);
+            Some(receiver)
+        } else {
+            None
+        };
+        self.sync_connected_peer_metric(&guard);
+        if receiver.is_some() {
+            self.metrics.increment_tasks_routed();
+        }
+        (delivery, receiver)
+    }
+
+    /// Abandon a timed-out result frame generation while leaving any already-delivered copy
+    /// harmlessly idempotent at the destination.
+    pub fn abandon_frame(&self, destination_node_id: &str, frame_id: &str) {
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        let mut guard = self.lock_peers();
+        guard.frame_ack_waiters.remove(&key);
+        guard.frame_destinations.remove(&key);
+        if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
+        }
     }
 
     /// Acknowledge a destination-owned frame and remove only its mailbox copy.
@@ -248,6 +305,12 @@ impl RelayRuntime {
             }
         }
         remember_acknowledgement(&mut guard, key);
+        if let Some(waiter) = guard
+            .frame_ack_waiters
+            .remove(&(destination_node_id.to_string(), frame_id.to_string()))
+        {
+            let _ = waiter.send(());
+        }
         mark_published_task_acknowledged(&mut guard, destination_node_id, frame_id);
         FrameAcknowledgement::Accepted
     }
@@ -291,6 +354,11 @@ impl RelayRuntime {
         if guard.frame_destinations.contains(&frame_key)
             || guard.acknowledged_frames.contains(&frame_key)
             || guard.frame_destinations.len() >= MAX_TRACKED_FRAMES
+            || proposed_receipt.frame_id.trim().is_empty()
+            || guard
+                .mailboxes
+                .get(destination_node_id)
+                .is_some_and(|mailbox| mailbox.len() >= MAX_TRACKED_FRAMES)
         {
             return PublishedTaskDelivery::RejectedCapacity;
         }
@@ -484,16 +552,22 @@ fn route_frame_locked(
     frame: RelayFrame,
 ) -> FrameDelivery {
     let frame_id = frame.frame_id.trim();
-    if !frame_id.is_empty() {
-        let key = (target_node_id.clone(), frame_id.to_string());
-        if state.frame_destinations.contains(&key) || state.acknowledged_frames.contains(&key) {
-            return FrameDelivery::RejectedDuplicate;
-        }
-        if state.frame_destinations.len() >= MAX_TRACKED_FRAMES {
-            return FrameDelivery::RejectedCapacity;
-        }
-        state.frame_destinations.insert(key);
+    if frame_id.is_empty() {
+        return FrameDelivery::RejectedInvalid;
     }
+    let key = (target_node_id.clone(), frame_id.to_string());
+    if state.frame_destinations.contains(&key) || state.acknowledged_frames.contains(&key) {
+        return FrameDelivery::RejectedDuplicate;
+    }
+    if state.frame_destinations.len() >= MAX_TRACKED_FRAMES
+        || state
+            .mailboxes
+            .get(&target_node_id)
+            .is_some_and(|mailbox| mailbox.len() >= MAX_TRACKED_FRAMES)
+    {
+        return FrameDelivery::RejectedCapacity;
+    }
+    state.frame_destinations.insert(key);
     state.registered.insert(target_node_id.clone());
     state
         .mailboxes
@@ -908,5 +982,57 @@ mod tests {
             FrameDelivery::RejectedCapacity
         );
         assert_eq!(runtime.mailbox_depth("destination"), MAX_TRACKED_FRAMES);
+    }
+
+    #[test]
+    fn blank_frame_identity_is_rejected_without_consuming_mailbox_capacity() {
+        let runtime = RelayRuntime::new("relay");
+        assert_eq!(
+            runtime.route_frame("destination", frame("   ")),
+            FrameDelivery::RejectedInvalid
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), 0);
+    }
+
+    #[test]
+    fn reconnect_backpressure_never_panics_or_discards_authoritative_mailbox() {
+        let runtime = RelayRuntime::new("relay");
+        assert_eq!(
+            runtime.route_frame("destination", frame("pending")),
+            FrameDelivery::Mailboxed
+        );
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(Ok(frame("already-buffered"))).unwrap();
+        assert_eq!(runtime.connect_node("destination", sender), 0);
+        assert_eq!(runtime.mailbox_depth("destination"), 1);
+        assert!(!runtime.peer_identity("destination").unwrap().connected);
+    }
+
+    #[tokio::test]
+    async fn result_delivery_waiter_resolves_only_for_authenticated_destination_ack() {
+        let runtime = RelayRuntime::new("relay");
+        let (delivery, acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination", frame("result-frame"));
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        let acknowledgement = acknowledgement.unwrap();
+        assert_eq!(
+            runtime.ack_frame("other-destination", "result-frame"),
+            FrameAcknowledgement::WrongDestination
+        );
+        assert_eq!(
+            runtime.ack_frame("destination", "result-frame"),
+            FrameAcknowledgement::Accepted
+        );
+        acknowledgement.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_restart_drops_unacknowledged_result_waiter_instead_of_settling_it() {
+        let runtime = RelayRuntime::new("relay");
+        let (delivery, acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination", frame("result-frame"));
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        drop(runtime);
+        assert!(acknowledgement.unwrap().await.is_err());
     }
 }
