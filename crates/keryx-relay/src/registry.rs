@@ -376,7 +376,7 @@ impl SkillRegistry {
         &self,
         gossip: GossipRegistration,
     ) -> Result<(), RegistryGossipError> {
-        let registration = gossip.try_into_registration()?;
+        let mut registration = gossip.try_into_registration()?;
         let mut guard = self.inner.write().await;
         if registration.expires_at <= Instant::now() {
             guard.remove_peer(&registration.peer_id);
@@ -389,6 +389,12 @@ impl SkillRegistry {
         {
             return Ok(());
         }
+        // Gossip is useful for discovery but is not an authenticated capability authority.
+        // Preserve only features already established by this relay's authenticated control plane.
+        registration.protocol_features = guard
+            .nodes
+            .get(&registration.peer_id)
+            .map_or_else(Vec::new, |existing| existing.protocol_features.clone());
         guard.insert_registration(registration);
         Ok(())
     }
@@ -742,5 +748,68 @@ mod tests {
         let found = target.discover(Some("sync"), &["relay".into()], 10).await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].peer_id.as_str(), "peer-gossip");
+    }
+
+    #[tokio::test]
+    async fn gossip_cannot_assert_or_replace_authenticated_protocol_features() {
+        let source = SkillRegistry::new();
+        let target = SkillRegistry::new();
+        let id = peer("peer-feature-owner");
+        source
+            .register_with_features(
+                id.clone(),
+                vec![skill("sync", &[])],
+                "source".into(),
+                "".into(),
+                vec!["forged_feature".into()],
+                None,
+            )
+            .await;
+
+        target
+            .apply_gossip_bytes(&source.gossip_snapshot_bytes().await)
+            .await
+            .unwrap();
+        assert!(
+            !target
+                .supports_protocol_feature(&id, "forged_feature")
+                .await
+        );
+
+        target
+            .register_with_features(
+                id.clone(),
+                vec![skill("local", &[])],
+                "target".into(),
+                "".into(),
+                vec!["authenticated_feature".into()],
+                None,
+            )
+            .await;
+        sleep(TokioDuration::from_millis(2)).await;
+        source
+            .register_with_features(
+                id.clone(),
+                vec![skill("newer-gossip", &[])],
+                "source-newer".into(),
+                "".into(),
+                vec!["forged_feature".into()],
+                None,
+            )
+            .await;
+        target
+            .apply_gossip_bytes(&source.gossip_snapshot_bytes().await)
+            .await
+            .unwrap();
+        assert!(
+            target
+                .supports_protocol_feature(&id, "authenticated_feature")
+                .await
+        );
+        assert!(
+            !target
+                .supports_protocol_feature(&id, "forged_feature")
+                .await
+        );
     }
 }
