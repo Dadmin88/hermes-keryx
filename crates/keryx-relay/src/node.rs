@@ -287,6 +287,7 @@ async fn run_relay_stream(
                             .ack_result_delivery(AckResultDeliveryRequest {
                                 delivery_id: delivery.delivery_id,
                                 worker_id: delivery_worker.clone(),
+                                lease_expires_at_ms: delivery.lease_expires_at_ms,
                             })
                             .await?;
                     }
@@ -298,6 +299,7 @@ async fn run_relay_stream(
                                 error_reason: error.message().to_string(),
                                 retry_delay_ms: 1_000,
                                 dead_letter: false,
+                                lease_expires_at_ms: delivery.lease_expires_at_ms,
                             })
                             .await?;
                     }

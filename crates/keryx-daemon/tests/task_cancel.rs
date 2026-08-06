@@ -233,6 +233,7 @@ async fn destination_cancel_emits_one_idempotent_canceled_result_delivery() {
             .ack_result_delivery(AckResultDeliveryRequest {
                 delivery_id: delivery.delivery_id,
                 worker_id: "cancel-delivery-worker".to_string(),
+                lease_expires_at_ms: delivery.lease_expires_at_ms,
             })
             .await
             .unwrap()
@@ -267,6 +268,108 @@ async fn destination_cancel_emits_one_idempotent_canceled_result_delivery() {
         .unwrap()
         .into_inner();
     assert!(!no_duplicate.has_delivery);
+}
+
+#[tokio::test]
+async fn stale_result_delivery_ack_cannot_fence_out_a_new_same_worker_claim() {
+    let mut harness = RpcTestHarness::start().await;
+    let task_id = CoreTaskId::new("cancel-stale-result-ack").unwrap();
+    let origin = PeerId::new("peer-origin-stale-ack").unwrap();
+    let local = harness.runtime.config().local_peer_id().clone();
+    harness
+        .runtime
+        .store()
+        .accept_task_with_envelope_and_context(
+            TaskRecord::new(task_id.clone(), TaskStatus::Pending, None),
+            TaskEnvelopeRecord::new(
+                task_id.clone(),
+                envelope(task_id.as_str()).encode_to_vec(),
+                1,
+            ),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(origin),
+                expected_executor_peer_id: Some(local.clone()),
+                destination_peer_id: local,
+                relay_frame_id: Some("relay-stale-result-ack".to_string()),
+                received_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+    harness
+        .client
+        .cancel_task(CancelTaskRequest {
+            task_id: Some(TaskId {
+                value: task_id.to_string(),
+            }),
+            reason: "fenced cancellation".to_string(),
+            metadata: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let first = harness
+        .client
+        .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+            worker_id: "edge-worker".to_string(),
+            lease_duration_ms: 1_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.has_delivery);
+    let reclaim_at_ms = first.lease_expires_at_ms.saturating_add(1);
+    let (second, _) = harness
+        .runtime
+        .store()
+        .claim_next_result_delivery("edge-worker", reclaim_at_ms, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(Some(first.lease_expires_at_ms), second.lease_expires_at_ms);
+
+    let stale_ack = harness
+        .runtime
+        .store()
+        .ack_result_delivery(
+            &first.delivery_id,
+            "edge-worker",
+            first.lease_expires_at_ms,
+            reclaim_at_ms,
+        )
+        .await;
+    assert!(matches!(
+        stale_ack,
+        Err(StoreError::ResultDeliveryLeaseMismatch(_))
+    ));
+    let stale_fail = harness
+        .runtime
+        .store()
+        .fail_result_delivery(
+            &first.delivery_id,
+            ("edge-worker", first.lease_expires_at_ms),
+            reclaim_at_ms,
+            reclaim_at_ms.saturating_add(1_000),
+            "stale failure",
+            false,
+        )
+        .await;
+    assert!(matches!(
+        stale_fail,
+        Err(StoreError::ResultDeliveryLeaseMismatch(_))
+    ));
+    harness
+        .runtime
+        .store()
+        .ack_result_delivery(
+            &second.delivery_id,
+            "edge-worker",
+            second.lease_expires_at_ms.unwrap(),
+            reclaim_at_ms.saturating_add(1),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

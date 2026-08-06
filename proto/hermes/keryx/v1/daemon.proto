@@ -111,6 +111,8 @@ message ClaimNextResultDeliveryResponse {
 message AckResultDeliveryRequest {
   string delivery_id = 1;
   string worker_id = 2;
+  // Fences acknowledgement to the exact active claim generation.
+  int64 lease_expires_at_ms = 3;
 }
 message AckResultDeliveryResponse { bool accepted = 1; }
 message FailResultDeliveryRequest {
@@ -119,6 +121,8 @@ message FailResultDeliveryRequest {
   string error_reason = 3;
   int64 retry_delay_ms = 4;
   bool dead_letter = 5;
+  // Fences failure to the exact active claim generation.
+  int64 lease_expires_at_ms = 6;
 }
 message FailResultDeliveryResponse { bool accepted = 1; }
 message IngestRemoteResultRequest {

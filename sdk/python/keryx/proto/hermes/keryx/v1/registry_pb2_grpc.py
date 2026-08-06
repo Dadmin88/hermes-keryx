@@ -5,7 +5,7 @@ import warnings
 
 from hermes.keryx.v1 import registry_pb2 as hermes_dot_keryx_dot_v1_dot_registry__pb2
 
-GRPC_GENERATED_VERSION = '1.82.1'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 

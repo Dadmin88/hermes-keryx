@@ -1872,7 +1872,12 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let inner = request.into_inner();
         self.runtime
             .store()
-            .ack_result_delivery(&inner.delivery_id, &inner.worker_id, unix_ms_now())
+            .ack_result_delivery(
+                &inner.delivery_id,
+                &inner.worker_id,
+                inner.lease_expires_at_ms,
+                unix_ms_now(),
+            )
             .await
             .map_err(store_error_to_status)?;
         Ok(Response::new(AckResultDeliveryResponse { accepted: true }))
@@ -1888,7 +1893,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             .store()
             .fail_result_delivery(
                 &inner.delivery_id,
-                &inner.worker_id,
+                (&inner.worker_id, inner.lease_expires_at_ms),
                 now_ms,
                 now_ms.saturating_add(inner.retry_delay_ms.max(1_000)),
                 &inner.error_reason,

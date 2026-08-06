@@ -883,12 +883,15 @@ impl SqliteStore {
         &self,
         delivery_id: &str,
         worker_id: &str,
+        lease_expires_at_ms: i64,
         now_ms: i64,
     ) -> StoreResult<()> {
-        let changed = sqlx::query("UPDATE result_outbox SET state = 'delivered', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ?")
+        let changed = sqlx::query("UPDATE result_outbox SET state = 'delivered', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?")
             .bind(now_ms)
             .bind(delivery_id)
             .bind(worker_id)
+            .bind(lease_expires_at_ms)
+            .bind(now_ms)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -904,7 +907,7 @@ impl SqliteStore {
     pub async fn fail_result_delivery(
         &self,
         delivery_id: &str,
-        worker_id: &str,
+        claim: (&str, i64),
         now_ms: i64,
         retry_at_ms: i64,
         error: &str,
@@ -915,13 +918,15 @@ impl SqliteStore {
         } else {
             "pending"
         };
-        let changed = sqlx::query("UPDATE result_outbox SET state = ?, attempt_count = attempt_count + 1, next_attempt_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, last_error = ?, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ?")
+        let changed = sqlx::query("UPDATE result_outbox SET state = ?, attempt_count = attempt_count + 1, next_attempt_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, last_error = ?, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?")
             .bind(state)
             .bind(retry_at_ms)
             .bind(error)
             .bind(now_ms)
             .bind(delivery_id)
-            .bind(worker_id)
+            .bind(claim.0)
+            .bind(claim.1)
+            .bind(now_ms)
             .execute(&self.pool)
             .await?
             .rows_affected();
