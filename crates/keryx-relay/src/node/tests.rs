@@ -798,6 +798,12 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         executor_shutdown_rx,
         RelayReconnectPolicy::new(Duration::from_millis(100), Duration::from_millis(100)),
     ));
+    let executor_delivery = tokio::spawn(run_result_delivery_worker(
+        format!("http://{relay_addr}"),
+        EXECUTOR.to_string(),
+        Some(EXECUTOR_TOKEN.to_string()),
+        format!("http://{executor_addr}"),
+    ));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if first_runtime
@@ -918,6 +924,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         .await
         .unwrap()
         .unwrap();
+    executor_delivery.abort();
+    let _ = executor_delivery.await;
     second_proxy.abort();
     second_relay.abort();
     origin_server.abort();

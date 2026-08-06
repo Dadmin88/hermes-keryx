@@ -147,18 +147,39 @@ pub async fn run_edge_node() -> Result<()> {
             let registry_peer_id = registry_peer_id.clone();
             let node_token = node_token();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let task = tokio::spawn(supervise_relay_stream(
-                move || {
-                    run_relay_stream(
-                        relay_endpoint.clone(),
-                        registry_peer_id.clone(),
-                        node_token.clone(),
-                        daemon_endpoint.clone(),
+            let stream_shutdown = shutdown_rx.clone();
+            let stream_relay_endpoint = relay_endpoint.clone();
+            let stream_registry_peer_id = registry_peer_id.clone();
+            let stream_node_token = node_token.clone();
+            let stream_daemon_endpoint = daemon_endpoint.clone();
+            let task = tokio::spawn(async move {
+                tokio::join!(
+                    supervise_relay_stream(
+                        move || {
+                            run_relay_stream(
+                                stream_relay_endpoint.clone(),
+                                stream_registry_peer_id.clone(),
+                                stream_node_token.clone(),
+                                stream_daemon_endpoint.clone(),
+                            )
+                        },
+                        stream_shutdown,
+                        RelayReconnectPolicy::default(),
+                    ),
+                    supervise_relay_stream(
+                        move || {
+                            run_result_delivery_worker(
+                                relay_endpoint.clone(),
+                                registry_peer_id.clone(),
+                                node_token.clone(),
+                                daemon_endpoint.clone(),
+                            )
+                        },
+                        shutdown_rx,
+                        RelayReconnectPolicy::default(),
                     )
-                },
-                shutdown_rx,
-                RelayReconnectPolicy::default(),
-            ));
+                );
+            });
             Some((shutdown_tx, task))
         }
         (Some(_), None) => {
@@ -275,6 +296,71 @@ fn publish_result_failure_is_permanent(code: Code) -> bool {
     )
 }
 
+async fn run_result_delivery_worker(
+    relay_endpoint: String,
+    registry_peer_id: String,
+    node_token: Option<String>,
+    daemon_endpoint: String,
+) -> Result<()> {
+    let channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
+    let mut relay = KeryxRelayClient::new(channel)
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let mut daemon = KeryxDaemonClient::connect(daemon_endpoint)
+        .await?
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let delivery_worker = format!("edge-{registry_peer_id}");
+    let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        delivery_tick.tick().await;
+        let delivery = daemon
+            .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+                worker_id: delivery_worker.clone(),
+                lease_duration_ms: 30_000,
+            })
+            .await?
+            .into_inner();
+        if !delivery.has_delivery {
+            continue;
+        }
+        let mut publish_request = Request::new(PublishResultRequest {
+            result: delivery.result,
+            target_node_id: delivery.target_peer_id,
+            source_node_id: registry_peer_id.clone(),
+            frame_id: delivery.delivery_id.clone(),
+        });
+        add_node_auth_metadata(
+            &mut publish_request,
+            &registry_peer_id,
+            node_token.as_deref(),
+        )?;
+        match relay.publish_result(publish_request).await {
+            Ok(_) => {
+                daemon
+                    .ack_result_delivery(AckResultDeliveryRequest {
+                        delivery_id: delivery.delivery_id,
+                        worker_id: delivery_worker.clone(),
+                        lease_expires_at_ms: delivery.lease_expires_at_ms,
+                    })
+                    .await?;
+            }
+            Err(error) => {
+                daemon
+                    .fail_result_delivery(FailResultDeliveryRequest {
+                        delivery_id: delivery.delivery_id,
+                        worker_id: delivery_worker.clone(),
+                        error_reason: error.message().to_string(),
+                        retry_delay_ms: 1_000,
+                        dead_letter: publish_result_failure_is_permanent(error.code()),
+                        lease_expires_at_ms: delivery.lease_expires_at_ms,
+                    })
+                    .await?;
+            }
+        }
+    }
+}
+
 async fn run_relay_stream(
     relay_endpoint: String,
     registry_peer_id: String,
@@ -298,8 +384,6 @@ async fn run_relay_stream(
         .into_inner();
     info!(registry_peer_id = %registry_peer_id, relay_endpoint = %relay_endpoint, "relay stream connected");
 
-    let delivery_worker = format!("edge-{registry_peer_id}");
-    let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             next = stream.next() => {
@@ -347,57 +431,7 @@ async fn run_relay_stream(
                     .await
                     .context("keryx node stream: relay AckFrame failed")?;
             }
-            _ = delivery_tick.tick() => {
-                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
-                    .await?
-                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
-                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
-                let delivery = daemon
-                    .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
-                        worker_id: delivery_worker.clone(),
-                        lease_duration_ms: 30_000,
-                    })
-                    .await?
-                    .into_inner();
-                if !delivery.has_delivery {
-                    continue;
-                }
-                let mut publish_request = Request::new(PublishResultRequest {
-                    result: delivery.result,
-                    target_node_id: delivery.target_peer_id,
-                    source_node_id: registry_peer_id.clone(),
-                    frame_id: delivery.delivery_id.clone(),
-                });
-                add_node_auth_metadata(
-                    &mut publish_request,
-                    &registry_peer_id,
-                    node_token.as_deref(),
-                )?;
-                let publish = relay.publish_result(publish_request).await;
-                match publish {
-                    Ok(_) => {
-                        daemon
-                            .ack_result_delivery(AckResultDeliveryRequest {
-                                delivery_id: delivery.delivery_id,
-                                worker_id: delivery_worker.clone(),
-                                lease_expires_at_ms: delivery.lease_expires_at_ms,
-                            })
-                            .await?;
-                    }
-                    Err(error) => {
-                        daemon
-                            .fail_result_delivery(FailResultDeliveryRequest {
-                                delivery_id: delivery.delivery_id,
-                                worker_id: delivery_worker.clone(),
-                                error_reason: error.message().to_string(),
-                                retry_delay_ms: 1_000,
-                                dead_letter: publish_result_failure_is_permanent(error.code()),
-                                lease_expires_at_ms: delivery.lease_expires_at_ms,
-                            })
-                            .await?;
-                    }
-                }
-            }
+
         }
     }
     drop(request_sender);
