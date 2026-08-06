@@ -372,7 +372,7 @@ async fn relay_restart_reconnects_reapplies_auth_and_processes_later_task() {
     first_runtime.mark_transport_listening();
     let first_relay = spawn_relay_server(
         first_backend_addr,
-        first_runtime,
+        Arc::clone(&first_runtime),
         Arc::clone(&registry),
         Arc::clone(&auth),
     );
@@ -394,6 +394,35 @@ async fn relay_restart_reconnects_reapplies_auth_and_processes_later_task() {
         shutdown_rx,
         RelayReconnectPolicy::new(Duration::from_millis(10), Duration::from_millis(40)),
     ));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if first_runtime
+                .peer_identity(DESTINATION)
+                .is_some_and(|peer| peer.connected)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("authenticated edge stream must connect before clean EOF");
+    first_runtime.disconnect_node(DESTINATION);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if attempts.load(Ordering::SeqCst) >= 2
+                && first_runtime
+                    .peer_identity(DESTINATION)
+                    .is_some_and(|peer| peer.connected)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("clean relay EOF must reconnect without restarting the edge");
 
     publish_remote_task(
         relay_addr,
@@ -656,9 +685,9 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         TcpListenerStream::new(executor_listener),
     ));
 
-    let relay_addr = reserve_loopback_addr().await;
-    let relay_runtime = RelayRuntime::new("result-outbox-reconnect-test");
-    relay_runtime.mark_transport_listening();
+    let first_backend_addr = reserve_loopback_addr().await;
+    let first_runtime = RelayRuntime::new("result-outbox-before-relay-restart");
+    first_runtime.mark_transport_listening();
     let registry = Arc::new(SkillRegistry::new());
     for node_id in [ORIGIN, EXECUTOR] {
         registry
@@ -683,11 +712,13 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         Default::default(),
     ));
     let first_relay = spawn_relay_server(
-        relay_addr,
-        Arc::clone(&relay_runtime),
+        first_backend_addr,
+        Arc::clone(&first_runtime),
         Arc::clone(&registry),
         Arc::clone(&auth),
     );
+    let relay_addr = reserve_loopback_addr().await;
+    let first_proxy = spawn_tcp_proxy(relay_addr, first_backend_addr);
 
     let origin_attempts = Arc::new(AtomicUsize::new(0));
     let origin_task_attempts = Arc::clone(&origin_attempts);
@@ -723,8 +754,12 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     ));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if relay_runtime.peer_identity(ORIGIN).is_some()
-                && relay_runtime.peer_identity(EXECUTOR).is_some()
+            if first_runtime
+                .peer_identity(ORIGIN)
+                .is_some_and(|peer| peer.connected)
+                && first_runtime
+                    .peer_identity(EXECUTOR)
+                    .is_some_and(|peer| peer.connected)
             {
                 break;
             }
@@ -734,8 +769,10 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     .await
     .expect("both authenticated edge streams must connect");
 
-    relay_runtime.disconnect_node(ORIGIN);
-    relay_runtime.disconnect_node(EXECUTOR);
+    first_proxy.abort();
+    let _ = first_proxy.await;
+    first_relay.abort();
+    let _ = first_relay.await;
 
     let mut executor_client = KeryxDaemonClient::connect(format!("http://{executor_addr}"))
         .await
@@ -779,6 +816,17 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         "result outbox must remain durable while relay is down"
     );
 
+    let second_backend_addr = reserve_loopback_addr().await;
+    let second_runtime = RelayRuntime::new("result-outbox-after-relay-restart");
+    second_runtime.mark_transport_listening();
+    let second_relay = spawn_relay_server(
+        second_backend_addr,
+        Arc::clone(&second_runtime),
+        Arc::clone(&registry),
+        Arc::clone(&auth),
+    );
+    let second_proxy = spawn_tcp_proxy(relay_addr, second_backend_addr);
+
     let result_id = CoreTaskId::new(RESULT_TASK).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -807,8 +855,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
 
     publish_remote_task(relay_addr, ORIGIN, ORIGIN_TOKEN, EXECUTOR, NEXT_TASK).await;
     wait_for_task(&executor_runtime, NEXT_TASK).await;
-    assert_eq!(relay_runtime.mailbox_depth(ORIGIN), 0);
-    assert_eq!(relay_runtime.mailbox_depth(EXECUTOR), 0);
+    assert_eq!(second_runtime.mailbox_depth(ORIGIN), 0);
+    assert_eq!(second_runtime.mailbox_depth(EXECUTOR), 0);
 
     origin_shutdown_tx.send(true).unwrap();
     executor_shutdown_tx.send(true).unwrap();
@@ -820,7 +868,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         .await
         .unwrap()
         .unwrap();
-    first_relay.abort();
+    second_proxy.abort();
+    second_relay.abort();
     origin_server.abort();
     executor_server.abort();
 }
