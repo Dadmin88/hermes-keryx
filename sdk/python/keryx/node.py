@@ -817,8 +817,8 @@ class KeryxNode:
     def task_handle(self, task_id: str) -> TaskHandle:
         """Reopen one daemon-backed task by ID for status/result reads.
 
-        Reattached cancellation is unavailable because the durable four-state
-        store cannot distinguish cancellation from canonical failure.
+        Reattached cancellation is unavailable because a reopened read handle
+        carries no original submission authority; cancellation fails closed.
         """
         self._ensure_running()
         task_id = _validate_task_id(task_id)
