@@ -9,7 +9,10 @@ use keryx_proto::v1::{
     AgentId, CancelTaskRequest, ClaimTaskRequest, CompleteTaskRequest, GetTaskResultRequest,
     SubmitTaskRequest, TaskEnvelope, TaskId, TerminalOutcome,
 };
-use keryx_store::{LeaseRecord, TaskRecord, TerminalResultRecord};
+use keryx_store::{
+    LeaseRecord, StoreError, TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord,
+    TerminalResultRecord,
+};
 use prost::Message;
 use tonic::Code;
 
@@ -77,6 +80,63 @@ async fn pre_v7_terminal_row_without_durable_result_stays_terminal_and_signals_u
         response.data_unavailable_reason,
         "terminal_result_unavailable"
     );
+}
+
+#[tokio::test]
+async fn remote_target_cancel_fails_closed_without_mutating_origin_state() {
+    let mut harness = RpcTestHarness::start().await;
+    let task_id = CoreTaskId::new("cancel-remote-target").unwrap();
+    let target = PeerId::new("peer-remote").unwrap();
+    harness
+        .runtime
+        .store()
+        .accept_task_with_envelope_and_context(
+            TaskRecord::new(task_id.clone(), TaskStatus::Pending, None),
+            TaskEnvelopeRecord::new(
+                task_id.clone(),
+                envelope(task_id.as_str()).encode_to_vec(),
+                1,
+            ),
+            TaskTransportContextRecord {
+                task_id: task_id.clone(),
+                authenticated_sender_peer_id: Some(
+                    harness.runtime.config().local_peer_id().clone(),
+                ),
+                expected_executor_peer_id: Some(target.clone()),
+                destination_peer_id: target,
+                relay_frame_id: Some("relay-remote-cancel".to_string()),
+                received_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = harness
+        .client
+        .cancel_task(CancelTaskRequest {
+            task_id: Some(TaskId {
+                value: task_id.as_str().to_string(),
+            }),
+            reason: "must not claim remote cancellation".to_string(),
+            metadata: Default::default(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .status,
+        TaskStatus::Pending
+    );
+    assert!(matches!(
+        harness.runtime.store().get_terminal_result(&task_id).await,
+        Err(StoreError::TerminalResultNotFound(_))
+    ));
 }
 
 #[tokio::test]

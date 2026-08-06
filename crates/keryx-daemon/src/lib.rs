@@ -1519,6 +1519,20 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let reason = normalized_cancel_reason(&inner.reason);
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("reason", tracing::field::display(&reason));
+        match self.runtime.store().get_transport_context(&task_id).await {
+            Ok(context)
+                if context
+                    .expected_executor_peer_id
+                    .as_ref()
+                    .is_some_and(|expected| expected != self.runtime.config().local_peer_id()) =>
+            {
+                return Err(Status::failed_precondition(
+                    "cross-node cancellation is unavailable; remote-target tasks fail closed",
+                ));
+            }
+            Ok(_) | Err(StoreError::TransportContextNotFound(_)) => {}
+            Err(error) => return Err(store_error_to_status(error)),
+        }
         self.runtime.cancellation().increment_cancel_requests();
         let now_ms = unix_ms_now();
         let result = TaskResultEnvelope {
