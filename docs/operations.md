@@ -165,6 +165,11 @@ HERMES_KERYX_RELAY_HEALTH_ENDPOINT=http://127.0.0.1:51052 \
 
 TOML config supports `[relay]`, `[security]`, and `[registry]` sections. It enables allowlists and node-token auth primitives. Relative security paths resolve relative to the relay config file.
 
+Relay identity keys, node-token files, and TLS private keys are secrets. Keep
+them outside version control, restrict them to the service account, and
+provision them through an operator-controlled secret channel. Public examples
+must contain placeholders only.
+
 ```toml
 [relay]
 listen_addresses = ["/ip4/127.0.0.1/tcp/4101", "/ip4/127.0.0.1/udp/4101/quic-v1"]
@@ -238,6 +243,11 @@ export HERMES_KERYX_NODE_DESCRIPTION="demo node"
 export HERMES_KERYX_NODE_TTL_SECONDS=300
 cargo run -p keryx-relay --bin keryx-node
 ```
+
+Edge-node skill registration is one-shot at process startup. A deployment that
+needs continuous discovery must arrange a refresh before the configured TTL
+expires; do not treat an expired registry entry as transport disconnection or
+task completion.
 
 CLI discovery:
 
