@@ -5,7 +5,7 @@
 Hermes Keryx is a **standalone Rust runtime workspace** plus Python SDK.
 
 - Default work stays inside this repository.
-- Do **not** modify Hermes Agency unless Kyle explicitly asks for an integration pass.
+- Do **not** modify Hermes Agency unless an integration pass is explicitly requested.
 - Do **not** introduce new AgentAnycast coupling into this repo.
 - Keep this repo PR-ready for eventual upstream submission to Nous (runtime only, not full Hermes Agency).
 - Treat [docs/current-product.md](docs/current-product.md) as the canonical documentation summary of the implemented product.
@@ -30,7 +30,14 @@ Hermes Agency consumes Keryx as primary transport. Agency may vendor a copy of t
 - Every accepted task must eventually map to a durable event-log contract.
 - Schema changes must bump store schema version and update tests (current: **v7**).
 - Dual-run ports must not collide with common legacy AgentAnycast defaults (4001 / 50052).
-- Do not commit secrets, real peer IDs, private hostnames, maintainer-local absolute paths, or private multiaddrs.
+- Do not commit secrets, credentials, real peer IDs, private hostnames or topology,
+  maintainer-local absolute paths, private multiaddrs, real service inventories,
+  environment files, deployment evidence, evidence bundles, internal plans,
+  agent state, or machine-specific runbooks.
+- Keep `.hermes/` and other agent scratch state outside Git. Public documentation
+  must describe reusable product behavior with generic roles and placeholders.
+- The historical task bridge is obsolete and unsafe. It must remain disabled,
+  must never be used as a fallback, and must never fabricate completion state.
 - Do not claim CI green without running the relevant validation commands.
 
 ## Current implemented surface (do not regress)
@@ -106,4 +113,4 @@ Keep examples generic: use placeholders for peer IDs, hostnames, multiaddrs, and
 
 ## Commit / push policy
 
-Follow Kyle's current autonomy policy for this workspace. Prefer validated commits; do not open noisy draft PRs. Never force-push `main`.
+Follow the current maintainer autonomy policy for this workspace. Prefer validated commits; do not open noisy draft PRs. Never force-push `main`.

@@ -11,5 +11,25 @@ dist/
 build/
 *.egg-info/
 
+# Local agent state, plans, and operational evidence
+.hermes/
+evidence/
+evidence-bundles/
+*.evidence.json
+*.evidence.yaml
+*.evidence.yml
+
+# Machine-local configuration and credentials
+.env
+.env.*
+*.env
+*.env.*
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+
 # Local daemon runtime data
 .keryx/
