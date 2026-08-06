@@ -24,6 +24,7 @@ use crate::health::RelayHealthReport;
 use crate::registry::SkillRegistry;
 use crate::runtime::{
     FrameAcknowledgement, PublishedTaskDelivery, PublishedTaskReceipt, RelayRuntime,
+    MAX_TRACKED_FRAMES,
 };
 use crate::security::NodeTokenAuth;
 use keryx_core::{PeerId, RESULT_ARTIFACT_FRAME_MAX_BYTES};
@@ -32,7 +33,7 @@ use keryx_core::{PeerId, RESULT_ARTIFACT_FRAME_MAX_BYTES};
 pub const NODE_ID_METADATA_KEY: &str = "x-keryx-node-id";
 pub const NODE_TOKEN_METADATA_KEY: &str = "x-keryx-node-token";
 
-const RELAY_STREAM_BUFFER: usize = 128;
+const RELAY_STREAM_BUFFER: usize = MAX_TRACKED_FRAMES;
 const TARGET_NODE_METADATA_KEYS: &[&str] = &[
     "target_node_id",
     "target_node",
@@ -168,15 +169,7 @@ impl KeryxRelay for RelayHealthService {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
 
-        let pending = self.runtime.connect_node(node_id.clone(), tx.clone());
-        let pending_tx = tx.clone();
-        tokio::spawn(async move {
-            for frame in pending {
-                if pending_tx.send(Ok(frame)).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let pending_count = self.runtime.connect_node(node_id.clone(), tx.clone());
 
         let runtime = Arc::clone(&self.runtime);
         let source_node_id = node_id.clone();
@@ -205,7 +198,7 @@ impl KeryxRelay for RelayHealthService {
             runtime.disconnect_node(&source_node_id);
         });
 
-        tracing::debug!(%node_id, "node connected to relay stream");
+        tracing::debug!(%node_id, pending_count, "node connected to relay stream");
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 

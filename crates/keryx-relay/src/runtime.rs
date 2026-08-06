@@ -94,7 +94,7 @@ struct PeerState {
     acknowledged_published_task_order: VecDeque<TaskPublishKey>,
 }
 
-const MAX_TRACKED_FRAMES: usize = 8_192;
+pub const MAX_TRACKED_FRAMES: usize = 8_192;
 const MAX_RECENT_ACKNOWLEDGEMENTS: usize = 8_192;
 const MAX_RETAINED_PUBLISHED_TASKS: usize = 8_192;
 
@@ -167,15 +167,10 @@ impl RelayRuntime {
     }
 
     /// Attach a node's gRPC relay stream and return any frames stored while it was offline.
-    pub fn connect_node(
-        &self,
-        node_id: impl Into<String>,
-        sender: RelayFrameSender,
-    ) -> Vec<RelayFrame> {
+    pub fn connect_node(&self, node_id: impl Into<String>, sender: RelayFrameSender) -> usize {
         let node_id = node_id.into();
         let mut guard = self.lock_peers();
         guard.registered.insert(node_id.clone());
-        guard.connected_nodes.insert(node_id.clone(), sender);
         let pending = guard
             .mailboxes
             .get(&node_id)
@@ -183,9 +178,15 @@ impl RelayRuntime {
             .flat_map(|mailbox| mailbox.iter())
             .filter(|frame| !is_acked(&node_id, frame, &guard.acknowledged_frames))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        for frame in &pending {
+            sender
+                .try_send(Ok(frame.clone()))
+                .expect("relay stream buffer must cover the bounded frame table");
+        }
+        guard.connected_nodes.insert(node_id.clone(), sender);
         self.sync_connected_peer_metric(&guard);
-        pending
+        pending.len()
     }
 
     /// Mark a node stream disconnected. A reconnect with the same node id replaces this state.
@@ -494,31 +495,30 @@ fn route_frame_locked(
         state.frame_destinations.insert(key);
     }
     state.registered.insert(target_node_id.clone());
+    state
+        .mailboxes
+        .entry(target_node_id.clone())
+        .or_default()
+        .push_back(frame.clone());
     if let Some(sender) = state.connected_nodes.get(&target_node_id).cloned() {
         match sender.try_send(Ok(frame.clone())) {
             Ok(()) => return FrameDelivery::Delivered,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(frame)))
-            | Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(frame))) => {
-                state.connected_nodes.remove(&target_node_id);
-                state
-                    .mailboxes
-                    .entry(target_node_id)
-                    .or_default()
-                    .push_back(frame);
+            Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(_))) => {
                 return FrameDelivery::Mailboxed;
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(Err(_)))
-            | Err(tokio::sync::mpsc::error::TrySendError::Closed(Err(_))) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(_))) => {
+                state.connected_nodes.remove(&target_node_id);
+                return FrameDelivery::Mailboxed;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(Err(_))) => {
+                return FrameDelivery::Mailboxed;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(Err(_))) => {
                 state.connected_nodes.remove(&target_node_id);
                 return FrameDelivery::Mailboxed;
             }
         }
     }
-    state
-        .mailboxes
-        .entry(target_node_id)
-        .or_default()
-        .push_back(frame);
     FrameDelivery::Mailboxed
 }
 
@@ -586,16 +586,60 @@ mod tests {
                 FrameDelivery::Mailboxed
             );
         }
-        let (sender, _receiver) = mpsc::channel(128);
-        let pending = runtime.connect_node("destination", sender);
+        let (sender, mut receiver) = mpsc::channel(MAX_TRACKED_FRAMES);
+        let pending_count = runtime.connect_node("destination", sender);
 
-        assert_eq!(pending.len(), 129);
+        assert_eq!(pending_count, 129);
+        for index in 0..129 {
+            let delivered = receiver.try_recv().unwrap().unwrap();
+            assert_eq!(delivered.frame_id, format!("pending-{index}"));
+        }
         assert_eq!(runtime.mailbox_depth("destination"), 129);
         assert_eq!(
             runtime.ack_frame("destination", "pending-0"),
             FrameAcknowledgement::Accepted
         );
         assert_eq!(runtime.mailbox_depth("destination"), 128);
+    }
+
+    #[test]
+    fn live_delivery_remains_replayable_until_ack_and_survives_backpressure() {
+        let runtime = RelayRuntime::new("relay");
+        let (sender, mut receiver) = mpsc::channel(MAX_TRACKED_FRAMES);
+        assert_eq!(runtime.connect_node("destination", sender), 0);
+
+        for index in 0..130 {
+            assert_eq!(
+                runtime.route_frame("destination", frame(format!("live-{index}"))),
+                FrameDelivery::Delivered
+            );
+        }
+        assert_eq!(runtime.mailbox_depth("destination"), 130);
+        for index in 0..130 {
+            let delivered = receiver.try_recv().unwrap().unwrap();
+            assert_eq!(delivered.frame_id, format!("live-{index}"));
+        }
+        assert_eq!(
+            runtime.route_frame("destination", frame("after-drain")),
+            FrameDelivery::Delivered
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap().frame_id,
+            "after-drain"
+        );
+
+        runtime.disconnect_node("destination");
+        let (reconnect_sender, mut reconnect_receiver) = mpsc::channel(MAX_TRACKED_FRAMES);
+        assert_eq!(runtime.connect_node("destination", reconnect_sender), 131);
+        assert_eq!(
+            reconnect_receiver.try_recv().unwrap().unwrap().frame_id,
+            "live-0"
+        );
+        assert_eq!(
+            runtime.ack_frame("destination", "live-0"),
+            FrameAcknowledgement::Accepted
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), 130);
     }
 
     #[test]

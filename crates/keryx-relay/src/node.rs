@@ -195,7 +195,7 @@ async fn run_relay_stream(
     let mut relay = KeryxRelayClient::new(channel)
         .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
         .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
-    let (_tx, rx) = mpsc::channel::<NodeFrame>(8);
+    let (request_sender, rx) = mpsc::channel::<NodeFrame>(8);
     let mut request = Request::new(ReceiverStream::new(rx));
     add_node_auth_metadata(&mut request, &registry_peer_id, node_token.as_deref())?;
     let mut stream = relay
@@ -305,6 +305,7 @@ async fn run_relay_stream(
             }
         }
     }
+    drop(request_sender);
     Ok(())
 }
 
