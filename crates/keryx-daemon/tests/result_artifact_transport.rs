@@ -1,19 +1,35 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::RpcTestHarness;
 use keryx_core::{origin_result_artifact_id, Digest, PeerId, TaskId as CoreTaskId, TaskStatus};
-use keryx_daemon::KeryxDaemonConfig;
+use keryx_daemon::{DiscoverySettings, KeryxDaemonConfig};
 use keryx_proto::v1::{
     AgentId, ArtifactId, ClaimNextResultDeliveryRequest, ClaimTaskRequest, CompleteTaskRequest,
     GetArtifactRequest, GetTaskResultRequest, IngestRemoteResultRequest, ResultArtifact,
     TaskArtifact, TaskEnvelope, TaskId, TaskResultEnvelope, TerminalOutcome,
 };
+use keryx_relay::{serve_registry_rpc, RegistryRpcService, SkillRegistry};
 use keryx_store::{TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord};
 use prost::Message;
+use tokio::net::TcpListener;
 use tonic::Code;
 
 const ORIGIN: &str = "artifact-origin";
 const EXECUTOR: &str = "artifact-executor";
+
+async fn start_registry(
+    registry: Arc<SkillRegistry>,
+) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(serve_registry_rpc(
+        RegistryRpcService::new(registry),
+        listener,
+    ));
+    (endpoint, server)
+}
 
 fn peer(value: &str) -> PeerId {
     PeerId::new(value).unwrap()
@@ -133,9 +149,27 @@ async fn ingest(
 
 #[tokio::test]
 async fn worker_completion_retains_present_binary_artifacts_and_uses_v2() {
+    let registry = Arc::new(SkillRegistry::new());
+    registry
+        .register_with_features(
+            peer(ORIGIN),
+            Vec::new(),
+            "origin".into(),
+            String::new(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    let (registry_endpoint, _registry_server) = start_registry(Arc::clone(&registry)).await;
     let mut harness = RpcTestHarness::start_with_config(
         KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
-            .with_local_peer_id(peer(EXECUTOR)),
+            .with_local_peer_id(peer(EXECUTOR))
+            .with_discovery(Some(DiscoverySettings {
+                registry_endpoint,
+                registry_ca_cert_path: None,
+                registration: None,
+                node_token: None,
+            })),
     )
     .await;
     let id = task_id("worker-byte-result");
@@ -147,7 +181,7 @@ async fn worker_completion_retains_present_binary_artifacts_and_uses_v2() {
             TaskRecord::new(core_id.clone(), TaskStatus::Pending, None),
             TaskEnvelopeRecord::new(core_id.clone(), task_envelope.encode_to_vec(), 1),
             TaskTransportContextRecord {
-                task_id: core_id,
+                task_id: core_id.clone(),
                 authenticated_sender_peer_id: Some(peer(ORIGIN)),
                 expected_executor_peer_id: Some(peer(EXECUTOR)),
                 destination_peer_id: peer(EXECUTOR),
@@ -170,28 +204,51 @@ async fn worker_completion_retains_present_binary_artifacts_and_uses_v2() {
         .unwrap()
         .into_inner();
     let bytes = vec![0, 255, 1, 0, 128];
-    harness
+    let completion = CompleteTaskRequest {
+        task_id: Some(id.clone()),
+        lease_id: claim.lease_id,
+        worker_id: Some(AgentId {
+            value: "byte-worker".to_string(),
+        }),
+        duration_ms: 1,
+        result_metadata: Default::default(),
+        output_artifacts: vec![TaskArtifact {
+            path: "../../not-a-path".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            metadata: Default::default(),
+            content: bytes.clone(),
+            byte_len: bytes.len() as u64,
+            sha256: Digest::compute(&bytes).as_str().to_string(),
+            content_present: true,
+        }],
+    };
+    let unsupported = harness
         .client
-        .complete_task(CompleteTaskRequest {
-            task_id: Some(id.clone()),
-            lease_id: claim.lease_id,
-            worker_id: Some(AgentId {
-                value: "byte-worker".to_string(),
-            }),
-            duration_ms: 1,
-            result_metadata: Default::default(),
-            output_artifacts: vec![TaskArtifact {
-                path: "../../not-a-path".to_string(),
-                media_type: "application/octet-stream".to_string(),
-                metadata: Default::default(),
-                content: bytes.clone(),
-                byte_len: bytes.len() as u64,
-                sha256: Digest::compute(&bytes).as_str().to_string(),
-                content_present: true,
-            }],
-        })
+        .complete_task(completion.clone())
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(unsupported.code(), Code::FailedPrecondition);
+    assert_eq!(
+        harness
+            .runtime
+            .store()
+            .get_task(&core_id)
+            .await
+            .unwrap()
+            .status,
+        TaskStatus::Running
+    );
+    registry
+        .register_with_features(
+            peer(ORIGIN),
+            Vec::new(),
+            "origin".into(),
+            String::new(),
+            vec!["result_artifact_bytes_v1".into()],
+            None,
+        )
+        .await;
+    harness.client.complete_task(completion).await.unwrap();
     let delivery = harness
         .client
         .claim_next_result_delivery(ClaimNextResultDeliveryRequest {

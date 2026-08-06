@@ -202,6 +202,30 @@ impl DiscoveryHandle {
         Ok(discover_response_to_daemon(response))
     }
 
+    pub async fn peer_supports_protocol_feature(
+        &self,
+        peer_id: &PeerId,
+        feature: &str,
+    ) -> Result<bool, Status> {
+        let mut client = self.client.lock().await;
+        let response = client
+            .discover_by_skill(DiscoverBySkillRequest {
+                skill_id: String::new(),
+                tags: Vec::new(),
+                limit: 0,
+            })
+            .await
+            .map_err(registry_rpc_error)?
+            .into_inner();
+        Ok(response.registrations.into_iter().any(|registration| {
+            registration.peer_id == peer_id.as_str()
+                && registration
+                    .protocol_features
+                    .iter()
+                    .any(|candidate| candidate == feature)
+        }))
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         if let Some(task) = self.loop_task.lock().await.take() {

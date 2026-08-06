@@ -609,6 +609,21 @@ impl KeryxDaemonRuntime {
         Ok(response)
     }
 
+    async fn peer_supports_protocol_feature(
+        &self,
+        peer_id: &PeerId,
+        feature: &str,
+    ) -> Result<bool, Status> {
+        let handle = self.discovery.read().await.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "relay registry is unavailable for destination capability verification",
+            )
+        })?;
+        handle
+            .peer_supports_protocol_feature(peer_id, feature)
+            .await
+    }
+
     /// Reject new RPC handlers while keeping the listener up (used by integration tests).
     pub fn mark_shutting_down(&self) {
         self.shutdown.mark_shutting_down();
@@ -1434,6 +1449,30 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
+        validate_worker_result_artifacts(inner.output_artifacts.clone())?;
+        let return_peer_id = return_peer_for_task(self.runtime.store(), &task_id).await;
+        if inner
+            .output_artifacts
+            .iter()
+            .any(|artifact| !artifact.content.is_empty())
+        {
+            if let Some(return_peer_id) = return_peer_id.as_ref() {
+                if !self
+                    .runtime
+                    .peer_supports_protocol_feature(
+                        return_peer_id,
+                        discovery::RESULT_ARTIFACT_BYTES_FEATURE,
+                    )
+                    .await?
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "destination peer {} does not support protocol feature {}",
+                        return_peer_id.as_str(),
+                        discovery::RESULT_ARTIFACT_BYTES_FEATURE
+                    )));
+                }
+            }
+        }
         let result = build_terminal_result(
             self.runtime.store(),
             self.runtime.config().local_peer_id(),
@@ -1449,7 +1488,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             task_id: task_id.clone(),
             encoded_result: result.encode_to_vec(),
             terminal_status: TaskStatus::Completed,
-            return_peer_id: return_peer_for_task(self.runtime.store(), &task_id).await,
+            return_peer_id,
             executor_peer_id: self.runtime.config().local_peer_id().clone(),
             created_at_ms: result.completed_at_ms,
         };
