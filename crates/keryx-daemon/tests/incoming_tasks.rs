@@ -105,21 +105,31 @@ async fn incoming_task_accepted_into_store() {
         context.received_at_ms
     );
 
-    let conflicting_frame = handle_incoming_task(
+    let fresh_frame_replay = handle_incoming_task(
         runtime.as_ref(),
         &allowlist,
         &IncomingDispatchConfig::default(),
         IncomingRelayTask::new(
-            "frame-conflict",
+            "frame-after-relay-restart",
             "node-trusted",
             envelope("incoming-task-1"),
         ),
     )
     .await;
     assert!(matches!(
-        conflicting_frame,
-        IncomingHandleResult::Store(keryx_store::StoreError::TransportContextConflict(_))
+        fresh_frame_replay,
+        IncomingHandleResult::Accepted { .. }
     ));
+    assert_eq!(
+        runtime
+            .store()
+            .get_transport_context(&task_id)
+            .await
+            .unwrap()
+            .relay_frame_id
+            .as_deref(),
+        Some("frame-after-relay-restart")
+    );
 
     let data_dir = dir.path().join("incoming-home");
     drop(runtime);

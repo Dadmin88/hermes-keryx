@@ -232,7 +232,6 @@ fn same_transport_identity(
         && left.authenticated_sender_peer_id == right.authenticated_sender_peer_id
         && left.expected_executor_peer_id == right.expected_executor_peer_id
         && left.destination_peer_id == right.destination_peer_id
-        && left.relay_frame_id == right.relay_frame_id
 }
 
 impl InMemoryStore {
@@ -327,6 +326,15 @@ impl InMemoryStore {
                     .get(task.task_id())
                     .is_some_and(|stored| same_transport_identity(stored, &context))
             {
+                if state
+                    .transport_contexts
+                    .get(task.task_id())
+                    .is_some_and(|stored| stored.relay_frame_id != context.relay_frame_id)
+                {
+                    state
+                        .transport_contexts
+                        .insert(task.task_id().clone(), context);
+                }
                 return Ok(existing);
             }
             return Err(StoreError::TransportContextConflict(task.task_id().clone()));
@@ -593,10 +601,12 @@ impl SqliteStore {
                 tx.commit().await?;
                 return Ok(context);
             }
-            return Err(StoreError::TransportContextConflict(task_id.clone()));
+            if context.authenticated_sender_peer_id.as_ref() != Some(authenticated_source_peer_id) {
+                return Err(StoreError::TransportContextConflict(task_id.clone()));
+            }
         }
         let update = sqlx::query(
-            "UPDATE task_transport_context SET authenticated_sender_peer_id = ?, relay_frame_id = ?, received_at_ms = ? WHERE task_id = ? AND relay_frame_id IS NULL",
+            "UPDATE task_transport_context SET authenticated_sender_peer_id = ?, relay_frame_id = ?, received_at_ms = ? WHERE task_id = ?",
         )
         .bind(authenticated_source_peer_id.as_str())
         .bind(frame_id)
@@ -605,17 +615,6 @@ impl SqliteStore {
         .execute(&mut *tx)
         .await?;
         if update.rows_affected() != 1 {
-            let existing = fetch_transport_context_optional(&mut tx, task_id)
-                .await?
-                .ok_or_else(|| StoreError::TransportContextNotFound(task_id.clone()))?;
-            if existing.relay_frame_id.as_deref() == Some(frame_id)
-                && existing.authenticated_sender_peer_id.as_ref()
-                    == Some(authenticated_source_peer_id)
-                && existing.received_at_ms == accepted_at_ms
-            {
-                tx.commit().await?;
-                return Ok(existing);
-            }
             return Err(StoreError::TransportContextConflict(task_id.clone()));
         }
         context.authenticated_sender_peer_id = Some(authenticated_source_peer_id.clone());
@@ -650,6 +649,19 @@ impl SqliteStore {
                     .as_ref()
                     .is_some_and(|stored| same_transport_identity(stored, &context))
             {
+                if existing_context
+                    .as_ref()
+                    .is_some_and(|stored| stored.relay_frame_id != context.relay_frame_id)
+                {
+                    sqlx::query(
+                        "UPDATE task_transport_context SET relay_frame_id = ?, received_at_ms = ? WHERE task_id = ?",
+                    )
+                    .bind(context.relay_frame_id.as_deref())
+                    .bind(context.received_at_ms)
+                    .bind(task.task_id().as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 tx.commit().await?;
                 return Ok(existing);
             }

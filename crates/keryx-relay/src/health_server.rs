@@ -283,11 +283,13 @@ impl KeryxRelay for RelayHealthService {
             Vec::new()
         };
         let mut delivered_task = task.clone();
-        delivered_task.metadata.insert(
-            AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string(),
-            serde_json::to_string(&source_features)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        );
+        delivered_task
+            .metadata
+            .entry(AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string())
+            .or_insert(
+                serde_json::to_string(&source_features)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            );
         let frame = RelayFrame {
             frame_id: proposed_receipt.frame_id.clone(),
             task: Some(delivered_task),

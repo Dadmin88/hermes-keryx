@@ -610,7 +610,7 @@ impl TaskRouter {
         &self,
         store: &SqliteStore,
         target_peer_id: PeerId,
-        envelope: TaskEnvelope,
+        mut envelope: TaskEnvelope,
         timeout_ms: i64,
     ) -> Result<SendTaskOutcome, RoutingError> {
         let task_id = parse_envelope_task_id(&envelope)?;
@@ -682,6 +682,12 @@ impl TaskRouter {
             });
         }
 
+        envelope.metadata.insert(
+            "keryx.authenticated_source_protocol_features".to_string(),
+            serde_json::to_string(crate::discovery::SUPPORTED_PROTOCOL_FEATURES)
+                .expect("supported protocol features serialize"),
+        );
+
         let publisher = Arc::clone(&*self.publisher.read().await);
         if !self.peers.is_routable(&target_peer_id).await && !publisher.is_configured() {
             return Err(RoutingError::UnknownPeer {
@@ -710,24 +716,9 @@ impl TaskRouter {
                 {
                     return Err(StoreError::TransportContextConflict(task_id.clone()).into());
                 }
-                if let Some(frame_id) = context.relay_frame_id {
-                    let authenticated_source_peer_id = context
-                        .authenticated_sender_peer_id
-                        .ok_or_else(|| StoreError::TransportContextConflict(task_id.clone()))?;
-                    return Ok(SendTaskOutcome {
-                        task_id: task_id.clone(),
-                        status: "relay_accepted".to_string(),
-                        routed_to: target_peer_id.clone(),
-                        route: DeliveryRoute::Relay,
-                        relay_receipt: Some(RelayRouteReceipt {
-                            task_id: task_id.clone(),
-                            frame_id,
-                            authenticated_source_peer_id,
-                            accepted_destination_peer_id: target_peer_id,
-                            accepted_route: "relay".to_string(),
-                            accepted_at_ms: context.received_at_ms,
-                        }),
-                    });
+                if context.authenticated_sender_peer_id.as_ref() != Some(self.peers.local_peer_id())
+                {
+                    return Err(StoreError::TransportContextConflict(task_id.clone()).into());
                 }
                 true
             }

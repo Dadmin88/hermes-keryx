@@ -92,6 +92,7 @@ impl Drop for RpcTestHarness {
 pub struct MockRelayPublisher {
     delay: Duration,
     fail: bool,
+    fresh_receipts: bool,
     deliveries: Mutex<Vec<(String, String)>>,
     call_count: AtomicUsize,
 }
@@ -102,6 +103,7 @@ impl MockRelayPublisher {
         Self {
             delay: Duration::ZERO,
             fail: false,
+            fresh_receipts: false,
             deliveries: Mutex::new(Vec::new()),
             call_count: AtomicUsize::new(0),
         }
@@ -114,6 +116,11 @@ impl MockRelayPublisher {
 
     pub fn failing(mut self) -> Self {
         self.fail = true;
+        self
+    }
+
+    pub fn with_fresh_receipts(mut self) -> Self {
+        self.fresh_receipts = true;
         self
     }
 
@@ -134,7 +141,7 @@ impl RelayTaskPublisher for MockRelayPublisher {
         envelope: TaskEnvelope,
         _timeout: Duration,
     ) -> Result<RelayRouteReceipt, RoutingError> {
-        self.call_count.fetch_add(1, Ordering::SeqCst);
+        let call_index = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
         if self.delay > Duration::ZERO {
             tokio::time::sleep(self.delay).await;
         }
@@ -155,11 +162,19 @@ impl RelayTaskPublisher for MockRelayPublisher {
             .push((target_peer_id.as_str().to_string(), task_id.clone()));
         Ok(RelayRouteReceipt {
             task_id: TaskId::new(&task_id)?,
-            frame_id: format!("relay-test-{task_id}"),
+            frame_id: if self.fresh_receipts {
+                format!("relay-test-{task_id}-{call_index}")
+            } else {
+                format!("relay-test-{task_id}")
+            },
             authenticated_source_peer_id: PeerId::new("peer-local")?,
             accepted_destination_peer_id: target_peer_id.clone(),
             accepted_route: "relay".to_string(),
-            accepted_at_ms: 1,
+            accepted_at_ms: if self.fresh_receipts {
+                call_index as i64
+            } else {
+                1
+            },
         })
     }
 }

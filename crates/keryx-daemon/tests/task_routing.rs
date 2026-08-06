@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use keryx_core::{NodeId, PeerId};
+use keryx_core::{NodeId, PeerId, TaskId as CoreTaskId};
 use keryx_daemon::{GrpcRelayTaskPublisher, KeryxDaemonConfig, RelayTaskPublisher};
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::{
@@ -151,9 +151,13 @@ async fn send_task_routes_to_relay_peer() {
 }
 
 #[tokio::test]
-async fn accepted_remote_task_retry_returns_durable_receipt_without_republishing() {
-    let mut harness = RpcTestHarness::start().await;
-    let mock = Arc::new(MockRelayPublisher::new());
+async fn accepted_remote_task_retry_republishes_and_replaces_stale_relay_receipt() {
+    let mut harness = RpcTestHarness::start_with_config(
+        KeryxDaemonConfig::new(tempfile::tempdir().unwrap().keep(), 0)
+            .with_local_peer_id(PeerId::new("peer-local").unwrap()),
+    )
+    .await;
+    let mock = Arc::new(MockRelayPublisher::new().with_fresh_receipts());
     harness.runtime.router().set_publisher(mock.clone()).await;
     let remote = PeerId::new("node-remote-retry").unwrap();
     harness
@@ -179,9 +183,19 @@ async fn accepted_remote_task_retry_returns_durable_receipt_without_republishing
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(second.relay_frame_id, first.relay_frame_id);
-    assert_eq!(second.accepted_at_ms, first.accepted_at_ms);
-    assert_eq!(mock.call_count(), 1);
+    assert_ne!(second.relay_frame_id, first.relay_frame_id);
+    assert!(second.accepted_at_ms > first.accepted_at_ms);
+    assert_eq!(mock.call_count(), 2);
+    let context = harness
+        .runtime
+        .store()
+        .get_transport_context(&CoreTaskId::new("route-relay-retry").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        context.relay_frame_id.as_deref(),
+        Some(second.relay_frame_id.as_str())
+    );
 }
 
 #[tokio::test]
