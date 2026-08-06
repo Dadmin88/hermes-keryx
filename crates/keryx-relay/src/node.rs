@@ -48,6 +48,7 @@ const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 struct RelayReconnectPolicy {
     initial_delay: Duration,
     max_delay: Duration,
+    jitter_seed: u64,
 }
 
 impl RelayReconnectPolicy {
@@ -55,7 +56,13 @@ impl RelayReconnectPolicy {
         Self {
             initial_delay,
             max_delay,
+            jitter_seed: 0,
         }
+    }
+
+    const fn with_jitter_seed(mut self, jitter_seed: u64) -> Self {
+        self.jitter_seed = jitter_seed;
+        self
     }
 }
 
@@ -67,6 +74,26 @@ impl Default for RelayReconnectPolicy {
 
 fn next_reconnect_delay(current: Duration, maximum: Duration) -> Duration {
     current.saturating_mul(2).min(maximum)
+}
+
+fn stable_jitter_seed(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn jittered_delay(base: Duration, maximum: Duration, seed: u64, attempt: u32) -> Duration {
+    let mixed = seed
+        .wrapping_add(u64::from(attempt).wrapping_mul(0x9e3779b97f4a7c15))
+        .wrapping_mul(0xbf58476d1ce4e5b9);
+    let percent = 80 + (mixed % 41);
+    base.saturating_mul(percent as u32)
+        .checked_div(100)
+        .unwrap_or(base)
+        .min(maximum)
 }
 
 async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -89,6 +116,7 @@ async fn supervise_relay_stream<F, Fut>(
     Fut: std::future::Future<Output = Result<()>>,
 {
     let mut delay = policy.initial_delay.min(policy.max_delay);
+    let mut retry_attempt = 0_u32;
     loop {
         if *shutdown.borrow() {
             break;
@@ -101,10 +129,13 @@ async fn supervise_relay_stream<F, Fut>(
             Ok(()) => tracing::warn!("relay stream closed cleanly; reconnecting"),
             Err(error) => tracing::warn!(error = %error, "relay stream failed; reconnecting"),
         }
+        let sleep_delay =
+            jittered_delay(delay, policy.max_delay, policy.jitter_seed, retry_attempt);
         tokio::select! {
             _ = wait_for_shutdown(&mut shutdown) => break,
-            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::time::sleep(sleep_delay) => {}
         }
+        retry_attempt = retry_attempt.saturating_add(1);
         delay = next_reconnect_delay(delay, policy.max_delay);
     }
 }
@@ -152,6 +183,9 @@ pub async fn run_edge_node() -> Result<()> {
             let stream_registry_peer_id = registry_peer_id.clone();
             let stream_node_token = node_token.clone();
             let stream_daemon_endpoint = daemon_endpoint.clone();
+            let stream_jitter_seed = stable_jitter_seed(&format!("stream:{registry_peer_id}"));
+            let delivery_jitter_seed =
+                stable_jitter_seed(&format!("result-delivery:{registry_peer_id}"));
             let task = tokio::spawn(async move {
                 tokio::join!(
                     supervise_relay_stream(
@@ -164,7 +198,7 @@ pub async fn run_edge_node() -> Result<()> {
                             )
                         },
                         stream_shutdown,
-                        RelayReconnectPolicy::default(),
+                        RelayReconnectPolicy::default().with_jitter_seed(stream_jitter_seed),
                     ),
                     supervise_relay_stream(
                         move || {
@@ -176,7 +210,7 @@ pub async fn run_edge_node() -> Result<()> {
                             )
                         },
                         shutdown_rx,
-                        RelayReconnectPolicy::default(),
+                        RelayReconnectPolicy::default().with_jitter_seed(delivery_jitter_seed),
                     )
                 );
             });
@@ -296,10 +330,17 @@ fn publish_result_failure_is_permanent(code: Code) -> bool {
     )
 }
 
-fn result_delivery_retry_delay_ms(attempt_count: u32) -> i64 {
+fn result_delivery_retry_delay_ms(delivery_id: &str, attempt_count: u32) -> i64 {
     const MAX_DELAY_MS: i64 = 60_000;
     let multiplier = 1_i64 << attempt_count.min(6);
-    1_000_i64.saturating_mul(multiplier).min(MAX_DELAY_MS)
+    let base_ms = 1_000_i64.saturating_mul(multiplier).min(MAX_DELAY_MS);
+    jittered_delay(
+        Duration::from_millis(base_ms as u64),
+        Duration::from_millis(MAX_DELAY_MS as u64),
+        stable_jitter_seed(delivery_id),
+        attempt_count,
+    )
+    .as_millis() as i64
 }
 
 async fn run_result_delivery_worker(
@@ -354,10 +395,13 @@ async fn run_result_delivery_worker(
             Err(error) => {
                 daemon
                     .fail_result_delivery(FailResultDeliveryRequest {
-                        delivery_id: delivery.delivery_id,
+                        delivery_id: delivery.delivery_id.clone(),
                         worker_id: delivery_worker.clone(),
                         error_reason: error.message().to_string(),
-                        retry_delay_ms: result_delivery_retry_delay_ms(delivery.attempt_count),
+                        retry_delay_ms: result_delivery_retry_delay_ms(
+                            &delivery.delivery_id,
+                            delivery.attempt_count,
+                        ),
                         dead_letter: publish_result_failure_is_permanent(error.code()),
                         lease_expires_at_ms: delivery.lease_expires_at_ms,
                     })

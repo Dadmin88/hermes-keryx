@@ -404,7 +404,7 @@ async fn worker_rejects_artifact_length_digest_and_absence_mismatches_before_com
 }
 
 #[tokio::test]
-async fn authenticated_late_result_after_deadline_returns_success_without_terminal_mutation() {
+async fn authenticated_late_artifact_result_after_deadline_fails_closed_without_loss() {
     let mut harness = origin_harness().await;
     let id = task_id("origin-rpc-late-after-deadline");
     let core_id = CoreTaskId::new(id.value.clone()).unwrap();
@@ -426,14 +426,15 @@ async fn authenticated_late_result_after_deadline_returns_success_without_termin
         .await
         .unwrap();
 
-    ingest(
+    let late_artifact = ingest(
         &mut harness,
         result(&id, 2, vec![present_artifact(b"late bytes".to_vec())]),
         ORIGIN,
         EXECUTOR,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(late_artifact.code(), Code::FailedPrecondition);
 
     assert_eq!(
         harness

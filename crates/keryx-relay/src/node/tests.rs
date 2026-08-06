@@ -119,12 +119,28 @@ fn permanent_publish_rejections_are_dead_lettered_without_acknowledgement() {
 }
 
 #[test]
-fn result_delivery_retry_backoff_is_exponential_and_bounded() {
-    assert_eq!(result_delivery_retry_delay_ms(0), 1_000);
-    assert_eq!(result_delivery_retry_delay_ms(1), 2_000);
-    assert_eq!(result_delivery_retry_delay_ms(5), 32_000);
-    assert_eq!(result_delivery_retry_delay_ms(6), 60_000);
-    assert_eq!(result_delivery_retry_delay_ms(u32::MAX), 60_000);
+fn result_delivery_retry_backoff_is_exponential_jittered_and_bounded() {
+    let first = result_delivery_retry_delay_ms("delivery-a", 0);
+    let second = result_delivery_retry_delay_ms("delivery-a", 1);
+    let capped = result_delivery_retry_delay_ms("delivery-a", u32::MAX);
+    assert!((800..=1_200).contains(&first));
+    assert!((1_600..=2_400).contains(&second));
+    assert!((48_000..=60_000).contains(&capped));
+    assert_ne!(
+        result_delivery_retry_delay_ms("delivery-a", 2),
+        result_delivery_retry_delay_ms("delivery-b", 2)
+    );
+}
+
+#[test]
+fn reconnect_jitter_is_bounded_and_differs_by_node() {
+    let base = Duration::from_secs(4);
+    let maximum = Duration::from_secs(5);
+    let first = jittered_delay(base, maximum, stable_jitter_seed("node-a"), 2);
+    let second = jittered_delay(base, maximum, stable_jitter_seed("node-b"), 2);
+    assert!((Duration::from_millis(3_200)..=maximum).contains(&first));
+    assert!((Duration::from_millis(3_200)..=maximum).contains(&second));
+    assert_ne!(first, second);
 }
 
 #[tokio::test]
@@ -830,10 +846,11 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     .await
     .expect("both authenticated edge streams must connect");
 
-    first_proxy.abort();
-    let _ = first_proxy.await;
-    first_relay.abort();
-    let _ = first_relay.await;
+    origin_shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), origin_edge)
+        .await
+        .unwrap()
+        .unwrap();
 
     let mut executor_client = KeryxDaemonClient::connect(format!("http://{executor_addr}"))
         .await
@@ -866,16 +883,36 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         })
         .await
         .unwrap();
-    assert_eq!(
-        executor_runtime
-            .store()
-            .pending_result_deliveries(10)
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "result outbox must remain durable while relay is down"
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let delivery_in_flight = executor_runtime
+                .store()
+                .result_delivery_for_task(&CoreTaskId::new(RESULT_TASK).unwrap())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|delivery| delivery.state == ResultDeliveryState::Leased);
+            if delivery_in_flight && first_runtime.mailbox_depth(ORIGIN) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("result publication must be awaiting destination ACK before relay replacement");
+
+    first_proxy.abort();
+    let _ = first_proxy.await;
+    first_relay.abort();
+    let _ = first_relay.await;
+
+    let delivery_after_drop = executor_runtime
+        .store()
+        .result_delivery_for_task(&CoreTaskId::new(RESULT_TASK).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(delivery_after_drop.state, ResultDeliveryState::Delivered);
 
     let second_backend_addr = reserve_loopback_addr().await;
     let second_runtime = RelayRuntime::new("result-outbox-after-relay-restart");
@@ -887,6 +924,22 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         Arc::clone(&auth),
     );
     let second_proxy = spawn_tcp_proxy(relay_addr, second_backend_addr);
+
+    let origin_task_attempts = Arc::clone(&origin_attempts);
+    let (origin_shutdown_tx, origin_shutdown_rx) = watch::channel(false);
+    let origin_edge = tokio::spawn(supervise_relay_stream(
+        move || {
+            origin_task_attempts.fetch_add(1, Ordering::SeqCst);
+            run_relay_stream(
+                format!("http://{relay_addr}"),
+                ORIGIN.to_string(),
+                Some(ORIGIN_TOKEN.to_string()),
+                format!("http://{origin_addr}"),
+            )
+        },
+        origin_shutdown_rx,
+        RelayReconnectPolicy::new(Duration::from_millis(100), Duration::from_millis(100)),
+    ));
 
     let result_id = CoreTaskId::new(RESULT_TASK).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {

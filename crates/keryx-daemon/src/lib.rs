@@ -2739,6 +2739,13 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
                 reason
             ))
         }
+        StoreError::RemoteResultTerminalArtifactsRejected { task_id, reason } => {
+            Status::failed_precondition(format!(
+                "remote result for task {} carries artifacts that cannot settle terminal reason {}",
+                task_id.as_str(),
+                reason
+            ))
+        }
         StoreError::ArtifactNotFound(artifact_id) => {
             Status::not_found(format!("artifact not found: {artifact_id}"))
         }

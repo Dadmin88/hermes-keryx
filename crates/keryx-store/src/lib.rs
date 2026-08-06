@@ -103,6 +103,14 @@ pub enum StoreError {
         reason: RemoteResultTerminalReason,
     },
 
+    #[error(
+        "remote result for task {task_id} carries artifacts that cannot settle terminal reason {reason}"
+    )]
+    RemoteResultTerminalArtifactsRejected {
+        task_id: TaskId,
+        reason: RemoteResultTerminalReason,
+    },
+
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationError),
     #[error("event stream for task {0} is corrupt or incomplete")]

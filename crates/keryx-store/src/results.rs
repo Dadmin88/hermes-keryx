@@ -1109,6 +1109,12 @@ impl SqliteStore {
             _ => None,
         };
         if let Some(reason) = settlement_reason {
+            if !records.is_empty() {
+                return Err(StoreError::RemoteResultTerminalArtifactsRejected {
+                    task_id: result.task_id.clone(),
+                    reason,
+                });
+            }
             tx.commit().await?;
             return Ok(RemoteResultIngestOutcome::SettledTerminal {
                 task,

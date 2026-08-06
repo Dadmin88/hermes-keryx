@@ -309,6 +309,9 @@ impl RelayRuntime {
         let target_node_id = target_node_id.into();
         let frame_id = frame.frame_id.trim().to_string();
         let mut guard = self.lock_peers();
+        // Keep the peer-state lock across both live enqueue and waiter insertion. A destination
+        // may receive the frame immediately, but its AckFrame cannot acquire this lock until the
+        // waiter is installed, so an early authenticated ACK cannot be lost.
         let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
         let receiver = if matches!(
             delivery,

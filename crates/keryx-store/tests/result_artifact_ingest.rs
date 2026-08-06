@@ -556,7 +556,8 @@ async fn origin_ingest_cleans_prepared_blob_when_terminal_transition_is_rejected
 }
 
 #[tokio::test]
-async fn authenticated_late_result_after_deadline_is_settled_without_mutation() {
+async fn authenticated_late_result_after_deadline_rejects_artifacts_then_settles_without_mutation()
+{
     let dir = tempdir().unwrap();
     let store = SqliteStore::connect(dir.path().join("keryx.db"))
         .await
@@ -588,10 +589,27 @@ async fn authenticated_late_result_after_deadline_is_settled_without_mutation() 
     let before_events = store.events_for_task(&task_id).await.unwrap();
     let late_artifact = artifact(&task_id, 0, b"late bytes".to_vec());
 
-    let outcome = store
+    let rejection = store
         .ingest_remote_result_with_artifacts(
             result(&task_id),
             std::slice::from_ref(&late_artifact),
+            &peer("remote-executor"),
+            &blob_dir,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejection,
+        StoreError::RemoteResultTerminalArtifactsRejected {
+            reason: RemoteResultTerminalReason::DeadlineExpired,
+            ..
+        }
+    ));
+
+    let outcome = store
+        .ingest_remote_result_with_artifacts(
+            result(&task_id),
+            &[],
             &peer("remote-executor"),
             &blob_dir,
         )
@@ -626,7 +644,8 @@ async fn authenticated_late_result_after_deadline_is_settled_without_mutation() 
 }
 
 #[tokio::test]
-async fn authenticated_late_result_after_cancellation_preserves_canonical_outcome() {
+async fn authenticated_late_result_after_cancellation_rejects_artifacts_then_preserves_canonical_outcome(
+) {
     let dir = tempdir().unwrap();
     let store = SqliteStore::connect(dir.path().join("keryx.db"))
         .await
@@ -650,10 +669,27 @@ async fn authenticated_late_result_after_cancellation_preserves_canonical_outcom
     let before_events = store.events_for_task(&task_id).await.unwrap();
     let late_artifact = artifact(&task_id, 0, b"late bytes".to_vec());
 
-    let outcome = store
+    let rejection = store
         .ingest_remote_result_with_artifacts(
             result(&task_id),
             std::slice::from_ref(&late_artifact),
+            &peer("remote-executor"),
+            &blob_dir,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejection,
+        StoreError::RemoteResultTerminalArtifactsRejected {
+            reason: RemoteResultTerminalReason::Canceled,
+            ..
+        }
+    ));
+
+    let outcome = store
+        .ingest_remote_result_with_artifacts(
+            result(&task_id),
+            &[],
             &peer("remote-executor"),
             &blob_dir,
         )
