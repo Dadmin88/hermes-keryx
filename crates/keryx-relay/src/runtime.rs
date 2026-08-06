@@ -395,6 +395,55 @@ impl RelayRuntime {
             .map_or(0, VecDeque::len)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pending_frame_counts(&self, node_id: &str) -> (usize, usize, usize) {
+        let guard = self.lock_peers();
+        (
+            guard.frame_ack_waiters.len(),
+            guard.frame_destinations.len(),
+            guard.mailboxes.get(node_id).map_or(0, VecDeque::len),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_result_frame_ids(&self, node_id: &str) -> Vec<String> {
+        let guard = self.lock_peers();
+        let mut frame_ids = guard
+            .frame_ack_waiters
+            .keys()
+            .filter(|(destination_node_id, _)| destination_node_id == node_id)
+            .map(|(_, frame_id)| frame_id.clone())
+            .collect::<Vec<_>>();
+        frame_ids.sort();
+        frame_ids
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_frame_ack_waiter(&self, node_id: &str, frame_id: &str) -> bool {
+        self.lock_peers()
+            .frame_ack_waiters
+            .remove(&(node_id.to_string(), frame_id.to_string()))
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_exact_frame_state(
+        &self,
+        node_id: &str,
+        frame_id: &str,
+    ) -> (bool, bool, bool) {
+        let guard = self.lock_peers();
+        let key = (node_id.to_string(), frame_id.to_string());
+        (
+            guard.frame_ack_waiters.contains_key(&key),
+            guard.frame_destinations.contains(&key),
+            guard
+                .mailboxes
+                .get(node_id)
+                .is_some_and(|mailbox| mailbox.iter().any(|frame| frame.frame_id == frame_id)),
+        )
+    }
+
     /// Atomically admit a task identity and acquire bounded frame ownership before delivery.
     pub fn publish_task_frame(
         &self,
@@ -1127,6 +1176,31 @@ mod tests {
             FrameAcknowledgement::Accepted
         );
         acknowledgement.await.unwrap();
+    }
+
+    #[test]
+    fn abandoning_frame_is_idempotent_and_scoped_to_exact_destination_and_frame() {
+        let runtime = RelayRuntime::new("relay");
+        let (first_delivery, _first_acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination-a", frame("shared-frame"));
+        let (second_delivery, _second_acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination-b", frame("shared-frame"));
+        assert_eq!(first_delivery, FrameDelivery::Mailboxed);
+        assert_eq!(second_delivery, FrameDelivery::Mailboxed);
+
+        runtime.abandon_frame("destination-a", "shared-frame");
+        runtime.abandon_frame("destination-a", "shared-frame");
+
+        assert_eq!(runtime.mailbox_depth("destination-a"), 0);
+        assert_eq!(runtime.mailbox_depth("destination-b"), 1);
+        assert_eq!(
+            runtime.ack_frame("destination-a", "shared-frame"),
+            FrameAcknowledgement::WrongDestination
+        );
+        assert_eq!(
+            runtime.ack_frame("destination-b", "shared-frame"),
+            FrameAcknowledgement::Accepted
+        );
     }
 
     #[tokio::test]
