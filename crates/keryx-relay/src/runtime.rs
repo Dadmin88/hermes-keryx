@@ -149,10 +149,11 @@ impl RelayRuntime {
         guard.connected_nodes.insert(node_id.clone(), sender);
         let pending = guard
             .mailboxes
-            .remove(&node_id)
-            .unwrap_or_default()
+            .get(&node_id)
             .into_iter()
+            .flat_map(|mailbox| mailbox.iter())
             .filter(|frame| !is_acked(&node_id, frame, &guard.acknowledged_frames))
+            .cloned()
             .collect();
         self.sync_connected_peer_metric(&guard);
         pending
@@ -409,6 +410,27 @@ mod tests {
             FrameDelivery::RejectedDuplicate
         );
         assert_eq!(runtime.mailbox_depth("destination"), 1);
+    }
+
+    #[test]
+    fn reconnect_snapshot_preserves_pending_mailbox_until_destination_acknowledges() {
+        let runtime = RelayRuntime::new("relay");
+        for index in 0..129 {
+            assert_eq!(
+                runtime.route_frame("destination", frame(format!("pending-{index}"))),
+                FrameDelivery::Mailboxed
+            );
+        }
+        let (sender, _receiver) = mpsc::channel(128);
+        let pending = runtime.connect_node("destination", sender);
+
+        assert_eq!(pending.len(), 129);
+        assert_eq!(runtime.mailbox_depth("destination"), 129);
+        assert_eq!(
+            runtime.ack_frame("destination", "pending-0"),
+            FrameAcknowledgement::Accepted
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), 128);
     }
 
     #[test]

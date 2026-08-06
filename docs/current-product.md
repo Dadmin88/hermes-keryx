@@ -118,7 +118,7 @@ sender keryxd SendTask
 
 Phase 17 was completed in [PR #29](https://github.com/DeployFaith/hermes-keryx/pull/29). The permanent proof starts a relay/registry, two daemons, two edge nodes, and a real Python worker, then verifies discovery, authenticated sender/executor identity, remote handler execution, durable result return, canonical origin-assigned artifact descriptors, exact binary artifact retrieval, explicit-path download, and clean shutdown. Cross-node result content is bounded to 4 MiB aggregate, integrity-checked before origin persistence, and never uses remote logical names as local paths.
 
-The relay's offline mailbox is currently in-memory. It delivers frames when a node reconnects to the same running relay process, but it is not a relay-restart-durable queue.
+The relay's offline mailbox is currently in-memory. It delivers frames when a node reconnects to the same running relay process, retains each pending frame until the authenticated destination acknowledges that exact relay frame, and preserves unsent reconnect overflow for later delivery. It is not a relay-restart-durable queue.
 
 ## Operator CLI
 

@@ -392,7 +392,7 @@ async fn publish_task_stores_offline_mailbox_and_delivers_on_reconnect() {
         .expect("relay stream ended")
         .expect("relay frame status");
     assert_eq!(task_id(&delivered.task.unwrap()), "task-offline");
-    assert_eq!(runtime.mailbox_depth("node-offline"), 0);
+    assert_eq!(runtime.mailbox_depth("node-offline"), 1);
 
     let mut ack_request = Request::new(AckFrameRequest { frame_id });
     add_auth_metadata(&mut ack_request, "node-offline");
@@ -402,6 +402,7 @@ async fn publish_task_stores_offline_mailbox_and_delivers_on_reconnect() {
         .expect("ack exact frame")
         .into_inner();
     assert!(acked.accepted);
+    assert_eq!(runtime.mailbox_depth("node-offline"), 0);
 }
 
 #[tokio::test]

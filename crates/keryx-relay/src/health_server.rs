@@ -167,11 +167,14 @@ impl KeryxRelay for RelayHealthService {
         let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
 
         let pending = self.runtime.connect_node(node_id.clone(), tx.clone());
-        for frame in pending {
-            if tx.try_send(Ok(frame.clone())).is_err() {
-                self.runtime.route_frame(node_id.clone(), frame);
+        let pending_tx = tx.clone();
+        tokio::spawn(async move {
+            for frame in pending {
+                if pending_tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
             }
-        }
+        });
 
         let runtime = Arc::clone(&self.runtime);
         let source_node_id = node_id.clone();
