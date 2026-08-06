@@ -256,18 +256,18 @@ async def test_node_reopens_existing_task_result_by_id(sample_card: AgentCard) -
 
 
 @pytest.mark.asyncio
-async def test_node_cancels_reopened_task_by_id(sample_card: AgentCard) -> None:
+async def test_node_rejects_cancel_on_reattached_task(sample_card: AgentCard) -> None:
     peer_id = _make_peer_id(bytes(range(32)))
     fake_client = FakeDaemonClient(local_peer_id=peer_id)
     node = KeryxNode(sample_card, client_factory=lambda **_: fake_client)
     await node.start()
 
     handle = node.task_handle("task-cancel")
-    await handle.cancel()
+    with pytest.raises(NotImplementedError, match="reattached task handles"):
+        await handle.cancel()
 
-    request = fake_client._fake_daemon.canceled[0]
-    assert request.task_id.value == "task-cancel"
-    assert handle.status.value == "canceled"
+    assert fake_client._fake_daemon.canceled == []
+    assert handle.status.value == "submitted"
 
 
 @pytest.mark.asyncio

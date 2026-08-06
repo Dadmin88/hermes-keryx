@@ -804,16 +804,21 @@ class KeryxNode:
         )
 
     def task_handle(self, task_id: str) -> TaskHandle:
-        """Reopen one daemon-backed task by ID for refresh, wait, or cancel."""
+        """Reopen one daemon-backed task by ID for status/result reads.
+
+        Reattached cancellation is unavailable because the durable four-state
+        store cannot distinguish cancellation from canonical failure.
+        """
         self._ensure_running()
         task_id = _validate_task_id(task_id)
-        return self._remote_task_handle(Task(task_id=task_id))
+        return self._remote_task_handle(Task(task_id=task_id), allow_cancel=False)
 
     def _remote_task_handle(
         self,
         task: Task,
         *,
         receipt: SubmissionReceipt | None = None,
+        allow_cancel: bool = True,
     ) -> TaskHandle:
         self._ensure_running()
 
@@ -865,6 +870,10 @@ class KeryxNode:
             return task
 
         async def cancel_remote() -> None:
+            if not allow_cancel:
+                raise NotImplementedError(
+                    "Keryx cancellation is unavailable on reattached task handles"
+                )
             assert self._client is not None
             await self._client.cancel_task(
                 task.task_id,
