@@ -125,6 +125,23 @@ Artifact limits:
 
 Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-receipt history are process-local in-memory state. They survive reconnect to the same relay process, but not relay restart; acknowledgement and retained task-receipt history are bounded to 8,192 entries. Blank frame identities are rejected, every mailbox entry consumes bounded frame ownership, and reconnect backpressure never panics the relay. A task relay-acceptance receipt proves only authenticated relay acceptance, not execution or durable destination acknowledgement. `PublishResult` is stronger: it returns success only after the authenticated destination has either durably applied the exact result or safely accounted for it against a structurally verified deadline/cancellation terminal state, then acknowledged the relay-issued frame. An executor therefore does not settle its durable result outbox on relay admission alone.
 
+### Typed Nodescale identity-binding control
+
+`nodescale.identity.bind.v1` is control traffic, not task traffic. A control-capable edge installs the public typed `NodescaleIdentityBindHandler` and advertises the `nodescale_identity_bind_v1` protocol feature. The edge can run this handler with a relay endpoint and no daemon endpoint; task or result frames still fail closed when no daemon is present.
+
+Operational invariants:
+
+- configure node-token authentication for both publisher and destination;
+- use TLS for non-loopback relay control endpoints;
+- never place a sender identity in the operation body—the relay derives it from authenticated metadata;
+- never log or audit the binding nonce;
+- treat the relay frame ID as correlation only, not application authority;
+- complete a control frame only with `CompleteNodescaleIdentityBind`; generic `AckFrame` cannot settle it;
+- expect timeout, disconnect, missing feature, missing handler, or handler failure to return no semantic success;
+- control delivery leaves generic task-routing metrics and daemon/task state unchanged.
+
+The relay retains only bounded, process-local pending control ownership while awaiting the destination's typed result. Timeout or publisher cancellation removes the waiter, frame ownership, and mailbox copy. Relay restart similarly loses pending transport state but does not define or revoke any durable Nodescale identity binding.
+
 `keryx-node` supervises its `ConnectNode` stream. Clean EOF, transport loss, and relay replacement reconnect automatically with authentication metadata reapplied and node-specific jitter around an exponential base delay from 250 ms to a 5-second cap. Shutdown interrupts both an active stream and reconnect sleep. A separately supervised result-delivery worker keeps inbound frame consumption independent from outbound destination acknowledgement. Transient publication failures remain unacknowledged and retry durably for at most 10 total publication attempts with delivery-specific jittered exponential backoff capped at 60 seconds. The tenth failed attempt transitions the exact outbox row to retained dead-letter state with its terminal result, artifact data, and last failure reason intact; typed permanent failures still dead-letter immediately without masquerading as destination ACK. Verified artifact-free terminal late results do not reopen the task or prevent later frames from being consumed. Artifact-bearing late results fail closed so their source outbox retains the result and artifacts for durable dead-letter inspection rather than silently discarding bytes.
 
 ### JSON config (direct `RelayConfig`)

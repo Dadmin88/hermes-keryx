@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keryx_core::{Digest, NodeId, PeerId, TaskId as CoreTaskId, TaskStatus as CoreTaskStatus};
@@ -137,6 +137,120 @@ fn transient_result_delivery_failures_dead_letter_on_the_tenth_attempt() {
     ));
 }
 
+#[derive(Default)]
+struct RecordingDirectHandler {
+    calls: Mutex<
+        Vec<(
+            AuthenticatedDirectContext,
+            keryx_proto::v1::NodescaleIdentityBindV1,
+        )>,
+    >,
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityBindHandler for RecordingDirectHandler {
+    async fn handle_nodescale_identity_bind(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: keryx_proto::v1::NodescaleIdentityBindV1,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityBindResult> {
+        self.calls.lock().unwrap().push((context, operation));
+        Ok(keryx_proto::v1::NodescaleIdentityBindResult {
+            disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
+            accepted: true,
+            binding_id: "binding".to_string(),
+            generation: 1,
+            revision: 1,
+            reason: String::new(),
+            code: String::new(),
+        })
+    }
+}
+
+struct FailingDirectHandler;
+
+#[tonic::async_trait]
+impl NodescaleIdentityBindHandler for FailingDirectHandler {
+    async fn handle_nodescale_identity_bind(
+        &self,
+        _context: AuthenticatedDirectContext,
+        _operation: keryx_proto::v1::NodescaleIdentityBindV1,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityBindResult> {
+        anyhow::bail!("synthetic direct handler failure")
+    }
+}
+
+#[tokio::test]
+async fn typed_direct_handler_receives_exact_context_and_is_deterministic_without_task_routing() {
+    let runtime = RelayRuntime::new("direct-handler-test");
+    let before = runtime.metrics().snapshot().tasks_routed;
+    let handler = Arc::new(RecordingDirectHandler::default());
+    let handlers = DirectControlHandlers {
+        nodescale_identity_bind_v1: Some(handler.clone()),
+    };
+    let context = AuthenticatedDirectContext {
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        relay_frame_id: "frame".to_string(),
+    };
+    let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
+        operation_id: "operation".to_string(),
+        network_id: "network".to_string(),
+        device_id: "device".to_string(),
+        join_session_id: "session".to_string(),
+        binding_nonce: "nonce".to_string(),
+        binding_generation: 1,
+        agent_version: "v1".to_string(),
+    };
+
+    let first = dispatch_nodescale_identity_bind_v1(&handlers, context.clone(), operation.clone())
+        .await
+        .unwrap();
+    let second = dispatch_nodescale_identity_bind_v1(&handlers, context.clone(), operation.clone())
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+    let calls = handler.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], (context.clone(), operation.clone()));
+    assert_eq!(calls[1], (context, operation));
+}
+
+#[tokio::test]
+async fn typed_direct_handler_absence_or_failure_returns_error_without_task_fallback() {
+    let context = AuthenticatedDirectContext {
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        relay_frame_id: "frame".to_string(),
+    };
+    let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
+        operation_id: "operation".to_string(),
+        network_id: "network".to_string(),
+        device_id: "device".to_string(),
+        join_session_id: "session".to_string(),
+        binding_nonce: "nonce".to_string(),
+        binding_generation: 1,
+        agent_version: "v1".to_string(),
+    };
+    assert!(dispatch_nodescale_identity_bind_v1(
+        &DirectControlHandlers::default(),
+        context.clone(),
+        operation.clone(),
+    )
+    .await
+    .is_err());
+    assert!(dispatch_nodescale_identity_bind_v1(
+        &DirectControlHandlers {
+            nodescale_identity_bind_v1: Some(Arc::new(FailingDirectHandler)),
+        },
+        context,
+        operation,
+    )
+    .await
+    .is_err());
+}
+
 #[tokio::test]
 async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_artifacts() {
     const ORIGIN: &str = "retry-budget-origin";
@@ -262,6 +376,7 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
                 result: None,
                 authenticated_source_node_id: EXECUTOR.to_string(),
                 destination_node_id: ORIGIN.to_string(),
+                nodescale_identity_bind_v1: None,
             },
         );
     }
