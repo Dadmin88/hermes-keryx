@@ -56,6 +56,66 @@ pub struct RelayHealthService {
     node_auth: Option<Arc<NodeTokenAuth>>,
 }
 
+struct PendingFrameOwnership {
+    runtime: Arc<RelayRuntime>,
+    destination_node_id: String,
+    frame_id: String,
+    armed: bool,
+}
+
+impl PendingFrameOwnership {
+    fn new(runtime: Arc<RelayRuntime>, destination_node_id: String, frame_id: String) -> Self {
+        Self {
+            runtime,
+            destination_node_id,
+            frame_id,
+            armed: true,
+        }
+    }
+
+    fn abandon(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            self.runtime
+                .abandon_frame(&self.destination_node_id, &self.frame_id);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingFrameOwnership {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+async fn await_frame_acknowledgement(
+    acknowledgement: tokio::sync::oneshot::Receiver<()>,
+    pending_frame: &mut PendingFrameOwnership,
+    timeout: Duration,
+) -> Result<(), Status> {
+    match tokio::time::timeout(timeout, acknowledgement).await {
+        Ok(Ok(())) => {
+            pending_frame.disarm();
+            Ok(())
+        }
+        Ok(Err(_)) => {
+            pending_frame.abandon();
+            Err(Status::unavailable(
+                "relay restarted before destination acknowledged result frame",
+            ))
+        }
+        Err(_) => {
+            pending_frame.abandon();
+            Err(Status::deadline_exceeded(
+                "destination did not acknowledge result frame before retry deadline",
+            ))
+        }
+    }
+}
+
 impl RelayHealthService {
     async fn require_destination_feature(
         &self,
@@ -171,7 +231,8 @@ impl KeryxRelay for RelayHealthService {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RELAY_STREAM_BUFFER);
 
-        let pending_count = self.runtime.connect_node(node_id.clone(), tx.clone());
+        let (pending_count, connection_generation) =
+            self.runtime.connect_node_fenced(node_id.clone(), tx);
 
         let runtime = Arc::clone(&self.runtime);
         let source_node_id = node_id.clone();
@@ -179,14 +240,18 @@ impl KeryxRelay for RelayHealthService {
             if let Some(next) = inbound.next().await {
                 match next {
                     Ok(_) => {
-                        let error = Status::failed_precondition(
-                            "ConnectNode is receive-only; publish through authenticated PublishTask or PublishResult",
-                        );
                         tracing::warn!(
                             source_node_id = %source_node_id,
                             "rejecting mutation frame on receive-only node stream"
                         );
-                        let _ = tx.send(Err(error)).await;
+                        runtime.disconnect_node_with_status_if_current(
+                            &source_node_id,
+                            connection_generation,
+                            Status::failed_precondition(
+                                "ConnectNode is receive-only; publish through authenticated PublishTask or PublishResult",
+                            ),
+                        );
+                        return;
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -197,7 +262,7 @@ impl KeryxRelay for RelayHealthService {
                     }
                 }
             }
-            runtime.disconnect_node(&source_node_id);
+            runtime.disconnect_node_if_current(&source_node_id, connection_generation);
         });
 
         tracing::debug!(%node_id, pending_count, "node connected to relay stream");
@@ -370,23 +435,15 @@ impl KeryxRelay for RelayHealthService {
             },
         );
         ensure_frame_routed(delivery)?;
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&self.runtime),
+            target_node_id.clone(),
+            frame_id.clone(),
+        );
         let acknowledgement = acknowledgement
             .ok_or_else(|| Status::internal("accepted result frame lacks acknowledgement state"))?;
-        match tokio::time::timeout(Duration::from_secs(25), acknowledgement).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                self.runtime.abandon_frame(&target_node_id, &frame_id);
-                return Err(Status::unavailable(
-                    "relay restarted before destination acknowledged result frame",
-                ));
-            }
-            Err(_) => {
-                self.runtime.abandon_frame(&target_node_id, &frame_id);
-                return Err(Status::deadline_exceeded(
-                    "destination did not acknowledge result frame before retry deadline",
-                ));
-            }
-        }
+        await_frame_acknowledgement(acknowledgement, &mut pending_frame, Duration::from_secs(25))
+            .await?;
         Ok(Response::new(PublishResultResponse {
             accepted: true,
             frame_id,
@@ -630,5 +687,369 @@ pub async fn serve_http_health(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use keryx_proto::v1::{TaskId, TaskResultEnvelope, TerminalOutcome};
+
+    use super::*;
+
+    const SOURCE_NODE_ID: &str = "executor-node";
+    const DESTINATION_NODE_ID: &str = "origin-node";
+    const SOURCE_TOKEN: &str = "test-token";
+
+    fn test_service(runtime: Arc<RelayRuntime>) -> Arc<RelayHealthService> {
+        let source_node_id = SOURCE_NODE_ID.parse().expect("valid source node id");
+        let auth = Arc::new(NodeTokenAuth::new(
+            HashMap::from([(source_node_id, SOURCE_TOKEN.to_string())]),
+            HashSet::new(),
+        ));
+        Arc::new(RelayHealthService::with_registry_and_auth(
+            runtime,
+            Arc::new(SkillRegistry::new()),
+            auth,
+        ))
+    }
+
+    fn publish_result_request(task_id: impl Into<String>) -> Request<PublishResultRequest> {
+        let mut request = Request::new(PublishResultRequest {
+            result: Some(TaskResultEnvelope {
+                protocol_version: 1,
+                task_id: Some(TaskId {
+                    value: task_id.into(),
+                }),
+                correlation_id: None,
+                outcome: TerminalOutcome::Completed as i32,
+                executor_peer_id: SOURCE_NODE_ID.to_string(),
+                duration_ms: 1,
+                completed_at_ms: 1,
+                error_reason: String::new(),
+                result_metadata: HashMap::new(),
+                output_artifacts: Vec::new(),
+            }),
+            target_node_id: DESTINATION_NODE_ID.to_string(),
+            source_node_id: SOURCE_NODE_ID.to_string(),
+            frame_id: String::new(),
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+        request
+    }
+
+    fn unrelated_frame() -> RelayFrame {
+        RelayFrame {
+            frame_id: "unrelated-frame".to_string(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "unrelated-source".to_string(),
+            destination_node_id: DESTINATION_NODE_ID.to_string(),
+        }
+    }
+
+    fn spawn_publish_result(
+        service: Arc<RelayHealthService>,
+        task_id: impl Into<String>,
+    ) -> tokio::task::JoinHandle<Result<Response<PublishResultResponse>, Status>> {
+        let request = publish_result_request(task_id);
+        tokio::spawn(async move { KeryxRelay::publish_result(service.as_ref(), request).await })
+    }
+
+    async fn wait_for_single_pending_result_frame(runtime: &RelayRuntime) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame_ids = runtime.test_pending_result_frame_ids(DESTINATION_NODE_ID);
+                if let [frame_id] = frame_ids.as_slice() {
+                    return frame_id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("result frame must reach the ACK-wait state")
+    }
+
+    #[tokio::test]
+    async fn dropping_publish_result_future_abandons_only_its_exact_frame() {
+        let runtime = RelayRuntime::new("publish-result-drop-test");
+        let service = test_service(Arc::clone(&runtime));
+        assert_eq!(
+            runtime.route_frame(DESTINATION_NODE_ID, unrelated_frame()),
+            crate::runtime::FrameDelivery::Mailboxed
+        );
+        let baseline = runtime.test_pending_frame_counts(DESTINATION_NODE_ID);
+        assert_eq!(baseline, (0, 1, 1));
+
+        let publish = spawn_publish_result(Arc::clone(&service), "cancelled-result");
+        let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (true, true, true)
+        );
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            (1, 2, 2)
+        );
+
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, false, false)
+        );
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, "unrelated-frame"),
+            (false, true, true)
+        );
+
+        let later_publish = spawn_publish_result(service, "later-result");
+        let later_frame_id = wait_for_single_pending_result_frame(&runtime).await;
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &later_frame_id),
+            FrameAcknowledgement::Accepted
+        );
+        assert!(later_publish.await.unwrap().unwrap().into_inner().accepted);
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_publish_result_cancellation_recovers_frame_capacity() {
+        const CANCELLATION_ATTEMPTS: usize = 64;
+
+        let runtime = RelayRuntime::new("publish-result-capacity-recovery-test");
+        let service = test_service(Arc::clone(&runtime));
+        let baseline = runtime.test_pending_frame_counts(DESTINATION_NODE_ID);
+        assert_eq!(baseline, (0, 0, 0));
+
+        for attempt in 0..CANCELLATION_ATTEMPTS {
+            let publish =
+                spawn_publish_result(Arc::clone(&service), format!("cancelled-{attempt}"));
+            let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+            assert_eq!(
+                runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+                (true, true, true)
+            );
+            publish.abort();
+            assert!(publish.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+                baseline,
+                "cancellation attempt {attempt} leaked bounded frame capacity"
+            );
+        }
+
+        let later_publish = spawn_publish_result(service, "accepted-after-cancellations");
+        let later_frame_id = wait_for_single_pending_result_frame(&runtime).await;
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &later_frame_id),
+            FrameAcknowledgement::Accepted
+        );
+        assert!(later_publish.await.unwrap().unwrap().into_inner().accepted);
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_ack_is_recorded_keeps_ack_idempotent_and_leak_free() {
+        let runtime = RelayRuntime::new("publish-result-cancel-after-ack-test");
+        let service = test_service(Arc::clone(&runtime));
+        let publish = spawn_publish_result(service, "cancel-after-ack");
+        let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
+            FrameAcknowledgement::Accepted
+        );
+        assert!(
+            !publish.is_finished(),
+            "the handler must still be awaiting its next poll before cancellation"
+        );
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
+            FrameAcknowledgement::Accepted
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, false, false)
+        );
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ack_and_cancellation_never_leak_or_panic() {
+        let runtime = RelayRuntime::new("publish-result-concurrent-ack-cancel-test");
+        let service = test_service(Arc::clone(&runtime));
+        assert_eq!(
+            runtime.route_frame(DESTINATION_NODE_ID, unrelated_frame()),
+            crate::runtime::FrameDelivery::Mailboxed
+        );
+        let baseline = runtime.test_pending_frame_counts(DESTINATION_NODE_ID);
+        let publish = spawn_publish_result(service, "concurrent-ack-cancel");
+        let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let ack_runtime = Arc::clone(&runtime);
+        let ack_frame_id = frame_id.clone();
+        let ack_barrier = Arc::clone(&barrier);
+        let ack = tokio::spawn(async move {
+            ack_barrier.wait().await;
+            ack_runtime.ack_frame(DESTINATION_NODE_ID, &ack_frame_id)
+        });
+
+        barrier.wait().await;
+        publish.abort();
+        let publish_result = publish.await;
+        let ack_result = ack.await.unwrap();
+        match publish_result {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(Ok(response)) => assert!(response.into_inner().accepted),
+            Ok(Err(status)) => panic!("racing authenticated ACK failed: {status}"),
+        }
+        assert!(matches!(
+            ack_result,
+            FrameAcknowledgement::Accepted | FrameAcknowledgement::UnknownFrame
+        ));
+        if ack_result == FrameAcknowledgement::Accepted {
+            assert_eq!(
+                runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
+                FrameAcknowledgement::Accepted
+            );
+        }
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, false, false)
+        );
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, "unrelated-frame"),
+            (false, true, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_server_request_task_abandons_waiting_result_frame() {
+        let runtime = RelayRuntime::new("publish-result-server-request-shutdown-test");
+        let service = test_service(Arc::clone(&runtime));
+        let server_request_task = spawn_publish_result(service, "server-request-shutdown");
+        let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+
+        server_request_task.abort();
+        assert!(server_request_task.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, false, false)
+        );
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_receiver_failure_abandons_only_the_exact_result_frame() {
+        let runtime = RelayRuntime::new("publish-result-receiver-failure-test");
+        let service = test_service(Arc::clone(&runtime));
+        assert_eq!(
+            runtime.route_frame(DESTINATION_NODE_ID, unrelated_frame()),
+            crate::runtime::FrameDelivery::Mailboxed
+        );
+        let baseline = runtime.test_pending_frame_counts(DESTINATION_NODE_ID);
+        let publish = spawn_publish_result(service, "receiver-failure");
+        let frame_id = wait_for_single_pending_result_frame(&runtime).await;
+
+        assert!(runtime.test_drop_frame_ack_waiter(DESTINATION_NODE_ID, &frame_id));
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, true, true)
+        );
+        let error = publish.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, "unrelated-frame"),
+            (false, true, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_timeout_abandons_only_the_exact_result_frame() {
+        let runtime = RelayRuntime::new("publish-result-timeout-test");
+        assert_eq!(
+            runtime.route_frame(DESTINATION_NODE_ID, unrelated_frame()),
+            crate::runtime::FrameDelivery::Mailboxed
+        );
+        let baseline = runtime.test_pending_frame_counts(DESTINATION_NODE_ID);
+        let frame_id = "timed-out-frame".to_string();
+        let (delivery, acknowledgement) = runtime.route_frame_waiting_for_ack(
+            DESTINATION_NODE_ID,
+            RelayFrame {
+                frame_id: frame_id.clone(),
+                task: None,
+                result: None,
+                authenticated_source_node_id: SOURCE_NODE_ID.to_string(),
+                destination_node_id: DESTINATION_NODE_ID.to_string(),
+            },
+        );
+        assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&runtime),
+            DESTINATION_NODE_ID.to_string(),
+            frame_id.clone(),
+        );
+
+        let error = await_frame_acknowledgement(
+            acknowledgement.unwrap(),
+            &mut pending_frame,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            baseline
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, &frame_id),
+            (false, false, false)
+        );
+        assert_eq!(
+            runtime.test_exact_frame_state(DESTINATION_NODE_ID, "unrelated-frame"),
+            (false, true, true)
+        );
     }
 }

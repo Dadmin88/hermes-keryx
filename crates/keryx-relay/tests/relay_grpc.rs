@@ -450,6 +450,83 @@ async fn descriptor_only_publish_result_requires_configured_authentication() {
 }
 
 #[tokio::test]
+async fn cancelled_publish_result_rpc_releases_mailbox_and_accepts_later_publication() {
+    let runtime = RelayRuntime::new("relay-grpc-result-cancellation-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_authenticated_relay(Arc::clone(&runtime)).await;
+    let channel = connect_grpc(addr).await;
+    let (_origin_tx, origin_rx) = mpsc::channel(4);
+    let mut origin = result_frame_client(channel.clone());
+    let mut origin_stream = origin
+        .connect_node(authenticated_connect_request("origin-node", origin_rx))
+        .await
+        .expect("connect authenticated origin node")
+        .into_inner();
+
+    let mut publisher = result_frame_client(channel.clone());
+    let cancelled_publish = tokio::spawn(async move {
+        publisher
+            .publish_result(authenticated_result_request("cancelled-result"))
+            .await
+    });
+    let cancelled_frame = tokio::time::timeout(Duration::from_secs(3), origin_stream.next())
+        .await
+        .expect("cancelled result relay timeout")
+        .expect("origin stream ended")
+        .expect("cancelled result relay status");
+    assert_eq!(runtime.mailbox_depth("origin-node"), 1);
+
+    cancelled_publish.abort();
+    assert!(cancelled_publish.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while runtime.mailbox_depth("origin-node") != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled PublishResult must release its mailbox frame");
+
+    let mut late_ack = Request::new(AckFrameRequest {
+        frame_id: cancelled_frame.frame_id,
+    });
+    add_auth_metadata(&mut late_ack, "origin-node");
+    assert!(
+        !result_frame_client(channel.clone())
+            .ack_frame(late_ack)
+            .await
+            .expect("late ACK for abandoned frame")
+            .into_inner()
+            .accepted
+    );
+
+    let mut later_publisher = result_frame_client(channel.clone());
+    let later_publish = tokio::spawn(async move {
+        later_publisher
+            .publish_result(authenticated_result_request("later-result"))
+            .await
+    });
+    let later_frame = tokio::time::timeout(Duration::from_secs(3), origin_stream.next())
+        .await
+        .expect("later result relay timeout")
+        .expect("origin stream ended")
+        .expect("later result relay status");
+    let mut later_ack = Request::new(AckFrameRequest {
+        frame_id: later_frame.frame_id,
+    });
+    add_auth_metadata(&mut later_ack, "origin-node");
+    assert!(
+        result_frame_client(channel)
+            .ack_frame(later_ack)
+            .await
+            .expect("ACK later result frame")
+            .into_inner()
+            .accepted
+    );
+    assert!(later_publish.await.unwrap().unwrap().into_inner().accepted);
+    assert_eq!(runtime.mailbox_depth("origin-node"), 0);
+}
+
+#[tokio::test]
 async fn authenticated_publish_result_delivers_four_mib_artifact_payload_unchanged() {
     let runtime = RelayRuntime::new("relay-grpc-result-frame-limit-test");
     runtime.mark_transport_listening();
@@ -1047,6 +1124,31 @@ fn authenticated_request<T>(node_id: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     add_auth_metadata(&mut request, node_id);
     request
+}
+
+fn authenticated_result_request(task_id: &str) -> Request<PublishResultRequest> {
+    authenticated_request(
+        "executor-node",
+        PublishResultRequest {
+            result: Some(TaskResultEnvelope {
+                protocol_version: 1,
+                task_id: Some(TaskId {
+                    value: task_id.to_string(),
+                }),
+                correlation_id: None,
+                outcome: TerminalOutcome::Completed as i32,
+                executor_peer_id: "executor-node".to_string(),
+                duration_ms: 1,
+                completed_at_ms: 1,
+                error_reason: String::new(),
+                result_metadata: HashMap::new(),
+                output_artifacts: Vec::new(),
+            }),
+            target_node_id: "origin-node".to_string(),
+            source_node_id: "executor-node".to_string(),
+            frame_id: String::new(),
+        },
+    )
 }
 
 fn add_auth_metadata<T>(request: &mut Request<T>, node_id: &str) {

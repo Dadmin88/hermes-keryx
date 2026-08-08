@@ -82,10 +82,17 @@ pub struct PeerIdentity {
     pub mailbox_depth: usize,
 }
 
+#[derive(Debug)]
+struct ConnectedNode {
+    generation: u64,
+    sender: RelayFrameSender,
+}
+
 #[derive(Debug, Default)]
 struct PeerState {
     registered: HashSet<String>,
-    connected_nodes: HashMap<String, RelayFrameSender>,
+    connected_nodes: HashMap<String, ConnectedNode>,
+    next_connection_generation: u64,
     libp2p_connected_peers: HashSet<String>,
     mailboxes: HashMap<String, VecDeque<RelayFrame>>,
     frame_destinations: HashSet<FrameKey>,
@@ -171,8 +178,19 @@ impl RelayRuntime {
 
     /// Attach a node's gRPC relay stream and return any frames stored while it was offline.
     pub fn connect_node(&self, node_id: impl Into<String>, sender: RelayFrameSender) -> usize {
+        self.connect_node_fenced(node_id, sender).0
+    }
+
+    /// Attach a node stream and return its replay count plus an opaque connection generation.
+    pub fn connect_node_fenced(
+        &self,
+        node_id: impl Into<String>,
+        sender: RelayFrameSender,
+    ) -> (usize, u64) {
         let node_id = node_id.into();
         let mut guard = self.lock_peers();
+        guard.next_connection_generation = guard.next_connection_generation.wrapping_add(1).max(1);
+        let generation = guard.next_connection_generation;
         guard.registered.insert(node_id.clone());
         let pending = guard
             .mailboxes
@@ -198,10 +216,12 @@ impl RelayRuntime {
             }
         }
         if stream_open {
-            guard.connected_nodes.insert(node_id.clone(), sender);
+            guard
+                .connected_nodes
+                .insert(node_id.clone(), ConnectedNode { generation, sender });
         }
         self.sync_connected_peer_metric(&guard);
-        replayed
+        (replayed, generation)
     }
 
     /// Mark a node stream disconnected. A reconnect with the same node id replaces this state.
@@ -209,6 +229,55 @@ impl RelayRuntime {
         let mut guard = self.lock_peers();
         guard.connected_nodes.remove(node_id);
         self.sync_connected_peer_metric(&guard);
+    }
+
+    /// Disconnect only when the caller still owns the current stream generation.
+    pub fn disconnect_node_if_current(&self, node_id: &str, generation: u64) {
+        let mut guard = self.lock_peers();
+        if guard
+            .connected_nodes
+            .get(node_id)
+            .is_some_and(|connected| connected.generation == generation)
+        {
+            guard.connected_nodes.remove(node_id);
+        }
+        self.sync_connected_peer_metric(&guard);
+    }
+
+    /// Disconnect a node stream and best-effort deliver a terminal stream status first.
+    pub fn disconnect_node_with_status(&self, node_id: &str, status: Status) {
+        let connected = {
+            let mut guard = self.lock_peers();
+            let connected = guard.connected_nodes.remove(node_id);
+            self.sync_connected_peer_metric(&guard);
+            connected
+        };
+        if let Some(connected) = connected {
+            let _ = connected.sender.try_send(Err(status));
+        }
+    }
+
+    /// Disconnect the current generation with a terminal stream status.
+    pub fn disconnect_node_with_status_if_current(
+        &self,
+        node_id: &str,
+        generation: u64,
+        status: Status,
+    ) {
+        let connected = {
+            let mut guard = self.lock_peers();
+            let connected = match guard.connected_nodes.get(node_id) {
+                Some(connected) if connected.generation == generation => {
+                    guard.connected_nodes.remove(node_id)
+                }
+                _ => None,
+            };
+            self.sync_connected_peer_metric(&guard);
+            connected
+        };
+        if let Some(connected) = connected {
+            let _ = connected.sender.try_send(Err(status));
+        }
     }
 
     /// Route a frame to a target node, storing it in the offline mailbox when needed.
@@ -240,6 +309,9 @@ impl RelayRuntime {
         let target_node_id = target_node_id.into();
         let frame_id = frame.frame_id.trim().to_string();
         let mut guard = self.lock_peers();
+        // Keep the peer-state lock across both live enqueue and waiter insertion. A destination
+        // may receive the frame immediately, but its AckFrame cannot acquire this lock until the
+        // waiter is installed, so an early authenticated ACK cannot be lost.
         let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
         let receiver = if matches!(
             delivery,
@@ -321,6 +393,55 @@ impl RelayRuntime {
             .mailboxes
             .get(node_id)
             .map_or(0, VecDeque::len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_frame_counts(&self, node_id: &str) -> (usize, usize, usize) {
+        let guard = self.lock_peers();
+        (
+            guard.frame_ack_waiters.len(),
+            guard.frame_destinations.len(),
+            guard.mailboxes.get(node_id).map_or(0, VecDeque::len),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_result_frame_ids(&self, node_id: &str) -> Vec<String> {
+        let guard = self.lock_peers();
+        let mut frame_ids = guard
+            .frame_ack_waiters
+            .keys()
+            .filter(|(destination_node_id, _)| destination_node_id == node_id)
+            .map(|(_, frame_id)| frame_id.clone())
+            .collect::<Vec<_>>();
+        frame_ids.sort();
+        frame_ids
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_frame_ack_waiter(&self, node_id: &str, frame_id: &str) -> bool {
+        self.lock_peers()
+            .frame_ack_waiters
+            .remove(&(node_id.to_string(), frame_id.to_string()))
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_exact_frame_state(
+        &self,
+        node_id: &str,
+        frame_id: &str,
+    ) -> (bool, bool, bool) {
+        let guard = self.lock_peers();
+        let key = (node_id.to_string(), frame_id.to_string());
+        (
+            guard.frame_ack_waiters.contains_key(&key),
+            guard.frame_destinations.contains(&key),
+            guard
+                .mailboxes
+                .get(node_id)
+                .is_some_and(|mailbox| mailbox.iter().any(|frame| frame.frame_id == frame_id)),
+        )
     }
 
     /// Atomically admit a task identity and acquire bounded frame ownership before delivery.
@@ -574,7 +695,11 @@ fn route_frame_locked(
         .entry(target_node_id.clone())
         .or_default()
         .push_back(frame.clone());
-    if let Some(sender) = state.connected_nodes.get(&target_node_id).cloned() {
+    if let Some(sender) = state
+        .connected_nodes
+        .get(&target_node_id)
+        .map(|connected| connected.sender.clone())
+    {
         match sender.try_send(Ok(frame.clone())) {
             Ok(()) => return FrameDelivery::Delivered,
             Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(_))) => {
@@ -649,6 +774,33 @@ mod tests {
             FrameDelivery::RejectedDuplicate
         );
         assert_eq!(runtime.mailbox_depth("destination"), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_stream_cleanup_cannot_disconnect_newer_generation() {
+        let runtime = RelayRuntime::new("relay");
+        let (old_sender, mut old_receiver) = mpsc::channel(1);
+        let (_, old_generation) = runtime.connect_node_fenced("destination", old_sender);
+        let (new_sender, mut new_receiver) = mpsc::channel(1);
+        let (_, new_generation) = runtime.connect_node_fenced("destination", new_sender);
+        assert_ne!(old_generation, new_generation);
+        assert!(old_receiver.recv().await.is_none());
+
+        runtime.disconnect_node_if_current("destination", old_generation);
+        runtime.disconnect_node_with_status_if_current(
+            "destination",
+            old_generation,
+            Status::unavailable("stale stream ended"),
+        );
+        assert!(runtime.peer_identity("destination").unwrap().connected);
+        assert_eq!(
+            runtime.route_frame("destination", frame("new-generation-frame")),
+            FrameDelivery::Delivered
+        );
+        assert_eq!(
+            new_receiver.recv().await.unwrap().unwrap().frame_id,
+            "new-generation-frame"
+        );
     }
 
     #[test]
@@ -1024,6 +1176,31 @@ mod tests {
             FrameAcknowledgement::Accepted
         );
         acknowledgement.await.unwrap();
+    }
+
+    #[test]
+    fn abandoning_frame_is_idempotent_and_scoped_to_exact_destination_and_frame() {
+        let runtime = RelayRuntime::new("relay");
+        let (first_delivery, _first_acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination-a", frame("shared-frame"));
+        let (second_delivery, _second_acknowledgement) =
+            runtime.route_frame_waiting_for_ack("destination-b", frame("shared-frame"));
+        assert_eq!(first_delivery, FrameDelivery::Mailboxed);
+        assert_eq!(second_delivery, FrameDelivery::Mailboxed);
+
+        runtime.abandon_frame("destination-a", "shared-frame");
+        runtime.abandon_frame("destination-a", "shared-frame");
+
+        assert_eq!(runtime.mailbox_depth("destination-a"), 0);
+        assert_eq!(runtime.mailbox_depth("destination-b"), 1);
+        assert_eq!(
+            runtime.ack_frame("destination-a", "shared-frame"),
+            FrameAcknowledgement::WrongDestination
+        );
+        assert_eq!(
+            runtime.ack_frame("destination-b", "shared-frame"),
+            FrameAcknowledgement::Accepted
+        );
     }
 
     #[tokio::test]
