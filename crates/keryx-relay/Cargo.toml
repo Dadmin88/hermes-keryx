@@ -37,6 +37,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures-timer = "3"
+keryx-daemon = { path = "../keryx-daemon" }
+keryx-store = { path = "../keryx-store" }
+prost = "0.14"
 rcgen = "0.13"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "process", "net", "io-util"] }

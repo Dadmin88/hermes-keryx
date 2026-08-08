@@ -50,9 +50,10 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{error, instrument, warn};
 
 use keryx_store::{
-    LeaseRecord, OriginResultArtifact, RecoveryReport, SqliteStore, StoreError, StoreResult,
-    TaskEnvelopeRecord, TaskRecord, TaskTransportContextRecord, TerminalResultRecord,
-    CURRENT_SCHEMA_VERSION,
+    LeaseRecord, OriginResultArtifact, RecoveryReport, RemoteResultIngestOutcome,
+    RemoteResultTerminalReason, SqliteStore, StoreError, StoreResult, TaskEnvelopeRecord,
+    TaskRecord, TaskTransportContextRecord, TerminalResultRecord, CURRENT_SCHEMA_VERSION,
+    MAX_RESULT_DELIVERY_RETRY_DELAY_MS,
 };
 
 pub use cancellation::{CancellationSnapshot, CancellationState};
@@ -153,6 +154,13 @@ impl RpcInFlightGuard {
             .shutdown
             .in_flight_rpcs
             .fetch_add(1, Ordering::SeqCst);
+        if runtime.shutdown.is_shutting_down() {
+            runtime
+                .shutdown
+                .in_flight_rpcs
+                .fetch_sub(1, Ordering::SeqCst);
+            return Err(Status::unavailable("daemon is shutting down"));
+        }
         Ok(Self {
             state: Arc::clone(&runtime.shutdown),
         })
@@ -1869,6 +1877,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         &self,
         request: Request<AckResultDeliveryRequest>,
     ) -> Result<Response<AckResultDeliveryResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         let inner = request.into_inner();
         self.runtime
             .store()
@@ -1887,6 +1896,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         &self,
         request: Request<FailResultDeliveryRequest>,
     ) -> Result<Response<FailResultDeliveryResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         let inner = request.into_inner();
         let now_ms = unix_ms_now();
         self.runtime
@@ -1895,7 +1905,11 @@ impl KeryxDaemon for KeryxDaemonRpcService {
                 &inner.delivery_id,
                 (&inner.worker_id, inner.lease_expires_at_ms),
                 now_ms,
-                now_ms.saturating_add(inner.retry_delay_ms.max(1_000)),
+                now_ms.saturating_add(
+                    inner
+                        .retry_delay_ms
+                        .clamp(1_000, MAX_RESULT_DELIVERY_RETRY_DELAY_MS),
+                ),
                 &inner.error_reason,
                 inner.dead_letter,
             )
@@ -1908,6 +1922,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         &self,
         request: Request<IngestRemoteResultRequest>,
     ) -> Result<Response<IngestRemoteResultResponse>, Status> {
+        let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         let inner = request.into_inner();
         let mut result = inner
             .result
@@ -1937,10 +1952,16 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             executor_peer_id: executor.clone(),
             created_at_ms: result.completed_at_ms,
         };
-        let task = self
+        let artifact_count = artifacts.len();
+        let artifact_bytes = artifacts
+            .iter()
+            .map(|artifact| artifact.content.len() as u64)
+            .sum::<u64>();
+        let relay_frame_id = inner.relay_frame_id;
+        let outcome = self
             .runtime
             .store()
-            .apply_remote_result_with_artifacts(
+            .ingest_remote_result_with_artifacts(
                 record,
                 &artifacts,
                 &executor,
@@ -1948,6 +1969,26 @@ impl KeryxDaemon for KeryxDaemonRpcService {
             )
             .await
             .map_err(store_error_to_status)?;
+        let task = match outcome {
+            RemoteResultIngestOutcome::Applied(task)
+            | RemoteResultIngestOutcome::Duplicate(task) => task,
+            RemoteResultIngestOutcome::SettledTerminal {
+                task,
+                reason,
+                canonical_result,
+            } => {
+                validate_terminal_result_settlement(&task_id, reason, canonical_result.as_ref())?;
+                warn!(
+                    task_id = %task_id.as_str(),
+                    relay_frame_id = %relay_frame_id,
+                    terminal_reason = %reason,
+                    artifact_count,
+                    artifact_bytes,
+                    "settled authenticated late result without mutating terminal task"
+                );
+                task
+            }
+        };
         Ok(Response::new(IngestRemoteResultResponse {
             task_id: Some(proto_task_id(&task_id)),
             status: task_status_label(task.status).to_string(),
@@ -2293,6 +2334,50 @@ fn terminal_result_status(result: &TaskResultEnvelope) -> Result<&'static str, S
             "stored terminal result has no terminal outcome",
         )),
     }
+}
+
+fn validate_terminal_result_settlement(
+    task_id: &TaskId,
+    reason: RemoteResultTerminalReason,
+    canonical_result: Option<&TerminalResultRecord>,
+) -> Result<(), Status> {
+    match reason {
+        RemoteResultTerminalReason::DeadlineExpired => {
+            if canonical_result.is_some() {
+                return Err(Status::data_loss(
+                    "deadline-expired task unexpectedly has a canonical terminal result",
+                ));
+            }
+        }
+        RemoteResultTerminalReason::Canceled => {
+            let record = canonical_result.ok_or_else(|| {
+                Status::data_loss("canceled task is missing its canonical terminal result")
+            })?;
+            let envelope = TaskResultEnvelope::decode(record.encoded_result.as_slice())
+                .map_err(|_| Status::data_loss("canceled task has a corrupt terminal result"))?;
+            if envelope.task_id.as_ref().map(|id| id.value.as_str()) != Some(task_id.as_str()) {
+                return Err(Status::data_loss(
+                    "canceled terminal result has mismatched task identity",
+                ));
+            }
+            if TerminalOutcome::try_from(envelope.outcome).ok() != Some(TerminalOutcome::Canceled) {
+                return Err(Status::data_loss(
+                    "canceled task has a non-canceled canonical result",
+                ));
+            }
+            if envelope.executor_peer_id != record.executor_peer_id.as_str() {
+                return Err(Status::data_loss(
+                    "canceled terminal result has mismatched executor identity",
+                ));
+            }
+            if !envelope.output_artifacts.is_empty() {
+                return Err(Status::data_loss(
+                    "canceled terminal result unexpectedly references artifacts",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn terminal_outcome_status(outcome: i32) -> Result<TaskStatus, Status> {
@@ -2662,6 +2747,20 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             expected.as_str(),
             actual.as_str()
         )),
+        StoreError::RemoteResultTerminallySettled { task_id, reason } => {
+            Status::failed_precondition(format!(
+                "remote result for task {} was settled against terminal reason {}",
+                task_id.as_str(),
+                reason
+            ))
+        }
+        StoreError::RemoteResultTerminalArtifactsRejected { task_id, reason } => {
+            Status::failed_precondition(format!(
+                "remote result for task {} carries artifacts that cannot settle terminal reason {}",
+                task_id.as_str(),
+                reason
+            ))
+        }
         StoreError::ArtifactNotFound(artifact_id) => {
             Status::not_found(format!("artifact not found: {artifact_id}"))
         }

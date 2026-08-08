@@ -97,6 +97,19 @@ pub enum StoreError {
         expected: keryx_core::PeerId,
         actual: keryx_core::PeerId,
     },
+    #[error("remote result for task {task_id} was settled against terminal reason {reason}")]
+    RemoteResultTerminallySettled {
+        task_id: TaskId,
+        reason: RemoteResultTerminalReason,
+    },
+
+    #[error(
+        "remote result for task {task_id} carries artifacts that cannot settle terminal reason {reason}"
+    )]
+    RemoteResultTerminalArtifactsRejected {
+        task_id: TaskId,
+        reason: RemoteResultTerminalReason,
+    },
 
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationError),

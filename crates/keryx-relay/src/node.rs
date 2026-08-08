@@ -19,10 +19,10 @@ use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
 use libp2p::swarm::SwarmEvent;
 use libp2p::Multiaddr;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
-use tonic::Request;
+use tonic::{Code, Request};
 use tracing::info;
 
 use crate::bootstrap::{dial_bootstrap_peers, wait_for_listen_addr};
@@ -41,6 +41,104 @@ const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+struct RelayReconnectPolicy {
+    initial_delay: Duration,
+    max_delay: Duration,
+    jitter_seed: u64,
+}
+
+impl RelayReconnectPolicy {
+    const fn new(initial_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            initial_delay,
+            max_delay,
+            jitter_seed: 0,
+        }
+    }
+
+    const fn with_jitter_seed(mut self, jitter_seed: u64) -> Self {
+        self.jitter_seed = jitter_seed;
+        self
+    }
+}
+
+impl Default for RelayReconnectPolicy {
+    fn default() -> Self {
+        Self::new(RELAY_RECONNECT_INITIAL_DELAY, RELAY_RECONNECT_MAX_DELAY)
+    }
+}
+
+fn next_reconnect_delay(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
+}
+
+fn stable_jitter_seed(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn jittered_delay(base: Duration, maximum: Duration, seed: u64, attempt: u32) -> Duration {
+    let mixed = seed
+        .wrapping_add(u64::from(attempt).wrapping_mul(0x9e3779b97f4a7c15))
+        .wrapping_mul(0xbf58476d1ce4e5b9);
+    let percent = 80 + (mixed % 41);
+    base.saturating_mul(percent as u32)
+        .checked_div(100)
+        .unwrap_or(base)
+        .min(maximum)
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+async fn supervise_relay_stream<F, Fut>(
+    mut run_once: F,
+    mut shutdown: watch::Receiver<bool>,
+    policy: RelayReconnectPolicy,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delay = policy.initial_delay.min(policy.max_delay);
+    let mut retry_attempt = 0_u32;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let outcome = tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            outcome = run_once() => outcome,
+        };
+        match outcome {
+            Ok(()) => tracing::warn!("relay stream closed cleanly; reconnecting"),
+            Err(error) => tracing::warn!(error = %error, "relay stream failed; reconnecting"),
+        }
+        let sleep_delay =
+            jittered_delay(delay, policy.max_delay, policy.jitter_seed, retry_attempt);
+        tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            _ = tokio::time::sleep(sleep_delay) => {}
+        }
+        retry_attempt = retry_attempt.saturating_add(1);
+        delay = next_reconnect_delay(delay, policy.max_delay);
+    }
+}
 
 /// Run an edge node until SIGINT: listen, dial bootstrap peers, optionally register skills.
 pub async fn run_edge_node() -> Result<()> {
@@ -75,21 +173,48 @@ pub async fn run_edge_node() -> Result<()> {
 
     register_node_skills(&registry_peer_id).await?;
 
-    let relay_stream_task = match (relay_endpoint(), daemon_endpoint()) {
+    let mut relay_stream_task = match (relay_endpoint(), daemon_endpoint()) {
         (Some(relay_endpoint), Some(daemon_endpoint)) => {
             let registry_peer_id = registry_peer_id.clone();
-            Some(tokio::spawn(async move {
-                if let Err(error) = run_relay_stream(
-                    relay_endpoint,
-                    registry_peer_id,
-                    node_token(),
-                    daemon_endpoint,
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "relay stream task exited");
-                }
-            }))
+            let node_token = node_token();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let stream_shutdown = shutdown_rx.clone();
+            let stream_relay_endpoint = relay_endpoint.clone();
+            let stream_registry_peer_id = registry_peer_id.clone();
+            let stream_node_token = node_token.clone();
+            let stream_daemon_endpoint = daemon_endpoint.clone();
+            let stream_jitter_seed = stable_jitter_seed(&format!("stream:{registry_peer_id}"));
+            let delivery_jitter_seed =
+                stable_jitter_seed(&format!("result-delivery:{registry_peer_id}"));
+            let task = tokio::spawn(async move {
+                tokio::join!(
+                    supervise_relay_stream(
+                        move || {
+                            run_relay_stream(
+                                stream_relay_endpoint.clone(),
+                                stream_registry_peer_id.clone(),
+                                stream_node_token.clone(),
+                                stream_daemon_endpoint.clone(),
+                            )
+                        },
+                        stream_shutdown,
+                        RelayReconnectPolicy::default().with_jitter_seed(stream_jitter_seed),
+                    ),
+                    supervise_relay_stream(
+                        move || {
+                            run_result_delivery_worker(
+                                relay_endpoint.clone(),
+                                registry_peer_id.clone(),
+                                node_token.clone(),
+                                daemon_endpoint.clone(),
+                            )
+                        },
+                        shutdown_rx,
+                        RelayReconnectPolicy::default().with_jitter_seed(delivery_jitter_seed),
+                    )
+                );
+            });
+            Some((shutdown_tx, task))
         }
         (Some(_), None) => {
             info!(
@@ -112,8 +237,16 @@ pub async fn run_edge_node() -> Result<()> {
         tokio::select! {
             _ = signal::ctrl_c() => {
                 info!(component = "keryx-node", "shutdown signal received");
-                if let Some(task) = &relay_stream_task {
-                    task.abort();
+                if let Some((shutdown_tx, mut task)) = relay_stream_task.take() {
+                    let _ = shutdown_tx.send(true);
+                    if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("relay stream supervisor did not stop before timeout; aborting");
+                        task.abort();
+                        let _ = task.await;
+                    }
                 }
                 break;
             }
@@ -182,6 +315,134 @@ fn relay_endpoint() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+const MAX_RESULT_DELIVERY_ATTEMPTS: u32 = 10;
+
+fn publish_result_failure_is_permanent(code: Code) -> bool {
+    matches!(
+        code,
+        Code::InvalidArgument
+            | Code::Unauthenticated
+            | Code::PermissionDenied
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::FailedPrecondition
+            | Code::OutOfRange
+            | Code::Unimplemented
+            | Code::DataLoss
+    )
+}
+
+/// `attempt_count` is the number of previously failed publication attempts stored in the outbox.
+/// The failure currently being handled is therefore attempt `attempt_count + 1`.
+fn result_delivery_failure_should_dead_letter(code: Code, attempt_count: u32) -> bool {
+    publish_result_failure_is_permanent(code)
+        || attempt_count.saturating_add(1) >= MAX_RESULT_DELIVERY_ATTEMPTS
+}
+
+fn result_delivery_retry_delay_ms(delivery_id: &str, attempt_count: u32) -> i64 {
+    const MAX_DELAY_MS: i64 = 60_000;
+    let multiplier = 1_i64 << attempt_count.min(6);
+    let base_ms = 1_000_i64.saturating_mul(multiplier).min(MAX_DELAY_MS);
+    jittered_delay(
+        Duration::from_millis(base_ms as u64),
+        Duration::from_millis(MAX_DELAY_MS as u64),
+        stable_jitter_seed(delivery_id),
+        attempt_count,
+    )
+    .as_millis() as i64
+}
+
+async fn run_result_delivery_worker(
+    relay_endpoint: String,
+    registry_peer_id: String,
+    node_token: Option<String>,
+    daemon_endpoint: String,
+) -> Result<()> {
+    run_result_delivery_worker_with_retry_delay(
+        relay_endpoint,
+        registry_peer_id,
+        node_token,
+        daemon_endpoint,
+        result_delivery_retry_delay_ms,
+    )
+    .await
+}
+
+async fn run_result_delivery_worker_with_retry_delay<F>(
+    relay_endpoint: String,
+    registry_peer_id: String,
+    node_token: Option<String>,
+    daemon_endpoint: String,
+    retry_delay_ms: F,
+) -> Result<()>
+where
+    F: Fn(&str, u32) -> i64 + Send + Sync,
+{
+    let channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
+    let mut relay = KeryxRelayClient::new(channel)
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let mut daemon = KeryxDaemonClient::connect(daemon_endpoint)
+        .await?
+        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let delivery_worker = format!("edge-{registry_peer_id}");
+    let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        delivery_tick.tick().await;
+        let delivery = daemon
+            .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
+                worker_id: delivery_worker.clone(),
+                lease_duration_ms: 30_000,
+            })
+            .await?
+            .into_inner();
+        if !delivery.has_delivery {
+            continue;
+        }
+        let mut publish_request = Request::new(PublishResultRequest {
+            result: delivery.result,
+            target_node_id: delivery.target_peer_id,
+            source_node_id: registry_peer_id.clone(),
+            frame_id: delivery.delivery_id.clone(),
+        });
+        add_node_auth_metadata(
+            &mut publish_request,
+            &registry_peer_id,
+            node_token.as_deref(),
+        )?;
+        match relay.publish_result(publish_request).await {
+            Ok(_) => {
+                daemon
+                    .ack_result_delivery(AckResultDeliveryRequest {
+                        delivery_id: delivery.delivery_id,
+                        worker_id: delivery_worker.clone(),
+                        lease_expires_at_ms: delivery.lease_expires_at_ms,
+                    })
+                    .await?;
+            }
+            Err(error) => {
+                daemon
+                    .fail_result_delivery(FailResultDeliveryRequest {
+                        delivery_id: delivery.delivery_id.clone(),
+                        worker_id: delivery_worker.clone(),
+                        error_reason: error.message().to_string(),
+                        retry_delay_ms: retry_delay_ms(
+                            &delivery.delivery_id,
+                            delivery.attempt_count,
+                        ),
+                        dead_letter: result_delivery_failure_should_dead_letter(
+                            error.code(),
+                            delivery.attempt_count,
+                        ),
+                        lease_expires_at_ms: delivery.lease_expires_at_ms,
+                    })
+                    .await?;
+            }
+        }
+    }
+}
+
 async fn run_relay_stream(
     relay_endpoint: String,
     registry_peer_id: String,
@@ -205,8 +466,6 @@ async fn run_relay_stream(
         .into_inner();
     info!(registry_peer_id = %registry_peer_id, relay_endpoint = %relay_endpoint, "relay stream connected");
 
-    let delivery_worker = format!("edge-{registry_peer_id}");
-    let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             next = stream.next() => {
@@ -254,57 +513,7 @@ async fn run_relay_stream(
                     .await
                     .context("keryx node stream: relay AckFrame failed")?;
             }
-            _ = delivery_tick.tick() => {
-                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
-                    .await?
-                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
-                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
-                let delivery = daemon
-                    .claim_next_result_delivery(ClaimNextResultDeliveryRequest {
-                        worker_id: delivery_worker.clone(),
-                        lease_duration_ms: 30_000,
-                    })
-                    .await?
-                    .into_inner();
-                if !delivery.has_delivery {
-                    continue;
-                }
-                let mut publish_request = Request::new(PublishResultRequest {
-                    result: delivery.result,
-                    target_node_id: delivery.target_peer_id,
-                    source_node_id: registry_peer_id.clone(),
-                    frame_id: delivery.delivery_id.clone(),
-                });
-                add_node_auth_metadata(
-                    &mut publish_request,
-                    &registry_peer_id,
-                    node_token.as_deref(),
-                )?;
-                let publish = relay.publish_result(publish_request).await;
-                match publish {
-                    Ok(_) => {
-                        daemon
-                            .ack_result_delivery(AckResultDeliveryRequest {
-                                delivery_id: delivery.delivery_id,
-                                worker_id: delivery_worker.clone(),
-                                lease_expires_at_ms: delivery.lease_expires_at_ms,
-                            })
-                            .await?;
-                    }
-                    Err(error) => {
-                        daemon
-                            .fail_result_delivery(FailResultDeliveryRequest {
-                                delivery_id: delivery.delivery_id,
-                                worker_id: delivery_worker.clone(),
-                                error_reason: error.message().to_string(),
-                                retry_delay_ms: 1_000,
-                                dead_letter: false,
-                                lease_expires_at_ms: delivery.lease_expires_at_ms,
-                            })
-                            .await?;
-                    }
-                }
-            }
+
         }
     }
     drop(request_sender);
@@ -443,26 +652,4 @@ fn skills_from_env() -> Vec<SkillInfo> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn remote_plaintext_registry_endpoint_fails_closed() {
-        let error = connect_registry_client("http://192.0.2.1:50053")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("require TLS"));
-    }
-
-    #[test]
-    fn remote_plaintext_relay_control_endpoint_fails_closed() {
-        let error = secure_endpoint_builder("http://192.0.2.1:50052").unwrap_err();
-        assert!(error.to_string().contains("require TLS"));
-    }
-
-    #[test]
-    fn https_relay_control_endpoint_uses_tls() {
-        let endpoint = secure_endpoint_builder("https://relay.example:50052").unwrap();
-        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
-    }
-}
+mod tests;
