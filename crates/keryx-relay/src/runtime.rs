@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keryx_observe::RelayMetrics;
-use keryx_proto::v1::{RelayFrame, TaskEnvelope};
+use keryx_proto::v1::{NodescaleIdentityBindResult, RelayFrame, TaskEnvelope};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
@@ -36,6 +36,14 @@ pub enum FrameAcknowledgement {
     /// The frame identifier is known, but not for the authenticated destination.
     WrongDestination,
     /// The relay has no record of this frame identifier.
+    UnknownFrame,
+}
+
+/// Result of settling a typed direct-control frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectControlCompletion {
+    Accepted,
+    WrongDestination,
     UnknownFrame,
 }
 
@@ -102,6 +110,7 @@ struct PeerState {
     published_frame_index: HashMap<FrameKey, TaskPublishKey>,
     acknowledged_published_task_order: VecDeque<TaskPublishKey>,
     frame_ack_waiters: HashMap<FrameKey, oneshot::Sender<()>>,
+    direct_control_waiters: HashMap<FrameKey, oneshot::Sender<NodescaleIdentityBindResult>>,
 }
 
 pub const MAX_TRACKED_FRAMES: usize = 8_192;
@@ -332,12 +341,81 @@ impl RelayRuntime {
         (delivery, receiver)
     }
 
+    /// Atomically route a typed direct-control frame and install its destination-only result waiter.
+    pub fn route_nodescale_identity_bind_waiting_for_completion(
+        &self,
+        target_node_id: impl Into<String>,
+        frame: RelayFrame,
+    ) -> (
+        FrameDelivery,
+        Option<oneshot::Receiver<NodescaleIdentityBindResult>>,
+    ) {
+        let target_node_id = target_node_id.into();
+        let frame_id = frame.frame_id.trim().to_string();
+        if frame.nodescale_identity_bind_v1.is_none() {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
+        let mut guard = self.lock_peers();
+        let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
+        let receiver = if matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ) {
+            let (sender, receiver) = oneshot::channel();
+            guard
+                .direct_control_waiters
+                .insert((target_node_id, frame_id), sender);
+            Some(receiver)
+        } else {
+            None
+        };
+        self.sync_connected_peer_metric(&guard);
+        (delivery, receiver)
+    }
+
+    /// Complete a typed control frame exactly once. Only the exact authenticated destination can
+    /// settle the publisher's waiter; duplicate/unknown completion is deliberately not idempotent.
+    pub fn complete_nodescale_identity_bind(
+        &self,
+        destination_node_id: &str,
+        frame_id: &str,
+        result: NodescaleIdentityBindResult,
+    ) -> DirectControlCompletion {
+        let destination_node_id = destination_node_id.trim();
+        let frame_id = frame_id.trim();
+        if destination_node_id.is_empty() || frame_id.is_empty() {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        let mut guard = self.lock_peers();
+        let Some(waiter) = guard.direct_control_waiters.remove(&key) else {
+            return if guard
+                .direct_control_waiters
+                .keys()
+                .any(|(_, known_frame_id)| known_frame_id == frame_id)
+            {
+                DirectControlCompletion::WrongDestination
+            } else {
+                DirectControlCompletion::UnknownFrame
+            };
+        };
+        if !guard.frame_destinations.remove(&key) {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
+        }
+        let _ = waiter.send(result);
+        DirectControlCompletion::Accepted
+    }
+
     /// Abandon a timed-out result frame generation while leaving any already-delivered copy
     /// harmlessly idempotent at the destination.
     pub fn abandon_frame(&self, destination_node_id: &str, frame_id: &str) {
         let key = (destination_node_id.to_string(), frame_id.to_string());
         let mut guard = self.lock_peers();
         guard.frame_ack_waiters.remove(&key);
+        guard.direct_control_waiters.remove(&key);
         guard.frame_destinations.remove(&key);
         if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
             mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
@@ -353,6 +431,11 @@ impl RelayRuntime {
         }
         let mut guard = self.lock_peers();
         let key = (destination_node_id.to_string(), frame_id.to_string());
+        // Typed direct-control frames have a destination-only semantic completion channel.
+        // Generic ACKs must never consume their ownership or settle their waiters.
+        if guard.direct_control_waiters.contains_key(&key) {
+            return FrameAcknowledgement::UnknownFrame;
+        }
         if guard.acknowledged_frames.contains(&key) {
             return FrameAcknowledgement::Accepted;
         }
@@ -403,6 +486,37 @@ impl RelayRuntime {
             guard.frame_destinations.len(),
             guard.mailboxes.get(node_id).map_or(0, VecDeque::len),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_direct_control_state(&self, node_id: &str) -> (usize, usize, usize) {
+        let guard = self.lock_peers();
+        (
+            guard
+                .direct_control_waiters
+                .keys()
+                .filter(|(destination_node_id, _)| destination_node_id == node_id)
+                .count(),
+            guard
+                .frame_destinations
+                .iter()
+                .filter(|(destination_node_id, _)| destination_node_id == node_id)
+                .count(),
+            guard.mailboxes.get(node_id).map_or(0, VecDeque::len),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_direct_control_frame_ids(&self, node_id: &str) -> Vec<String> {
+        let guard = self.lock_peers();
+        let mut frame_ids = guard
+            .direct_control_waiters
+            .keys()
+            .filter(|(destination_node_id, _)| destination_node_id == node_id)
+            .map(|(_, frame_id)| frame_id.clone())
+            .collect::<Vec<_>>();
+        frame_ids.sort();
+        frame_ids
     }
 
     #[cfg(test)]
@@ -743,6 +857,26 @@ mod tests {
             result: None,
             authenticated_source_node_id: "source".to_string(),
             destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+        }
+    }
+
+    fn direct_control_frame(frame_id: impl Into<String>) -> RelayFrame {
+        RelayFrame {
+            frame_id: frame_id.into(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1 {
+                operation_id: "operation".to_string(),
+                network_id: "network".to_string(),
+                device_id: "device".to_string(),
+                join_session_id: "session".to_string(),
+                binding_nonce: "nonce".to_string(),
+                binding_generation: 1,
+                agent_version: "v1".to_string(),
+            }),
         }
     }
 
@@ -893,6 +1027,7 @@ mod tests {
                         result: None,
                         authenticated_source_node_id: "source".to_string(),
                         destination_node_id: "destination".to_string(),
+                        nodescale_identity_bind_v1: None,
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -951,6 +1086,7 @@ mod tests {
                     result: None,
                     authenticated_source_node_id: "source".to_string(),
                     destination_node_id: "destination".to_string(),
+                    nodescale_identity_bind_v1: None,
                 },
             ),
             FrameDelivery::Mailboxed
@@ -985,6 +1121,7 @@ mod tests {
                     result: None,
                     authenticated_source_node_id: "source".to_string(),
                     destination_node_id: "destination".to_string(),
+                    nodescale_identity_bind_v1: None,
                 },
             ),
             FrameDelivery::Mailboxed
@@ -1033,6 +1170,7 @@ mod tests {
                         result: None,
                         authenticated_source_node_id: "source".into(),
                         destination_node_id: "destination".into(),
+                        nodescale_identity_bind_v1: None,
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -1066,6 +1204,7 @@ mod tests {
                     result: None,
                     authenticated_source_node_id: "source".into(),
                     destination_node_id: "destination".into(),
+                    nodescale_identity_bind_v1: None,
                 },
                 overflow_receipt,
             ),
@@ -1176,6 +1315,53 @@ mod tests {
             FrameAcknowledgement::Accepted
         );
         acknowledgement.await.unwrap();
+    }
+
+    #[test]
+    fn typed_direct_control_does_not_increment_generic_task_routing_metric() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        let (delivery, _completion) = runtime.route_nodescale_identity_bind_waiting_for_completion(
+            "destination",
+            direct_control_frame("direct-control-frame"),
+        );
+
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+    }
+
+    #[tokio::test]
+    async fn generic_ack_cannot_settle_or_orphan_a_typed_direct_control_frame() {
+        let runtime = RelayRuntime::new("relay");
+        let (delivery, completion) = runtime.route_nodescale_identity_bind_waiting_for_completion(
+            "destination",
+            direct_control_frame("direct-control-frame"),
+        );
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        let completion = completion.unwrap();
+
+        assert_eq!(
+            runtime.ack_frame("destination", "direct-control-frame"),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_bind(
+                "destination",
+                "direct-control-frame",
+                keryx_proto::v1::NodescaleIdentityBindResult {
+                    disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
+                    accepted: true,
+                    binding_id: "binding".to_string(),
+                    generation: 1,
+                    revision: 1,
+                    reason: String::new(),
+                    code: String::new(),
+                },
+            ),
+            DirectControlCompletion::Accepted
+        );
+        assert_eq!(completion.await.unwrap().binding_id, "binding");
     }
 
     #[test]

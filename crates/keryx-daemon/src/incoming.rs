@@ -406,6 +406,7 @@ mod tests {
                 result: None,
                 authenticated_source_node_id: "node-remote".to_string(),
                 destination_node_id: "node-local".to_string(),
+                nodescale_identity_bind_v1: None,
             },
         );
         assert_eq!(task.frame_id, "frame-1");

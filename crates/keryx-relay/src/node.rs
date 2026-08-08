@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,7 +13,8 @@ use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
 use keryx_proto::v1::{
     AckFrameRequest, AckResultDeliveryRequest, ClaimNextResultDeliveryRequest,
-    FailResultDeliveryRequest, IngestRemoteResultRequest, NodeFrame, PublishResultRequest,
+    CompleteNodescaleIdentityBindRequest, FailResultDeliveryRequest, IngestRemoteResultRequest,
+    NodeFrame, NodescaleIdentityBindResult, NodescaleIdentityBindV1, PublishResultRequest,
     SubmitRemoteTaskRequest,
 };
 use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
@@ -140,8 +142,67 @@ async fn supervise_relay_stream<F, Fut>(
     }
 }
 
+/// Provenance projected by the relay for a direct non-execution operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedDirectContext {
+    pub authenticated_source_node_id: String,
+    pub destination_node_id: String,
+    pub relay_frame_id: String,
+}
+
+/// Closed typed direct-control seam. It cannot receive a daemon or task envelope.
+#[tonic::async_trait]
+pub trait NodescaleIdentityBindHandler: Send + Sync {
+    async fn handle_nodescale_identity_bind(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: NodescaleIdentityBindV1,
+    ) -> Result<NodescaleIdentityBindResult>;
+}
+
+#[derive(Clone, Default)]
+pub struct DirectControlHandlers {
+    pub nodescale_identity_bind_v1: Option<Arc<dyn NodescaleIdentityBindHandler>>,
+}
+
+impl DirectControlHandlers {
+    #[must_use]
+    pub fn has_nodescale_identity_bind_handler(&self) -> bool {
+        self.nodescale_identity_bind_v1.is_some()
+    }
+}
+
+/// Dispatch a typed direct control operation without any daemon/task dependency.
+pub async fn dispatch_nodescale_identity_bind_v1(
+    handlers: &DirectControlHandlers,
+    context: AuthenticatedDirectContext,
+    operation: NodescaleIdentityBindV1,
+) -> Result<NodescaleIdentityBindResult> {
+    anyhow::ensure!(
+        !context.authenticated_source_node_id.trim().is_empty()
+            && !context.destination_node_id.trim().is_empty()
+            && !context.relay_frame_id.trim().is_empty()
+            && !operation.operation_id.trim().is_empty(),
+        "direct control frame provenance and operation id are required"
+    );
+    let handler = handlers
+        .nodescale_identity_bind_v1
+        .as_ref()
+        .context("nodescale identity bind handler is not installed")?;
+    handler
+        .handle_nodescale_identity_bind(context, operation)
+        .await
+}
+
 /// Run an edge node until SIGINT: listen, dial bootstrap peers, optionally register skills.
 pub async fn run_edge_node() -> Result<()> {
+    run_edge_node_with_direct_control_handlers(DirectControlHandlers::default()).await
+}
+
+/// Run an edge node with only the narrowly typed direct-control handlers supplied.
+pub async fn run_edge_node_with_direct_control_handlers(
+    direct_control_handlers: DirectControlHandlers,
+) -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let keypair_path = std::env::var_os(NODE_KEYPAIR_ENV).map(PathBuf::from);
@@ -171,59 +232,64 @@ pub async fn run_edge_node() -> Result<()> {
     let bootstrap = bootstrap_peers_from_env()?;
     dial_bootstrap_peers(&mut swarm, &bootstrap);
 
-    register_node_skills(&registry_peer_id).await?;
+    register_node_skills(
+        &registry_peer_id,
+        direct_control_handlers.has_nodescale_identity_bind_handler(),
+    )
+    .await?;
 
-    let mut relay_stream_task = match (relay_endpoint(), daemon_endpoint()) {
-        (Some(relay_endpoint), Some(daemon_endpoint)) => {
+    let mut relay_stream_task = match relay_endpoint() {
+        Some(relay_endpoint) => {
             let registry_peer_id = registry_peer_id.clone();
             let node_token = node_token();
+            let daemon_endpoint = daemon_endpoint();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let stream_shutdown = shutdown_rx.clone();
             let stream_relay_endpoint = relay_endpoint.clone();
             let stream_registry_peer_id = registry_peer_id.clone();
             let stream_node_token = node_token.clone();
             let stream_daemon_endpoint = daemon_endpoint.clone();
+            let stream_handlers = direct_control_handlers.clone();
             let stream_jitter_seed = stable_jitter_seed(&format!("stream:{registry_peer_id}"));
-            let delivery_jitter_seed =
-                stable_jitter_seed(&format!("result-delivery:{registry_peer_id}"));
             let task = tokio::spawn(async move {
-                tokio::join!(
-                    supervise_relay_stream(
-                        move || {
-                            run_relay_stream(
-                                stream_relay_endpoint.clone(),
-                                stream_registry_peer_id.clone(),
-                                stream_node_token.clone(),
-                                stream_daemon_endpoint.clone(),
-                            )
-                        },
-                        stream_shutdown,
-                        RelayReconnectPolicy::default().with_jitter_seed(stream_jitter_seed),
-                    ),
-                    supervise_relay_stream(
-                        move || {
-                            run_result_delivery_worker(
-                                relay_endpoint.clone(),
-                                registry_peer_id.clone(),
-                                node_token.clone(),
-                                daemon_endpoint.clone(),
-                            )
-                        },
-                        shutdown_rx,
-                        RelayReconnectPolicy::default().with_jitter_seed(delivery_jitter_seed),
-                    )
+                let stream = supervise_relay_stream(
+                    move || {
+                        run_relay_stream_with_direct_control_handlers(
+                            stream_relay_endpoint.clone(),
+                            stream_registry_peer_id.clone(),
+                            stream_node_token.clone(),
+                            stream_daemon_endpoint.clone(),
+                            stream_handlers.clone(),
+                        )
+                    },
+                    stream_shutdown,
+                    RelayReconnectPolicy::default().with_jitter_seed(stream_jitter_seed),
                 );
+                if let Some(daemon_endpoint) = daemon_endpoint {
+                    let delivery_jitter_seed =
+                        stable_jitter_seed(&format!("result-delivery:{registry_peer_id}"));
+                    tokio::join!(
+                        stream,
+                        supervise_relay_stream(
+                            move || {
+                                run_result_delivery_worker(
+                                    relay_endpoint.clone(),
+                                    registry_peer_id.clone(),
+                                    node_token.clone(),
+                                    daemon_endpoint.clone(),
+                                )
+                            },
+                            shutdown_rx,
+                            RelayReconnectPolicy::default().with_jitter_seed(delivery_jitter_seed),
+                        )
+                    );
+                } else {
+                    stream.await;
+                }
             });
             Some((shutdown_tx, task))
         }
-        (Some(_), None) => {
-            info!(
-                registry_peer_id = %registry_peer_id,
-                "HERMES_KERYX_DAEMON_ENDPOINT unset; node will not consume relay frames"
-            );
-            None
-        }
-        _ => None,
+        None => None,
     };
 
     info!(
@@ -443,11 +509,29 @@ where
     }
 }
 
+#[cfg(test)]
 async fn run_relay_stream(
     relay_endpoint: String,
     registry_peer_id: String,
     node_token: Option<String>,
     daemon_endpoint: String,
+) -> Result<()> {
+    run_relay_stream_with_direct_control_handlers(
+        relay_endpoint,
+        registry_peer_id,
+        node_token,
+        Some(daemon_endpoint),
+        DirectControlHandlers::default(),
+    )
+    .await
+}
+
+async fn run_relay_stream_with_direct_control_handlers(
+    relay_endpoint: String,
+    registry_peer_id: String,
+    node_token: Option<String>,
+    daemon_endpoint: Option<String>,
+    direct_control_handlers: DirectControlHandlers,
 ) -> Result<()> {
     let channel = secure_endpoint_builder(&relay_endpoint)?
         .connect()
@@ -466,55 +550,82 @@ async fn run_relay_stream(
         .into_inner();
     info!(registry_peer_id = %registry_peer_id, relay_endpoint = %relay_endpoint, "relay stream connected");
 
-    loop {
-        tokio::select! {
-            next = stream.next() => {
-                let Some(frame) = next else { break; };
-                let frame = frame.context("keryx node stream: relay frame failed")?;
-                let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
-                    .await
-                    .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?
-                    .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
-                    .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
-                if let Some(task) = frame.task {
-                    daemon
-                        .submit_remote_task(SubmitRemoteTaskRequest {
-                            envelope: Some(task),
-                            authenticated_sender_peer_id: frame.authenticated_source_node_id.clone(),
-                            destination_peer_id: frame.destination_node_id.clone(),
-                            relay_frame_id: frame.frame_id.clone(),
-                        })
-                        .await
-                        .context("keryx node stream: daemon SubmitRemoteTask failed")?;
-                } else if let Some(result) = frame.result {
-                    daemon
-                        .ingest_remote_result(IngestRemoteResultRequest {
-                            result: Some(result),
-                            authenticated_executor_peer_id: frame.authenticated_source_node_id.clone(),
-                            destination_peer_id: frame.destination_node_id.clone(),
-                            relay_frame_id: frame.frame_id.clone(),
-                        })
-                        .await
-                        .context("keryx node stream: daemon IngestRemoteResult failed")?;
-                } else {
-                    tracing::warn!(frame_id = %frame.frame_id, "dropping empty relay frame");
-                    continue;
-                }
-                let ack_channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
-                let mut ack_client = KeryxRelayClient::new(ack_channel);
-                let mut ack_request = Request::new(AckFrameRequest { frame_id: frame.frame_id });
-                add_node_auth_metadata(
-                    &mut ack_request,
-                    &registry_peer_id,
-                    node_token.as_deref(),
-                )?;
-                ack_client
-                    .ack_frame(ack_request)
-                    .await
-                    .context("keryx node stream: relay AckFrame failed")?;
-            }
-
+    while let Some(frame) = stream.next().await {
+        let frame = frame.context("keryx node stream: relay frame failed")?;
+        if let Some(operation) = frame.nodescale_identity_bind_v1.clone() {
+            anyhow::ensure!(
+                frame.task.is_none() && frame.result.is_none(),
+                "direct control frame must not carry task or result payload"
+            );
+            let result = dispatch_nodescale_identity_bind_v1(
+                &direct_control_handlers,
+                AuthenticatedDirectContext {
+                    authenticated_source_node_id: frame.authenticated_source_node_id.clone(),
+                    destination_node_id: frame.destination_node_id.clone(),
+                    relay_frame_id: frame.frame_id.clone(),
+                },
+                operation,
+            )
+            .await?;
+            let completion_channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
+            let mut completion_client = KeryxRelayClient::new(completion_channel);
+            let mut completion_request = Request::new(CompleteNodescaleIdentityBindRequest {
+                frame_id: frame.frame_id,
+                result: Some(result),
+            });
+            add_node_auth_metadata(
+                &mut completion_request,
+                &registry_peer_id,
+                node_token.as_deref(),
+            )?;
+            completion_client
+                .complete_nodescale_identity_bind(completion_request)
+                .await
+                .context("keryx node stream: relay direct-control completion failed")?;
+            continue;
         }
+
+        let daemon_endpoint = daemon_endpoint
+            .as_ref()
+            .context("task/result relay frame refused because no daemon endpoint is configured")?;
+        let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
+            .await
+            .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?
+            .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+            .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+        if let Some(task) = frame.task {
+            daemon
+                .submit_remote_task(SubmitRemoteTaskRequest {
+                    envelope: Some(task),
+                    authenticated_sender_peer_id: frame.authenticated_source_node_id.clone(),
+                    destination_peer_id: frame.destination_node_id.clone(),
+                    relay_frame_id: frame.frame_id.clone(),
+                })
+                .await
+                .context("keryx node stream: daemon SubmitRemoteTask failed")?;
+        } else if let Some(result) = frame.result {
+            daemon
+                .ingest_remote_result(IngestRemoteResultRequest {
+                    result: Some(result),
+                    authenticated_executor_peer_id: frame.authenticated_source_node_id.clone(),
+                    destination_peer_id: frame.destination_node_id.clone(),
+                    relay_frame_id: frame.frame_id.clone(),
+                })
+                .await
+                .context("keryx node stream: daemon IngestRemoteResult failed")?;
+        } else {
+            anyhow::bail!("relay frame has no recognized payload");
+        }
+        let ack_channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
+        let mut ack_client = KeryxRelayClient::new(ack_channel);
+        let mut ack_request = Request::new(AckFrameRequest {
+            frame_id: frame.frame_id,
+        });
+        add_node_auth_metadata(&mut ack_request, &registry_peer_id, node_token.as_deref())?;
+        ack_client
+            .ack_frame(ack_request)
+            .await
+            .context("keryx node stream: relay AckFrame failed")?;
     }
     drop(request_sender);
     Ok(())
@@ -564,11 +675,21 @@ fn bootstrap_peers_from_env() -> Result<Vec<Multiaddr>> {
     Ok(Vec::new())
 }
 
-async fn register_node_skills(registry_peer_id: &str) -> Result<()> {
+async fn register_node_skills(
+    registry_peer_id: &str,
+    nodescale_identity_bind_enabled: bool,
+) -> Result<()> {
     let Some(endpoint) = registry_endpoint() else {
         return Ok(());
     };
     let skills = skills_from_env();
+    let mut protocol_features = vec![
+        "absolute_deadlines_v1".to_string(),
+        "result_artifact_bytes_v1".to_string(),
+    ];
+    if nodescale_identity_bind_enabled {
+        protocol_features.push("nodescale_identity_bind_v1".to_string());
+    }
 
     let mut client = connect_registry_client(&endpoint).await?;
     let mut request = Request::new(RegisterSkillsRequest {
@@ -580,10 +701,7 @@ async fn register_node_skills(registry_peer_id: &str) -> Result<()> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(300),
-        protocol_features: vec![
-            "absolute_deadlines_v1".to_string(),
-            "result_artifact_bytes_v1".to_string(),
-        ],
+        protocol_features,
     });
     add_node_auth_metadata(&mut request, registry_peer_id, node_token().as_deref())?;
     client
