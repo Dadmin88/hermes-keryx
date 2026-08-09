@@ -1,81 +1,162 @@
 # Hermes Keryx
 
-Hermes Keryx is a standalone Rust-native runtime for durable multi-agent task transport in the Hermes ecosystem.
+Hermes Keryx is the secure transport layer for distributed Hermes systems.
 
-It provides:
+Its job is to move application messages, tasks, results, and control operations between authenticated peers while keeping enough durable state to recover from retries, disconnects, and restarts.
 
-- local daemon (`keryxd`) with SQLite-backed task lifecycle
-- cross-node relay (`keryx-relay`) with libp2p, health probes, peer allowlisting, and a skill registry
-- edge node binary (`keryx-node`) for relay bootstrap, registry advertisement, and relay-frame delivery into a local daemon
-- operator CLI (`keryx`)
-- Python SDK (`keryx`) for Hermes Agency and standalone clients
-- cancellation, deadlines, artifacts, backpressure, routing policy, and migration tooling
-- fail-closed relay mutation authentication, recipient-bound acknowledgements, relay-acceptance receipts, negotiated deadline/byte-result features, and explicit historical-result unavailability
-
-**Hermes Agency** uses Keryx as its primary transport. The Keryx Python SDK may also be vendored into Hermes Agency under `src/keryx/` for packaging; this repository remains the source of truth for Rust crates, protobufs, and SDK evolution.
-
-See [docs/current-product.md](docs/current-product.md) for the canonical current-product map. Older RFCs and ADRs are design history when they conflict with the implemented surface.
-
-## Naming
-
-| Item | Value |
-|------|-------|
-| Product | Hermes Keryx |
-| CLI | `keryx` |
-| Daemon | `keryxd` |
-| Relay | `keryx-relay` |
-| Edge node | `keryx-node` |
-| Rust crates | `keryx-*` |
-| Python package | `keryx` (import name `keryx`) |
-| Protocol namespace | `hermes.keryx.v1` |
-| Runtime state | `.keryx` by default; dual-run uses `~/.hermes/.keryx/` |
-| Env prefix | `HERMES_KERYX_*` |
-
-## Workspace layout
+A simple mental model is:
 
 ```text
-crates/keryx-core      Pure domain model, identifiers, lifecycle, limits, artifacts
-crates/keryx-proto     Protocol-facing Rust types / gRPC bindings
-crates/keryx-store     Persistence traits + SQLite store (schema v7)
-crates/keryx-daemon    Local daemon runtime + `keryxd`
-crates/keryx-relay     Relay, health, registry, security + `keryx-relay` / `keryx-node`
-crates/keryx-cli       Operator CLI + `keryx`
-crates/keryx-policy    Policy, keys, tokens, approvals
-crates/keryx-observe   In-process daemon and relay metrics
-crates/keryx-testkit   Test fixtures and helpers
-sdk/python/            Python SDK package `keryx`
-scripts/               migrate-to-keryx.sh, keryx-dual-run.sh
-docs/                  Current product docs, semantics, migration, ops, architecture, RFCs/ADRs
-proto/                 Protobuf definitions
+Hermes / Agency / Fleet
+        ↓
+Keryx
+  authenticate peers
+  route work
+  persist task/result state
+  retry delivery safely
+        ↓
+remote node
 ```
 
-## Implementation status
+Keryx is not a scheduler and it does not decide which machine should run a workload. Higher-level systems such as Hermes Fleet make those decisions.
 
-| Phase | Focus | Status |
-|------|-------|--------|
-| 1–5 | Four-state lifecycle, SQLite, leases, recovery, readiness | Implemented |
-| 6 | Daemon worker RPCs (`Submit`/`Claim`/`Heartbeat`/`Complete`/`Fail`), CLI task verbs | Implemented |
-| 7 | Retry/dead-letter metadata, legacy status normalization | Implemented |
-| 8 | Observability, health probes, graceful shutdown | Implemented |
-| 9 | Artifact storage + artifact RPC/CLI | Implemented |
-| 10 | Backpressure + configurable limits | Implemented |
-| 11 | Cancellation + deadline fields, store APIs, daemon `CancelTask`, deadline loop | Implemented |
-| 12 | Relay publication, node identity, offline mailbox, daemon `SendTask`/peers | Implemented |
-| 13 | Peer discovery + skill registry with TTL and registry gossip | Implemented |
-| 14 | Security model + routing policy, relay allowlist and node-token auth primitives | Implemented |
-| 15 | Python SDK (`KeryxNode`) | Local lifecycle, remote worker loop, durable result observation, and compatibility helpers implemented |
-| 16 | Migration script + dual-run infrastructure | Implemented |
-| 17 | Authenticated daemon-to-Agent dispatch and durable terminal result/artifact-descriptor return | Implemented in [#29](https://github.com/DeployFaith/hermes-keryx/pull/29) |
+## How it fits into the Hermes stack
 
-Primary references:
+```text
+Nodescale
+  Device identity and trust
+        ↓
+Keryx
+  Authenticated application transport
+        ↓
+Hermes Fleet / Hermes Agency
+  Coordination and application policy
+        ↓
+Hermes Agent
+  Actual execution
+```
 
-- [docs/current-product.md](docs/current-product.md)
-- [docs/phase17-cross-node-agent-delivery.md](docs/phase17-cross-node-agent-delivery.md)
-- [docs/lifecycle-store-daemon-semantics.md](docs/lifecycle-store-daemon-semantics.md)
-- [docs/worker-loop.md](docs/worker-loop.md)
-- [docs/observability.md](docs/observability.md)
-- [docs/operations.md](docs/operations.md)
-- [docs/migration-from-agentanycast.md](docs/migration-from-agentanycast.md)
+Nodescale may use Keryx's authenticated runtime provenance to bind a trusted device to an application peer. Fleet and Agency use Keryx to communicate without having to build their own relay and durable delivery systems.
+
+## Main components
+
+| Component | Purpose |
+| --- | --- |
+| `keryxd` | Local daemon that owns durable task/result state and worker lifecycle. |
+| `keryx-relay` | Cross-node relay, authenticated publication boundary, health service, and skill registry. |
+| `keryx-node` | Edge process that connects a local daemon to the relay and receives relay frames. |
+| `keryx` | Operator CLI. |
+| Python SDK | Async client and worker API used by Hermes integrations and standalone applications. |
+
+The repository is Rust-native. The Python SDK lives in `sdk/python/`.
+
+## What Keryx provides
+
+Keryx currently provides:
+
+- authenticated peer identity;
+- durable local task lifecycle;
+- cross-node relay routing;
+- task claims and leases;
+- heartbeats and recovery;
+- deadlines;
+- retries and dead-letter handling;
+- durable terminal results;
+- result-delivery retries;
+- artifact descriptors and bounded artifact bytes where supported;
+- cancellation records;
+- peer and skill discovery;
+- bounded offline mailbox delivery while the relay process remains running;
+- typed non-execution control traffic used by Nodescale identity binding;
+- a Python SDK for higher-level Hermes applications.
+
+## Durable task lifecycle
+
+The canonical persisted task lifecycle stays intentionally small:
+
+```text
+pending
+  ↓
+running
+  ├─ completed
+  └─ failed
+```
+
+Other facts, such as cancellation, retry, dead-lettering, or deadline expiry, are recorded as outcomes and metadata rather than inventing a large set of task status values.
+
+This keeps recovery easier to reason about.
+
+## Why durable state matters
+
+Distributed systems fail in awkward places.
+
+For example:
+
+```text
+sender publishes task
+→ relay accepts it
+→ connection drops
+```
+
+or:
+
+```text
+worker finishes
+→ result is stored
+→ relay restarts before sender acknowledges it
+```
+
+Keryx keeps the important local task/result state durable so callers can inspect what is known instead of guessing.
+
+The relay itself still has some in-memory state, including offline mailboxes, so relay restart durability is a separate limitation.
+
+## Authenticated transport
+
+Keryx treats claimed identity and authenticated identity as different things.
+
+The relay derives authoritative sender identity from its authentication context. A request body cannot become trusted simply by including a peer ID string.
+
+Important transport rules include:
+
+- task/result publication uses authenticated mutation RPCs;
+- destination-owned acknowledgements settle delivery;
+- registry mutation is authenticated separately from read-only discovery;
+- non-loopback control/registry endpoints require TLS when configured for remote use;
+- typed Nodescale identity-binding control traffic is separate from generic task execution.
+
+See [Current product surface](docs/current-product.md) for the detailed contract.
+
+## What Keryx does not do
+
+Keryx does not:
+
+- choose a machine based on CPU, RAM, or GPU capacity;
+- manage private-network membership;
+- decide Fleet permissions;
+- install Hermes profiles;
+- replace Hermes Agent;
+- provide a generic remote shell;
+- make peer-produced content trusted just because the peer authenticated.
+
+Those responsibilities belong to other layers.
+
+## Workspace
+
+```text
+crates/keryx-core      Domain types, identifiers, lifecycle, limits
+crates/keryx-proto     Protocol types and gRPC bindings
+crates/keryx-store     Persistence interfaces and SQLite store
+crates/keryx-daemon    Local runtime and keryxd
+crates/keryx-relay     Relay, edge node, registry, and transport security
+crates/keryx-cli       Operator CLI
+crates/keryx-policy    Policy and authentication helpers
+crates/keryx-observe   Metrics
+crates/keryx-testkit   Test helpers
+sdk/python/            Python SDK
+proto/                 Protobuf definitions
+docs/                  Product and operator documentation
+scripts/               Local/e2e/migration helpers
+```
 
 ## Build and test
 
@@ -83,72 +164,32 @@ Primary references:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --bins
+```
 
-# After `cargo build --workspace --bins` and installing `sdk/python[dev]`:
+After installing the Python SDK development dependencies, the permanent two-node proof can be run with:
+
+```bash
 python scripts/e2e_two_node.py --bin-dir target/debug
 ```
 
-Release binaries:
+That proof starts isolated relay, daemon, edge-node, and Python worker processes and checks a real authenticated round trip.
+
+## Quick local start
+
+For a local daemon/relay pair on loopback addresses:
 
 ```bash
-cargo build --release \
-  --bin keryxd \
-  --bin keryx-relay \
-  --bin keryx-node \
-  --bin keryx
-```
-
-## Operator quickstart
-
-### Local dual-run
-
-```bash
-# Start one keryxd + one keryx-relay on non-conflicting loopback ports
 ./scripts/keryx-dual-run.sh --start
 ./scripts/keryx-dual-run.sh --status
 ./scripts/keryx-dual-run.sh --stop
 ```
 
-Dual-run defaults (loopback only; avoids common legacy AgentAnycast ports 4001/50052):
+This is a local infrastructure check, not the full two-node proof.
 
-| Component | Address |
-|-----------|---------|
-| `keryxd` gRPC | `127.0.0.1:50051` |
-| Relay health gRPC | `127.0.0.1:51052` |
-| Relay registry gRPC | `127.0.0.1:51053` |
-| Relay HTTP health | `127.0.0.1:18081` |
-| Relay libp2p TCP/QUIC | `127.0.0.1:4101` |
+## CLI
 
-Runtime files live under `~/.hermes/.keryx/` (`logs/`, `run/`, `data/`, relay config).
-
-This quickstart validates one local daemon/relay pair. The authenticated two-node proof is `scripts/e2e_two_node.py`; it starts a relay/registry, two daemons, two edge nodes, and a real Python worker with isolated state.
-
-### Manual daemon
-
-```bash
-export HERMES_KERYX_DATA_DIR="${PWD}/.keryx-data"
-export HERMES_KERYX_DAEMON_ADDR=127.0.0.1:50051
-cargo run -p keryx-daemon --bin keryxd
-```
-
-### CLI
-
-```bash
-export HERMES_KERYX_DAEMON_ENDPOINT=http://127.0.0.1:50051
-
-cargo run -p keryx-cli --bin keryx -- status
-cargo run -p keryx-cli --bin keryx -- doctor
-
-cargo run -p keryx-cli --bin keryx -- task submit my-task-id
-cargo run -p keryx-cli --bin keryx -- task claim my-task-id \
-  --worker worker-1 --lease-duration-ms 120000
-cargo run -p keryx-cli --bin keryx -- task heartbeat my-task-id \
-  --lease '<lease_id>' --worker worker-1
-cargo run -p keryx-cli --bin keryx -- task complete my-task-id \
-  --lease '<lease_id>' --worker worker-1 --duration-ms 1000
-```
-
-Implemented CLI groups:
+Main command groups:
 
 ```text
 keryx status
@@ -159,17 +200,19 @@ keryx relay start|status|registry list
 keryx node start|status|discover
 ```
 
-`CancelTask` is implemented in the daemon and SDK, but the Rust CLI does not currently expose `keryx task cancel`.
+The daemon supports cancellation, but the Rust CLI does not currently expose `keryx task cancel`.
 
 ## Python SDK
 
-Package name and import name: **`keryx`**.
+Install for development:
 
 ```bash
 cd sdk/python
 python -m pip install -e ".[dev]"
 pytest
 ```
+
+Minimal example:
 
 ```python
 from keryx import AgentCard, KeryxNode, Skill
@@ -180,11 +223,7 @@ card = AgentCard(
     skills=[Skill(id="echo", description="echo messages")],
 )
 
-node = KeryxNode(
-    card=card,
-    daemon_endpoint="127.0.0.1:50051",
-    registry_endpoint="127.0.0.1:51053",
-)
+node = KeryxNode(card=card)
 await node.connect()
 try:
     state = await node.submit(message="hello", metadata={"skill": "echo"})
@@ -193,42 +232,39 @@ finally:
     await node.close()
 ```
 
-This example proves local daemon submission. For the implemented remote worker/result loop, see [Phase 17](docs/phase17-cross-node-agent-delivery.md) and `scripts/e2e_two_node.py`.
+See [sdk/python/README.md](sdk/python/README.md) for the full SDK surface.
 
-Details: [sdk/python/README.md](sdk/python/README.md).
+## Hermes Agency and Fleet integration
 
-## Migration from AgentAnycast
+Hermes Agency uses Keryx as its primary transport.
 
-```bash
-./scripts/migrate-to-keryx.sh --dry-run
-./scripts/migrate-to-keryx.sh
-./scripts/migrate-to-keryx.sh --revert   # if needed
-```
+Hermes Fleet uses Keryx for authenticated node-to-node communication and durable task/result delivery while keeping Fleet-specific policy and execution binding in Fleet.
 
-The migrator rewrites Hermes config to `agency.transport_backend: keryx`, writes allowlist/relay config under `~/.hermes/.keryx/`, and keeps a timestamped backup.
+Nodescale uses a narrow authenticated Keryx control boundary to prove which application peer belongs to a trusted device.
 
-Full guide: [docs/migration-from-agentanycast.md](docs/migration-from-agentanycast.md).
-
-## Hermes Agency integration
-
-Hermes Agency treats Keryx as its primary transport:
-
-- Config: `agency.transport_backend: keryx`
-- Vendored Python SDK: `Hermes_Agency/src/keryx/` when packaging Agency
-- Node/pool modules import `from keryx import ...` directly
-- AgentAnycast remains a legacy fallback only
-
-The current integration supports local lifecycle, registry discovery, authenticated relay publication, remote worker execution, durable terminal result/artifact-descriptor return, and `TaskHandle.wait()`. Descriptor-only result return is the interoperability baseline; bounded artifact bytes traverse only when the authenticated origin advertises `result_artifact_bytes_v1`. The permanent cross-process proof lives in `scripts/e2e_two_node.py` and `.github/workflows/phase17-e2e.yml`.
-
-This repo stays independent so Keryx can be PR'd upstream without the full Agency product surface.
+These integrations share Keryx transport, but they do not share databases.
 
 ## Security notes
 
-- Prefer loopback binds for daemon/registry on single-host installs.
-- `keryxd` rejects non-loopback `HERMES_KERYX_DAEMON_ADDR` in the current binary.
-- Relay allowlists and node-token auth are documented in [docs/current-product.md](docs/current-product.md) and `crates/keryx-relay/config.example.toml`.
-- Do not commit peer IDs, tokens, private multiaddrs, or host paths into docs/examples.
+- Prefer loopback daemon binds for single-host installations.
+- Do not put private peer IDs, node tokens, TLS private keys, credentials, or private infrastructure paths into public docs or examples.
+- Authentication proves who sent something. It does not make the sender's payload trusted.
+- Unsupported or ambiguous transport capabilities fail closed where the contract requires them.
+- Result and task delivery are bounded. Keryx is not intended to become an unlimited blob-transfer system.
+
+## Detailed documentation
+
+Start with:
+
+- [Current product surface](docs/current-product.md)
+- [Lifecycle and store semantics](docs/lifecycle-store-daemon-semantics.md)
+- [Worker loop](docs/worker-loop.md)
+- [Operations](docs/operations.md)
+- [Observability](docs/observability.md)
+- [Python SDK](sdk/python/README.md)
+
+Older RFCs and ADRs are design history when they conflict with the current product documentation and source.
 
 ## License
 
-See `LICENSE` (and `LICENSE-APACHE` if present in tree).
+Current Hermes Keryx releases use the Apache License 2.0. See [LICENSE](LICENSE).
