@@ -780,7 +780,10 @@ async fn run_relay_stream(
     .await
 }
 
-async fn run_relay_stream_with_direct_control_handlers(
+/// Runs one configured authenticated edge stream until the relay closes it or
+/// the caller cancels the future. This is the deterministic composition seam
+/// for applications that own their own readiness and shutdown lifecycle.
+pub async fn run_relay_stream_with_direct_control_handlers(
     relay_endpoint: String,
     registry_peer_id: String,
     node_token: Option<String>,
