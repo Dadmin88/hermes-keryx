@@ -39,21 +39,25 @@ impl IncomingRelayTask {
     }
 
     /// Build from a [`RelayFrame`] when the relay attaches the originating node id separately.
-    #[must_use]
-    pub fn from_relay_frame(sender_node_id: impl Into<String>, frame: RelayFrame) -> Self {
-        Self {
+    ///
+    /// Typed direct controls are never task envelopes, including malformed frames that carry both.
+    /// Reject them before extracting a task so callers cannot persist or meter a control payload.
+    pub fn from_relay_frame(
+        sender_node_id: impl Into<String>,
+        frame: RelayFrame,
+    ) -> Result<Self, &'static str> {
+        let exact_task_payload = frame.task.is_some()
+            && frame.result.is_none()
+            && frame.nodescale_identity_bind_v1.is_none()
+            && frame.nodescale_identity_challenge_v1.is_none();
+        if !exact_task_payload {
+            return Err("relay task extraction requires exactly one task payload");
+        }
+        Ok(Self {
             frame_id: frame.frame_id,
             sender_node_id: sender_node_id.into(),
-            envelope: frame.task.unwrap_or(TaskEnvelope {
-                task_id: None,
-                correlation_id: None,
-                idempotency_key: None,
-                status: 0,
-                messages: vec![],
-                metadata: Default::default(),
-                deadline_ms: 0,
-            }),
-        }
+            envelope: frame.task.expect("task payload was checked above"),
+        })
     }
 }
 
@@ -407,9 +411,65 @@ mod tests {
                 authenticated_source_node_id: "node-remote".to_string(),
                 destination_node_id: "node-local".to_string(),
                 nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
             },
-        );
+        )
+        .expect("a generic task frame must remain extractable");
         assert_eq!(task.frame_id, "frame-1");
         assert_eq!(task.sender_node_id, "node-remote");
+    }
+
+    #[test]
+    fn from_relay_frame_rejects_zero_or_non_task_payload_kinds_before_task_extraction() {
+        let mut bind_with_task = RelayFrame {
+            frame_id: "bind-with-task".to_string(),
+            task: Some(envelope("mixed-bind-task")),
+            result: None,
+            authenticated_source_node_id: "node-remote".to_string(),
+            destination_node_id: "node-local".to_string(),
+            nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1::default()),
+            nodescale_identity_challenge_v1: None,
+        };
+        assert!(
+            IncomingRelayTask::from_relay_frame("node-remote", bind_with_task.clone()).is_err()
+        );
+
+        bind_with_task.frame_id = "challenge-with-task".to_string();
+        bind_with_task.nodescale_identity_bind_v1 = None;
+        bind_with_task.nodescale_identity_challenge_v1 =
+            Some(keryx_proto::v1::NodescaleIdentityChallengeV1::default());
+        assert!(IncomingRelayTask::from_relay_frame("node-remote", bind_with_task).is_err());
+
+        for frame in [
+            RelayFrame {
+                frame_id: "result-only".to_string(),
+                task: None,
+                result: Some(keryx_proto::v1::TaskResultEnvelope::default()),
+                authenticated_source_node_id: "node-remote".to_string(),
+                destination_node_id: "node-local".to_string(),
+                nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
+            },
+            RelayFrame {
+                frame_id: "zero-payload".to_string(),
+                task: None,
+                result: None,
+                authenticated_source_node_id: "node-remote".to_string(),
+                destination_node_id: "node-local".to_string(),
+                nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
+            },
+            RelayFrame {
+                frame_id: "task-and-result".to_string(),
+                task: Some(envelope("mixed-task-result")),
+                result: Some(keryx_proto::v1::TaskResultEnvelope::default()),
+                authenticated_source_node_id: "node-remote".to_string(),
+                destination_node_id: "node-local".to_string(),
+                nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
+            },
+        ] {
+            assert!(IncomingRelayTask::from_relay_frame("node-remote", frame).is_err());
+        }
     }
 }

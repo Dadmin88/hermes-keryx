@@ -16,7 +16,7 @@ pub use config::RelayConfig;
 pub use health::{health_json, RelayHealthReport};
 pub use node::{
     run_edge_node_with_direct_control_handlers, AuthenticatedDirectContext, DirectControlHandlers,
-    NodescaleIdentityBindHandler,
+    NodescaleIdentityBindHandler, NodescaleIdentityChallengeHandler,
 };
 pub use registry::{
     Registration, SkillRegistry, StoredSkill, DEFAULT_CLEANUP_INTERVAL, DEFAULT_REGISTRATION_TTL,

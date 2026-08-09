@@ -8,12 +8,15 @@ use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
 use keryx_proto::v1::{
     AckFrameRequest, AckFrameResponse, AckTaskRequest, AckTaskResponse,
-    CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityBindResponse, HealthRequest,
-    HealthResponse, NodeFrame, NodescaleIdentityBindDisposition, NodescaleIdentityBindResult,
-    NodescaleIdentityBindV1, PublishNodescaleIdentityBindRequest,
-    PublishNodescaleIdentityBindResponse, PublishResultRequest, PublishResultResponse,
-    PublishTaskRequest, PublishTaskResponse, RegisterNodeRequest, RegisterNodeResponse, RelayFrame,
-    TaskEnvelope,
+    CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityBindResponse,
+    CompleteNodescaleIdentityChallengeRequest, CompleteNodescaleIdentityChallengeResponse,
+    HealthRequest, HealthResponse, NodeFrame, NodescaleIdentityBindDisposition,
+    NodescaleIdentityBindResult, NodescaleIdentityBindV1, NodescaleIdentityChallengeDisposition,
+    NodescaleIdentityChallengeResult, NodescaleIdentityChallengeV1,
+    PublishNodescaleIdentityBindRequest, PublishNodescaleIdentityBindResponse,
+    PublishNodescaleIdentityChallengeRequest, PublishNodescaleIdentityChallengeResponse,
+    PublishResultRequest, PublishResultResponse, PublishTaskRequest, PublishTaskResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RelayFrame, TaskEnvelope,
 };
 
 use tokio::net::TcpListener;
@@ -52,8 +55,10 @@ const TARGET_NODE_METADATA_KEYS: &[&str] = &[
 const ABSOLUTE_DEADLINES_FEATURE: &str = "absolute_deadlines_v1";
 const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
 const NODESCALE_IDENTITY_BIND_FEATURE: &str = "nodescale_identity_bind_v1";
+const NODESCALE_IDENTITY_CHALLENGE_FEATURE: &str = "nodescale.identity.challenge.v1";
 const MAX_DIRECT_CONTROL_ID_BYTES: usize = 256;
 const MAX_DIRECT_CONTROL_NONCE_BYTES: usize = 512;
+const MAX_DIRECT_CONTROL_SECRET_BYTES: usize = 512;
 const MAX_DIRECT_CONTROL_REASON_BYTES: usize = 512;
 const AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY: &str =
     "keryx.authenticated_source_protocol_features";
@@ -144,6 +149,31 @@ async fn await_nodescale_identity_bind_completion(
             pending_frame.abandon();
             Err(Status::deadline_exceeded(
                 "destination did not complete direct control before retry deadline",
+            ))
+        }
+    }
+}
+
+async fn await_nodescale_identity_challenge_completion(
+    completion: tokio::sync::oneshot::Receiver<NodescaleIdentityChallengeResult>,
+    pending_frame: &mut PendingFrameOwnership,
+    timeout: Duration,
+) -> Result<NodescaleIdentityChallengeResult, Status> {
+    match tokio::time::timeout(timeout, completion).await {
+        Ok(Ok(result)) => {
+            pending_frame.disarm();
+            Ok(result)
+        }
+        Ok(Err(_)) => {
+            pending_frame.abandon();
+            Err(Status::unavailable(
+                "relay restarted before destination completed challenge control",
+            ))
+        }
+        Err(_) => {
+            pending_frame.abandon();
+            Err(Status::deadline_exceeded(
+                "destination did not complete challenge control before retry deadline",
             ))
         }
     }
@@ -353,6 +383,7 @@ impl KeryxRelay for RelayHealthService {
         let task = inner
             .task
             .ok_or_else(|| Status::invalid_argument("PublishTask requires task"))?;
+        let identity_task = canonical_task_publication_identity(&task);
         let target_node_id = if inner.target_node_id.trim().is_empty() {
             target_node_id_from_task(&task)?
         } else {
@@ -393,17 +424,18 @@ impl KeryxRelay for RelayHealthService {
         );
         let frame = RelayFrame {
             frame_id: proposed_receipt.frame_id.clone(),
-            task: Some(delivered_task),
+            task: Some(delivered_task.clone()),
             result: None,
             authenticated_source_node_id: source_node_id.clone(),
             destination_node_id: target_node_id.clone(),
             nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
         };
         let receipt = match self.runtime.publish_task_frame(
             &source_node_id,
             &target_node_id,
             task_id.value.trim(),
-            &task,
+            (&identity_task, &delivered_task),
             frame,
             proposed_receipt,
         ) {
@@ -418,6 +450,11 @@ impl KeryxRelay for RelayHealthService {
             PublishedTaskDelivery::RejectedCapacity => {
                 return Err(Status::resource_exhausted(
                     "relay task or frame identity table is at capacity",
+                ));
+            }
+            PublishedTaskDelivery::RejectedInvalid => {
+                return Err(Status::invalid_argument(
+                    "PublishTask frame must not contain typed direct control",
                 ));
             }
         };
@@ -472,6 +509,7 @@ impl KeryxRelay for RelayHealthService {
                 authenticated_source_node_id: source_node_id,
                 destination_node_id: target_node_id.clone(),
                 nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
             },
         );
         ensure_frame_routed(delivery)?;
@@ -516,6 +554,7 @@ impl KeryxRelay for RelayHealthService {
                     authenticated_source_node_id: authenticated_source,
                     destination_node_id: target_node_id.clone(),
                     nodescale_identity_bind_v1: Some(operation),
+                    nodescale_identity_challenge_v1: None,
                 },
             );
         ensure_frame_routed(delivery)?;
@@ -569,6 +608,91 @@ impl KeryxRelay for RelayHealthService {
             crate::runtime::DirectControlCompletion::UnknownFrame => Err(
                 Status::failed_precondition("direct control frame is unknown or already completed"),
             ),
+        }
+    }
+
+    async fn publish_nodescale_identity_challenge(
+        &self,
+        request: Request<PublishNodescaleIdentityChallengeRequest>,
+    ) -> Result<Response<PublishNodescaleIdentityChallengeResponse>, Status> {
+        let authenticated_source = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
+        let operation = inner
+            .operation
+            .ok_or_else(|| Status::invalid_argument("operation is required"))?;
+        validate_nodescale_identity_challenge(&operation)?;
+        self.require_destination_feature(&target_node_id, NODESCALE_IDENTITY_CHALLENGE_FEATURE)
+            .await?;
+
+        let frame_id = new_relay_frame_id();
+        let (delivery, completion) = self
+            .runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                target_node_id.clone(),
+                RelayFrame {
+                    frame_id: frame_id.clone(),
+                    task: None,
+                    result: None,
+                    authenticated_source_node_id: authenticated_source,
+                    destination_node_id: target_node_id.clone(),
+                    nodescale_identity_bind_v1: None,
+                    nodescale_identity_challenge_v1: Some(operation),
+                },
+            );
+        ensure_frame_routed(delivery)?;
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&self.runtime),
+            target_node_id.clone(),
+            frame_id.clone(),
+        );
+        let completion = completion.ok_or_else(|| {
+            Status::internal("accepted challenge control frame lacks completion state")
+        })?;
+        let result = await_nodescale_identity_challenge_completion(
+            completion,
+            &mut pending_frame,
+            Duration::from_secs(25),
+        )
+        .await?;
+        Ok(Response::new(PublishNodescaleIdentityChallengeResponse {
+            frame_id,
+            destination_node_id: target_node_id,
+            result: Some(result),
+        }))
+    }
+
+    async fn complete_nodescale_identity_challenge(
+        &self,
+        request: Request<CompleteNodescaleIdentityChallengeRequest>,
+    ) -> Result<Response<CompleteNodescaleIdentityChallengeResponse>, Status> {
+        let authenticated_destination = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let frame_id = required_node_value(&inner.frame_id, "frame_id")?;
+        let result = inner
+            .result
+            .ok_or_else(|| Status::invalid_argument("result is required"))?;
+        validate_nodescale_identity_challenge_result(&result)?;
+        match self.runtime.complete_nodescale_identity_challenge(
+            &authenticated_destination,
+            &frame_id,
+            result,
+        ) {
+            crate::runtime::DirectControlCompletion::Accepted => {
+                Ok(Response::new(CompleteNodescaleIdentityChallengeResponse {
+                    accepted: true,
+                }))
+            }
+            crate::runtime::DirectControlCompletion::WrongDestination => {
+                Err(Status::permission_denied(
+                    "authenticated node does not own the challenge control frame",
+                ))
+            }
+            crate::runtime::DirectControlCompletion::UnknownFrame => {
+                Err(Status::failed_precondition(
+                    "challenge control frame is unknown or already completed",
+                ))
+            }
         }
     }
 
@@ -654,10 +778,109 @@ fn required_node_value(value: &str, field: &str) -> Result<String, Status> {
     }
 }
 
+fn canonical_task_publication_identity(task: &TaskEnvelope) -> TaskEnvelope {
+    let mut identity = task.clone();
+    identity
+        .metadata
+        .remove(AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY);
+    identity
+}
+
 fn parse_registry_peer_id(value: &str) -> Result<PeerId, Status> {
     PeerId::new(value.trim()).map_err(|error| {
         Status::invalid_argument(format!("node id is not a valid registry peer id: {error}"))
     })
+}
+
+fn validate_nodescale_identity_challenge(
+    operation: &NodescaleIdentityChallengeV1,
+) -> Result<(), Status> {
+    for (name, value) in [
+        ("operation_id", operation.operation_id.as_str()),
+        ("network_id", operation.network_id.as_str()),
+        ("device_id", operation.device_id.as_str()),
+        ("join_session_id", operation.join_session_id.as_str()),
+        ("agent_version", operation.agent_version.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_DIRECT_CONTROL_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be non-empty and at most {MAX_DIRECT_CONTROL_ID_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_nodescale_identity_challenge_result(
+    result: &NodescaleIdentityChallengeResult,
+) -> Result<(), Status> {
+    let disposition =
+        NodescaleIdentityChallengeDisposition::try_from(result.disposition).map_err(|_| {
+            Status::invalid_argument("invalid nodescale identity challenge disposition")
+        })?;
+    if disposition == NodescaleIdentityChallengeDisposition::Unspecified {
+        return Err(Status::invalid_argument(
+            "nodescale identity challenge disposition is required",
+        ));
+    }
+    for (name, value, maximum) in [
+        (
+            "challenge_id",
+            result.challenge_id.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+        (
+            "challenge_secret",
+            result.challenge_secret.as_str(),
+            MAX_DIRECT_CONTROL_SECRET_BYTES,
+        ),
+        (
+            "reason",
+            result.reason.as_str(),
+            MAX_DIRECT_CONTROL_REASON_BYTES,
+        ),
+        (
+            "code",
+            result.code.as_str(),
+            MAX_DIRECT_CONTROL_REASON_BYTES,
+        ),
+    ] {
+        if value.len() > maximum {
+            return Err(Status::invalid_argument(format!(
+                "{name} exceeds {maximum} bytes"
+            )));
+        }
+    }
+    match disposition {
+        NodescaleIdentityChallengeDisposition::Issued => {
+            if !result.accepted
+                || result.challenge_id.trim().is_empty()
+                || result.challenge_secret.trim().is_empty()
+                || result.binding_generation == 0
+                || result.expires_at_unix_ms == 0
+                || !result.reason.is_empty()
+                || !result.code.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "issued challenge requires secret, identity, positive fences, and no rejection details",
+                ));
+            }
+        }
+        NodescaleIdentityChallengeDisposition::Rejected => {
+            if result.accepted
+                || !result.challenge_id.is_empty()
+                || !result.challenge_secret.is_empty()
+                || result.binding_generation != 0
+                || result.expires_at_unix_ms != 0
+            {
+                return Err(Status::invalid_argument(
+                    "rejected challenge must not claim active challenge material",
+                ));
+            }
+        }
+        NodescaleIdentityChallengeDisposition::Unspecified => unreachable!(),
+    }
+    Ok(())
 }
 
 fn validate_nodescale_identity_bind(operation: &NodescaleIdentityBindV1) -> Result<(), Status> {
@@ -920,9 +1143,17 @@ pub async fn serve_http_health(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use std::sync::Mutex;
+
+    use crate::node::{
+        dispatch_relay_typed_control_for_local, AuthenticatedDirectContext, DirectControlHandlers,
+        LocalTypedControlDispatch, NodescaleIdentityChallengeHandler,
+    };
     use keryx_proto::v1::{
         NodescaleIdentityBindDisposition, NodescaleIdentityBindResult, NodescaleIdentityBindV1,
-        PublishNodescaleIdentityBindRequest, TaskId, TaskResultEnvelope, TerminalOutcome,
+        NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
+        NodescaleIdentityChallengeV1, PublishNodescaleIdentityBindRequest,
+        PublishNodescaleIdentityChallengeRequest, TaskId, TaskResultEnvelope, TerminalOutcome,
     };
 
     use super::*;
@@ -930,6 +1161,97 @@ mod tests {
     const SOURCE_NODE_ID: &str = "executor-node";
     const DESTINATION_NODE_ID: &str = "origin-node";
     const SOURCE_TOKEN: &str = "test-token";
+
+    #[test]
+    fn task_publication_identity_excludes_only_relay_owned_feature_projection() {
+        let mut first = TaskEnvelope::default();
+        first.metadata.insert(
+            AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string(),
+            "[\"forged-a\"]".to_string(),
+        );
+        first
+            .metadata
+            .insert("caller-owned".to_string(), "stable".to_string());
+        let mut second = first.clone();
+        second.metadata.insert(
+            AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY.to_string(),
+            "[\"forged-b\"]".to_string(),
+        );
+        assert_eq!(
+            canonical_task_publication_identity(&first),
+            canonical_task_publication_identity(&second)
+        );
+
+        second
+            .metadata
+            .insert("caller-owned".to_string(), "changed".to_string());
+        assert_ne!(
+            canonical_task_publication_identity(&first),
+            canonical_task_publication_identity(&second)
+        );
+    }
+
+    #[test]
+    fn typed_nodescale_challenge_result_requires_delivery_only_secret_on_issued_and_none_on_rejected(
+    ) {
+        use keryx_proto::v1::{
+            NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
+            NodescaleIdentityChallengeV1,
+        };
+
+        let request = NodescaleIdentityChallengeV1 {
+            operation_id: "challenge-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            agent_version: "v1".to_string(),
+        };
+        assert_eq!(
+            NODESCALE_IDENTITY_CHALLENGE_FEATURE,
+            "nodescale.identity.challenge.v1"
+        );
+        assert_eq!(request.operation_id, "challenge-operation");
+
+        let issued = NodescaleIdentityChallengeResult {
+            disposition: NodescaleIdentityChallengeDisposition::Issued as i32,
+            accepted: true,
+            challenge_id: "challenge-id".to_string(),
+            challenge_secret: "challenge-secret-sentinel".to_string(),
+            binding_generation: 1,
+            expires_at_unix_ms: 1,
+            reason: String::new(),
+            code: String::new(),
+        };
+        assert!(validate_nodescale_identity_challenge_result(&issued).is_ok());
+
+        let rejected = NodescaleIdentityChallengeResult {
+            disposition: NodescaleIdentityChallengeDisposition::Rejected as i32,
+            accepted: false,
+            challenge_id: String::new(),
+            challenge_secret: String::new(),
+            binding_generation: 0,
+            expires_at_unix_ms: 0,
+            reason: "safe rejection".to_string(),
+            code: "rejected".to_string(),
+        };
+        assert!(validate_nodescale_identity_challenge_result(&rejected).is_ok());
+
+        let mut contradictory = rejected;
+        contradictory.challenge_secret = "challenge-secret-sentinel".to_string();
+        let error = validate_nodescale_identity_challenge_result(&contradictory).unwrap_err();
+        assert!(!error.message().contains("challenge-secret-sentinel"));
+        for source in [
+            include_str!("runtime.rs"),
+            include_str!("node.rs"),
+            include_str!("../../keryx-daemon/src/incoming.rs"),
+        ] {
+            let production_source = source.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                !production_source.contains("challenge_secret"),
+                "challenge secret must not enter relay runtime, edge, or daemon persistence paths"
+            );
+        }
+    }
 
     #[test]
     fn typed_nodescale_publish_request_cannot_claim_a_source_identity() {
@@ -1078,6 +1400,81 @@ mod tests {
                 .insert(NODE_TOKEN_METADATA_KEY, token.parse().unwrap());
         }
         request
+    }
+
+    fn challenge_operation() -> NodescaleIdentityChallengeV1 {
+        NodescaleIdentityChallengeV1 {
+            operation_id: "challenge-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            agent_version: "v1".to_string(),
+        }
+    }
+
+    fn challenge_publish_request(
+        token: Option<&str>,
+    ) -> Request<PublishNodescaleIdentityChallengeRequest> {
+        let mut request = Request::new(PublishNodescaleIdentityChallengeRequest {
+            operation: Some(challenge_operation()),
+            target_node_id: DESTINATION_NODE_ID.to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        if let Some(token) = token {
+            request
+                .metadata_mut()
+                .insert(NODE_TOKEN_METADATA_KEY, token.parse().unwrap());
+        }
+        request
+    }
+
+    #[derive(Default)]
+    struct IdempotentChallengeHarness {
+        issued_keys: Mutex<HashSet<(String, String)>>,
+    }
+
+    #[tonic::async_trait]
+    impl NodescaleIdentityChallengeHandler for IdempotentChallengeHarness {
+        async fn handle_nodescale_identity_challenge(
+            &self,
+            context: AuthenticatedDirectContext,
+            operation: NodescaleIdentityChallengeV1,
+        ) -> anyhow::Result<NodescaleIdentityChallengeResult> {
+            let key = (
+                context.authenticated_source_node_id().to_string(),
+                operation.operation_id,
+            );
+            if !self.issued_keys.lock().unwrap().insert(key) {
+                return Ok(NodescaleIdentityChallengeResult {
+                    disposition: NodescaleIdentityChallengeDisposition::Rejected as i32,
+                    accepted: false,
+                    challenge_id: String::new(),
+                    challenge_secret: String::new(),
+                    binding_generation: 0,
+                    expires_at_unix_ms: 0,
+                    reason: "duplicate operation".to_string(),
+                    code: "duplicate_operation".to_string(),
+                });
+            }
+            Ok(NodescaleIdentityChallengeResult {
+                disposition: NodescaleIdentityChallengeDisposition::Issued as i32,
+                accepted: true,
+                challenge_id: "issued-challenge".to_string(),
+                challenge_secret: "issued-secret-delivery-only".to_string(),
+                binding_generation: 1,
+                expires_at_unix_ms: 1,
+                reason: String::new(),
+                code: String::new(),
+            })
+        }
+    }
+
+    impl IdempotentChallengeHarness {
+        fn issued_count(&self) -> usize {
+            self.issued_keys.lock().unwrap().len()
+        }
     }
 
     fn direct_service(
@@ -1350,6 +1747,283 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn authenticated_challenge_rpc_projects_frame_completes_at_destination_and_delegates_dedupe(
+    ) {
+        let runtime = RelayRuntime::new("challenge-rpc-integration-test");
+        let registry = Arc::new(SkillRegistry::new());
+        let service = direct_service(Arc::clone(&runtime), Arc::clone(&registry), HashSet::new());
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        registry
+            .register_with_features(
+                DESTINATION_NODE_ID.parse().unwrap(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                vec!["nodescale_identity_challenge_v1".to_string()],
+                None,
+            )
+            .await;
+        let error = KeryxRelay::publish_nodescale_identity_challenge(
+            service.as_ref(),
+            challenge_publish_request(Some(SOURCE_TOKEN)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(runtime.mailbox_depth(DESTINATION_NODE_ID), 0);
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+
+        registry
+            .register_with_features(
+                DESTINATION_NODE_ID.parse().unwrap(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                vec![NODESCALE_IDENTITY_CHALLENGE_FEATURE.to_string()],
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert_eq!(runtime.connect_node(DESTINATION_NODE_ID, sender), 0);
+        let harness = Arc::new(IdempotentChallengeHarness::default());
+        let handlers = DirectControlHandlers {
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: Some(harness.clone()),
+        };
+
+        let publish_service = Arc::clone(&service);
+        let publish = tokio::spawn(async move {
+            KeryxRelay::publish_nodescale_identity_challenge(
+                publish_service.as_ref(),
+                challenge_publish_request(Some(SOURCE_TOKEN)),
+            )
+            .await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.authenticated_source_node_id, SOURCE_NODE_ID);
+        assert_eq!(frame.destination_node_id, DESTINATION_NODE_ID);
+        assert_eq!(
+            frame.nodescale_identity_challenge_v1,
+            Some(challenge_operation())
+        );
+        assert!(frame.task.is_none() && frame.result.is_none());
+        assert!(frame.nodescale_identity_bind_v1.is_none());
+        let frame_id = frame.frame_id.clone();
+        let issued =
+            match dispatch_relay_typed_control_for_local(&handlers, DESTINATION_NODE_ID, &frame)
+                .await
+                .unwrap()
+            {
+                Some(LocalTypedControlDispatch::Challenge(result)) => result,
+                _ => panic!("authenticated challenge frame must dispatch to the challenge handler"),
+            };
+        assert_eq!(harness.issued_count(), 1);
+
+        let mut wrong_destination = Request::new(CompleteNodescaleIdentityChallengeRequest {
+            frame_id: frame_id.clone(),
+            result: Some(issued.clone()),
+        });
+        wrong_destination
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        wrong_destination
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+        assert_eq!(
+            KeryxRelay::complete_nodescale_identity_challenge(service.as_ref(), wrong_destination)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+
+        let mut completion = Request::new(CompleteNodescaleIdentityChallengeRequest {
+            frame_id: frame_id.clone(),
+            result: Some(issued),
+        });
+        completion
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, DESTINATION_NODE_ID.parse().unwrap());
+        completion.metadata_mut().insert(
+            NODE_TOKEN_METADATA_KEY,
+            "destination-token".parse().unwrap(),
+        );
+        assert!(
+            KeryxRelay::complete_nodescale_identity_challenge(service.as_ref(), completion)
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
+        let published = publish.await.unwrap().unwrap().into_inner();
+        assert_eq!(published.frame_id, frame_id);
+        assert_eq!(published.destination_node_id, DESTINATION_NODE_ID);
+        assert_eq!(
+            published.result.unwrap().challenge_secret,
+            "issued-secret-delivery-only"
+        );
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+
+        let duplicate_service = Arc::clone(&service);
+        let duplicate_publish = tokio::spawn(async move {
+            KeryxRelay::publish_nodescale_identity_challenge(
+                duplicate_service.as_ref(),
+                challenge_publish_request(Some(SOURCE_TOKEN)),
+            )
+            .await
+        });
+        let duplicate_frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let duplicate_frame_id = duplicate_frame.frame_id.clone();
+        let duplicate_result = match dispatch_relay_typed_control_for_local(
+            &handlers,
+            DESTINATION_NODE_ID,
+            &duplicate_frame,
+        )
+        .await
+        .unwrap()
+        {
+            Some(LocalTypedControlDispatch::Challenge(result)) => result,
+            _ => panic!("authenticated challenge frame must dispatch to the challenge handler"),
+        };
+        assert_eq!(harness.issued_count(), 1);
+        assert_eq!(
+            duplicate_result.disposition,
+            NodescaleIdentityChallengeDisposition::Rejected as i32
+        );
+        assert!(!duplicate_result.accepted);
+        assert!(duplicate_result.challenge_secret.is_empty());
+
+        let mut duplicate_completion = Request::new(CompleteNodescaleIdentityChallengeRequest {
+            frame_id: duplicate_frame_id,
+            result: Some(duplicate_result),
+        });
+        duplicate_completion
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, DESTINATION_NODE_ID.parse().unwrap());
+        duplicate_completion.metadata_mut().insert(
+            NODE_TOKEN_METADATA_KEY,
+            "destination-token".parse().unwrap(),
+        );
+        assert!(
+            KeryxRelay::complete_nodescale_identity_challenge(
+                service.as_ref(),
+                duplicate_completion,
+            )
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted
+        );
+        let duplicate = duplicate_publish.await.unwrap().unwrap().into_inner();
+        let duplicate_result = duplicate.result.unwrap();
+        assert_eq!(
+            duplicate_result.disposition,
+            NodescaleIdentityChallengeDisposition::Rejected as i32
+        );
+        assert!(duplicate_result.challenge_secret.is_empty());
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+    }
+
+    #[tokio::test]
+    async fn challenge_timeout_and_publisher_cancellation_release_delivery_only_ownership() {
+        let runtime = RelayRuntime::new("challenge-timeout-cleanup-test");
+        let frame_id = "timed-out-challenge".to_string();
+        let (delivery, completion) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                DESTINATION_NODE_ID,
+                RelayFrame {
+                    frame_id: frame_id.clone(),
+                    task: None,
+                    result: None,
+                    authenticated_source_node_id: SOURCE_NODE_ID.to_string(),
+                    destination_node_id: DESTINATION_NODE_ID.to_string(),
+                    nodescale_identity_bind_v1: None,
+                    nodescale_identity_challenge_v1: Some(challenge_operation()),
+                },
+            );
+        assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&runtime),
+            DESTINATION_NODE_ID.to_string(),
+            frame_id.clone(),
+        );
+        let error = await_nodescale_identity_challenge_completion(
+            completion.unwrap(),
+            &mut pending_frame,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(!error.message().contains("issued-secret-delivery-only"));
+        assert_eq!(runtime.mailbox_depth(DESTINATION_NODE_ID), 0);
+        assert_eq!(
+            runtime.complete_nodescale_identity_challenge(
+                DESTINATION_NODE_ID,
+                &frame_id,
+                NodescaleIdentityChallengeResult {
+                    disposition: NodescaleIdentityChallengeDisposition::Rejected as i32,
+                    accepted: false,
+                    challenge_id: String::new(),
+                    challenge_secret: String::new(),
+                    binding_generation: 0,
+                    expires_at_unix_ms: 0,
+                    reason: "timed out".to_string(),
+                    code: "timeout".to_string(),
+                },
+            ),
+            crate::runtime::DirectControlCompletion::UnknownFrame
+        );
+
+        let runtime = RelayRuntime::new("challenge-cancel-cleanup-test");
+        let registry = Arc::new(SkillRegistry::new());
+        registry
+            .register_with_features(
+                DESTINATION_NODE_ID.parse().unwrap(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                vec![NODESCALE_IDENTITY_CHALLENGE_FEATURE.to_string()],
+                None,
+            )
+            .await;
+        let service = direct_service(Arc::clone(&runtime), registry, HashSet::new());
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(runtime.connect_node(DESTINATION_NODE_ID, sender), 0);
+        let publish_service = Arc::clone(&service);
+        let publish = tokio::spawn(async move {
+            KeryxRelay::publish_nodescale_identity_challenge(
+                publish_service.as_ref(),
+                challenge_publish_request(Some(SOURCE_TOKEN)),
+            )
+            .await
+        });
+        let frame_id = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .frame_id;
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+        assert_eq!(runtime.mailbox_depth(DESTINATION_NODE_ID), 0);
+        assert_eq!(
+            runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
+            FrameAcknowledgement::UnknownFrame
+        );
+    }
+
     fn publish_result_request(task_id: impl Into<String>) -> Request<PublishResultRequest> {
         let mut request = Request::new(PublishResultRequest {
             result: Some(TaskResultEnvelope {
@@ -1382,11 +2056,12 @@ mod tests {
     fn unrelated_frame() -> RelayFrame {
         RelayFrame {
             frame_id: "unrelated-frame".to_string(),
-            task: None,
+            task: Some(TaskEnvelope::default()),
             result: None,
             authenticated_source_node_id: "unrelated-source".to_string(),
             destination_node_id: DESTINATION_NODE_ID.to_string(),
             nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
         }
     }
 
@@ -1653,11 +2328,12 @@ mod tests {
             DESTINATION_NODE_ID,
             RelayFrame {
                 frame_id: frame_id.clone(),
-                task: None,
+                task: Some(TaskEnvelope::default()),
                 result: None,
                 authenticated_source_node_id: SOURCE_NODE_ID.to_string(),
                 destination_node_id: DESTINATION_NODE_ID.to_string(),
                 nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
             },
         );
         assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
@@ -1703,6 +2379,7 @@ mod tests {
                 authenticated_source_node_id: SOURCE_NODE_ID.to_string(),
                 destination_node_id: DESTINATION_NODE_ID.to_string(),
                 nodescale_identity_bind_v1: Some(direct_operation()),
+                nodescale_identity_challenge_v1: None,
             },
         );
         assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
@@ -1738,6 +2415,7 @@ mod tests {
                     authenticated_source_node_id: SOURCE_NODE_ID.to_string(),
                     destination_node_id: DESTINATION_NODE_ID.to_string(),
                     nodescale_identity_bind_v1: Some(direct_operation()),
+                    nodescale_identity_challenge_v1: None,
                 },
             );
         assert_eq!(reuse_delivery, crate::runtime::FrameDelivery::Mailboxed);

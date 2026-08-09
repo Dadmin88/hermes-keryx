@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keryx_observe::RelayMetrics;
-use keryx_proto::v1::{NodescaleIdentityBindResult, RelayFrame, TaskEnvelope};
+use keryx_proto::v1::{
+    NodescaleIdentityBindResult, NodescaleIdentityChallengeResult, RelayFrame, TaskEnvelope,
+};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
@@ -70,6 +72,7 @@ pub enum PublishedTaskDelivery {
     Retry(PublishedTaskReceipt),
     Conflict,
     RejectedCapacity,
+    RejectedInvalid,
 }
 
 type FrameKey = (String, String);
@@ -111,6 +114,7 @@ struct PeerState {
     acknowledged_published_task_order: VecDeque<TaskPublishKey>,
     frame_ack_waiters: HashMap<FrameKey, oneshot::Sender<()>>,
     direct_control_waiters: HashMap<FrameKey, oneshot::Sender<NodescaleIdentityBindResult>>,
+    challenge_control_waiters: HashMap<FrameKey, oneshot::Sender<NodescaleIdentityChallengeResult>>,
 }
 
 pub const MAX_TRACKED_FRAMES: usize = 8_192;
@@ -295,6 +299,9 @@ impl RelayRuntime {
         target_node_id: impl Into<String>,
         frame: RelayFrame,
     ) -> FrameDelivery {
+        if !has_exactly_one_generic_payload(&frame) {
+            return FrameDelivery::RejectedInvalid;
+        }
         let target_node_id = target_node_id.into();
         let mut guard = self.lock_peers();
         let delivery = route_frame_locked(&mut guard, target_node_id, frame);
@@ -315,6 +322,9 @@ impl RelayRuntime {
         target_node_id: impl Into<String>,
         frame: RelayFrame,
     ) -> (FrameDelivery, Option<oneshot::Receiver<()>>) {
+        if !has_exactly_one_generic_payload(&frame) {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
         let target_node_id = target_node_id.into();
         let frame_id = frame.frame_id.trim().to_string();
         let mut guard = self.lock_peers();
@@ -342,7 +352,7 @@ impl RelayRuntime {
     }
 
     /// Atomically route a typed direct-control frame and install its destination-only result waiter.
-    pub fn route_nodescale_identity_bind_waiting_for_completion(
+    pub(crate) fn route_nodescale_identity_bind_waiting_for_completion(
         &self,
         target_node_id: impl Into<String>,
         frame: RelayFrame,
@@ -351,8 +361,15 @@ impl RelayRuntime {
         Option<oneshot::Receiver<NodescaleIdentityBindResult>>,
     ) {
         let target_node_id = target_node_id.into();
+        if !typed_direct_control_target_matches_frame_destination(&target_node_id, &frame) {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
         let frame_id = frame.frame_id.trim().to_string();
-        if frame.nodescale_identity_bind_v1.is_none() {
+        if frame.nodescale_identity_bind_v1.is_none()
+            || frame.nodescale_identity_challenge_v1.is_some()
+            || frame.task.is_some()
+            || frame.result.is_some()
+        {
             return (FrameDelivery::RejectedInvalid, None);
         }
         let mut guard = self.lock_peers();
@@ -375,7 +392,7 @@ impl RelayRuntime {
 
     /// Complete a typed control frame exactly once. Only the exact authenticated destination can
     /// settle the publisher's waiter; duplicate/unknown completion is deliberately not idempotent.
-    pub fn complete_nodescale_identity_bind(
+    pub(crate) fn complete_nodescale_identity_bind(
         &self,
         destination_node_id: &str,
         frame_id: &str,
@@ -409,6 +426,81 @@ impl RelayRuntime {
         DirectControlCompletion::Accepted
     }
 
+    /// Atomically route a typed challenge-control frame and install its destination-only result waiter.
+    pub(crate) fn route_nodescale_identity_challenge_waiting_for_completion(
+        &self,
+        target_node_id: impl Into<String>,
+        frame: RelayFrame,
+    ) -> (
+        FrameDelivery,
+        Option<oneshot::Receiver<NodescaleIdentityChallengeResult>>,
+    ) {
+        let target_node_id = target_node_id.into();
+        if !typed_direct_control_target_matches_frame_destination(&target_node_id, &frame) {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
+        let frame_id = frame.frame_id.trim().to_string();
+        if frame.nodescale_identity_challenge_v1.is_none()
+            || frame.nodescale_identity_bind_v1.is_some()
+            || frame.task.is_some()
+            || frame.result.is_some()
+        {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
+        let mut guard = self.lock_peers();
+        let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
+        let receiver = if matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ) {
+            let (sender, receiver) = oneshot::channel();
+            guard
+                .challenge_control_waiters
+                .insert((target_node_id, frame_id), sender);
+            Some(receiver)
+        } else {
+            None
+        };
+        self.sync_connected_peer_metric(&guard);
+        (delivery, receiver)
+    }
+
+    /// Complete a typed challenge control frame exactly once. Only the exact authenticated
+    /// destination can settle the publisher's waiter; duplicate/unknown completion is not idempotent.
+    pub(crate) fn complete_nodescale_identity_challenge(
+        &self,
+        destination_node_id: &str,
+        frame_id: &str,
+        result: NodescaleIdentityChallengeResult,
+    ) -> DirectControlCompletion {
+        let destination_node_id = destination_node_id.trim();
+        let frame_id = frame_id.trim();
+        if destination_node_id.is_empty() || frame_id.is_empty() {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        let mut guard = self.lock_peers();
+        let Some(waiter) = guard.challenge_control_waiters.remove(&key) else {
+            return if guard
+                .challenge_control_waiters
+                .keys()
+                .any(|(_, known_frame_id)| known_frame_id == frame_id)
+            {
+                DirectControlCompletion::WrongDestination
+            } else {
+                DirectControlCompletion::UnknownFrame
+            };
+        };
+        if !guard.frame_destinations.remove(&key) {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
+        }
+        let _ = waiter.send(result);
+        DirectControlCompletion::Accepted
+    }
+
     /// Abandon a timed-out result frame generation while leaving any already-delivered copy
     /// harmlessly idempotent at the destination.
     pub fn abandon_frame(&self, destination_node_id: &str, frame_id: &str) {
@@ -416,6 +508,7 @@ impl RelayRuntime {
         let mut guard = self.lock_peers();
         guard.frame_ack_waiters.remove(&key);
         guard.direct_control_waiters.remove(&key);
+        guard.challenge_control_waiters.remove(&key);
         guard.frame_destinations.remove(&key);
         if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
             mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
@@ -433,7 +526,9 @@ impl RelayRuntime {
         let key = (destination_node_id.to_string(), frame_id.to_string());
         // Typed direct-control frames have a destination-only semantic completion channel.
         // Generic ACKs must never consume their ownership or settle their waiters.
-        if guard.direct_control_waiters.contains_key(&key) {
+        if guard.direct_control_waiters.contains_key(&key)
+            || guard.challenge_control_waiters.contains_key(&key)
+        {
             return FrameAcknowledgement::UnknownFrame;
         }
         if guard.acknowledged_frames.contains(&key) {
@@ -558,16 +653,23 @@ impl RelayRuntime {
         )
     }
 
-    /// Atomically admit a task identity and acquire bounded frame ownership before delivery.
+    /// Atomically admit a stable caller task identity and acquire bounded frame ownership.
+    ///
+    /// `identity_task` excludes relay-projected metadata and remains stable across retries.
+    /// `routed_task` is the exact task payload carried by `frame` for this delivery attempt.
     pub fn publish_task_frame(
         &self,
         source_node_id: &str,
         destination_node_id: &str,
         task_id: &str,
-        task: &TaskEnvelope,
+        tasks: (&TaskEnvelope, &TaskEnvelope),
         frame: RelayFrame,
         proposed_receipt: PublishedTaskReceipt,
     ) -> PublishedTaskDelivery {
+        let (identity_task, routed_task) = tasks;
+        if !is_exact_task_frame(&frame, routed_task) {
+            return PublishedTaskDelivery::RejectedInvalid;
+        }
         let task_key = (
             source_node_id.to_string(),
             destination_node_id.to_string(),
@@ -575,7 +677,7 @@ impl RelayRuntime {
         );
         let mut guard = self.lock_peers();
         if let Some(existing) = guard.published_tasks.get(&task_key) {
-            return if existing.envelope == *task {
+            return if existing.envelope == *identity_task {
                 PublishedTaskDelivery::Retry(existing.receipt.clone())
             } else {
                 PublishedTaskDelivery::Conflict
@@ -613,7 +715,7 @@ impl RelayRuntime {
         guard.published_tasks.insert(
             task_key,
             PublishedTaskRecord {
-                envelope: task.clone(),
+                envelope: identity_task.clone(),
                 receipt: proposed_receipt.clone(),
                 acknowledged: false,
             },
@@ -786,6 +888,9 @@ fn route_frame_locked(
     target_node_id: String,
     frame: RelayFrame,
 ) -> FrameDelivery {
+    if !has_exactly_one_relay_payload(&frame) {
+        return FrameDelivery::RejectedInvalid;
+    }
     let frame_id = frame.frame_id.trim();
     if frame_id.is_empty() {
         return FrameDelivery::RejectedInvalid;
@@ -835,6 +940,31 @@ fn route_frame_locked(
     FrameDelivery::Mailboxed
 }
 
+fn has_exactly_one_relay_payload(frame: &RelayFrame) -> bool {
+    let payload_count = usize::from(frame.task.is_some())
+        + usize::from(frame.result.is_some())
+        + usize::from(frame.nodescale_identity_bind_v1.is_some())
+        + usize::from(frame.nodescale_identity_challenge_v1.is_some());
+    payload_count == 1
+}
+
+fn has_exactly_one_generic_payload(frame: &RelayFrame) -> bool {
+    has_exactly_one_relay_payload(frame) && (frame.task.is_some() || frame.result.is_some())
+}
+
+fn is_exact_task_frame(frame: &RelayFrame, task: &TaskEnvelope) -> bool {
+    has_exactly_one_relay_payload(frame) && frame.task.as_ref() == Some(task)
+}
+
+fn typed_direct_control_target_matches_frame_destination(
+    target_node_id: &str,
+    frame: &RelayFrame,
+) -> bool {
+    !target_node_id.trim().is_empty()
+        && (frame.destination_node_id.trim().is_empty()
+            || target_node_id == frame.destination_node_id)
+}
+
 fn is_acked(
     destination_node_id: &str,
     frame: &RelayFrame,
@@ -853,11 +983,12 @@ mod tests {
     fn frame(frame_id: impl Into<String>) -> RelayFrame {
         RelayFrame {
             frame_id: frame_id.into(),
-            task: None,
+            task: Some(TaskEnvelope::default()),
             result: None,
             authenticated_source_node_id: "source".to_string(),
             destination_node_id: "destination".to_string(),
             nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
         }
     }
 
@@ -877,6 +1008,227 @@ mod tests {
                 binding_generation: 1,
                 agent_version: "v1".to_string(),
             }),
+            nodescale_identity_challenge_v1: None,
+        }
+    }
+
+    fn challenge_control_frame(frame_id: impl Into<String>) -> RelayFrame {
+        RelayFrame {
+            frame_id: frame_id.into(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: Some(keryx_proto::v1::NodescaleIdentityChallengeV1 {
+                operation_id: "challenge-operation".to_string(),
+                network_id: "network".to_string(),
+                device_id: "device".to_string(),
+                join_session_id: "session".to_string(),
+                agent_version: "v1".to_string(),
+            }),
+        }
+    }
+
+    fn challenge_result() -> NodescaleIdentityChallengeResult {
+        NodescaleIdentityChallengeResult {
+            disposition: keryx_proto::v1::NodescaleIdentityChallengeDisposition::Issued as i32,
+            accepted: true,
+            challenge_id: "challenge".to_string(),
+            challenge_secret: "delivery-only-test-secret".to_string(),
+            binding_generation: 1,
+            expires_at_unix_ms: 1,
+            reason: String::new(),
+            code: String::new(),
+        }
+    }
+
+    #[test]
+    fn generic_route_rejects_typed_direct_controls_without_acquiring_state_or_metrics() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        let mut bind_with_task = direct_control_frame("bind-with-task");
+        bind_with_task.task = Some(task("mixed-bind-task"));
+        let mut bind_with_result = direct_control_frame("bind-with-result");
+        bind_with_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let mut challenge_with_task = challenge_control_frame("challenge-with-task");
+        challenge_with_task.task = Some(task("mixed-challenge-task"));
+        let mut challenge_with_result = challenge_control_frame("challenge-with-result");
+        challenge_with_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let mut bind_with_challenge = direct_control_frame("bind-with-challenge");
+        bind_with_challenge.nodescale_identity_challenge_v1 =
+            challenge_control_frame("unused").nodescale_identity_challenge_v1;
+
+        for frame in [
+            direct_control_frame("bind-only"),
+            challenge_control_frame("challenge-only"),
+            bind_with_task,
+            bind_with_result,
+            challenge_with_task,
+            challenge_with_result,
+            bind_with_challenge,
+        ] {
+            assert_eq!(
+                runtime.route_frame("destination", frame),
+                FrameDelivery::RejectedInvalid
+            );
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.frame_destinations.is_empty());
+            assert!(guard.frame_ack_waiters.is_empty());
+            assert!(guard.direct_control_waiters.is_empty());
+            assert!(guard.challenge_control_waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_ack_waiter_route_rejects_typed_direct_controls_without_acquiring_state() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        for frame in [
+            direct_control_frame("bind-generic-ack-waiter"),
+            challenge_control_frame("challenge-generic-ack-waiter"),
+        ] {
+            let (delivery, acknowledgement) =
+                runtime.route_frame_waiting_for_ack("destination", frame);
+            assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+            assert!(acknowledgement.is_none());
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.frame_destinations.is_empty());
+            assert!(guard.frame_ack_waiters.is_empty());
+            assert!(guard.direct_control_waiters.is_empty());
+            assert!(guard.challenge_control_waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_routes_reject_zero_and_multi_payload_frames_before_mailbox_waiters_or_metrics() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        let mut task_and_result = frame("task-and-result");
+        task_and_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let zero_payload = RelayFrame {
+            frame_id: "zero-payload".to_string(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
+        };
+
+        for frame in [task_and_result, zero_payload] {
+            assert_eq!(
+                runtime.route_frame("destination", frame.clone()),
+                FrameDelivery::RejectedInvalid
+            );
+            let (delivery, acknowledgement) =
+                runtime.route_frame_waiting_for_ack("destination", frame);
+            assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+            assert!(acknowledgement.is_none());
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.frame_destinations.is_empty());
+            assert!(guard.frame_ack_waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn task_publish_route_rejects_typed_direct_controls_without_acquiring_state() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        for (index, mut frame) in [
+            direct_control_frame("published-bind-control"),
+            challenge_control_frame("published-challenge-control"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task = task(format!("published-task-{index}"));
+            frame.task = Some(task.clone());
+            assert!(!matches!(
+                runtime.publish_task_frame(
+                    "source",
+                    "destination",
+                    task.task_id.as_ref().unwrap().value.as_str(),
+                    (&task, &task),
+                    frame,
+                    PublishedTaskReceipt {
+                        frame_id: format!("published-control-{index}"),
+                        accepted_at_ms: index as i64,
+                    },
+                ),
+                PublishedTaskDelivery::New { .. }
+            ));
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.published_tasks.is_empty());
+            assert!(guard.published_frame_index.is_empty());
+            assert!(guard.frame_destinations.is_empty());
+            assert!(guard.direct_control_waiters.is_empty());
+            assert!(guard.challenge_control_waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn task_publish_requires_one_unchanged_task_payload_before_ownership_or_metrics() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+        let published_task = task("published-task");
+        let mut task_and_result = frame("published-task-and-result");
+        task_and_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let result_only = RelayFrame {
+            frame_id: "published-result-only".to_string(),
+            task: None,
+            result: Some(keryx_proto::v1::TaskResultEnvelope::default()),
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
+        };
+        let mismatched_envelope = RelayFrame {
+            frame_id: "published-mismatched-task".to_string(),
+            task: Some(task("mismatched-published-task")),
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
+        };
+
+        for (index, frame) in [task_and_result, result_only, mismatched_envelope]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                runtime.publish_task_frame(
+                    "source",
+                    "destination",
+                    "published-task",
+                    (&published_task, &published_task),
+                    frame,
+                    PublishedTaskReceipt {
+                        frame_id: format!("rejected-published-frame-{index}"),
+                        accepted_at_ms: index as i64,
+                    },
+                ),
+                PublishedTaskDelivery::RejectedInvalid
+            );
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.published_tasks.is_empty());
+            assert!(guard.published_frame_index.is_empty());
+            assert!(guard.frame_destinations.is_empty());
         }
     }
 
@@ -894,6 +1246,65 @@ mod tests {
             frame_id: format!("task-frame-{index}"),
             accepted_at_ms: index as i64 + 1,
         }
+    }
+
+    #[test]
+    fn task_retry_identity_is_stable_when_relay_projected_metadata_changes() {
+        let runtime = RelayRuntime::new("relay");
+        let identity_task = task("stable-task");
+        let mut first_delivery = identity_task.clone();
+        first_delivery.metadata.insert(
+            "keryx.authenticated_source_protocol_features".to_string(),
+            "[\"feature-a\"]".to_string(),
+        );
+        let mut second_delivery = first_delivery.clone();
+        second_delivery.metadata.insert(
+            "keryx.authenticated_source_protocol_features".to_string(),
+            "[\"feature-b\"]".to_string(),
+        );
+        let original_receipt = PublishedTaskReceipt {
+            frame_id: "stable-task-frame".to_string(),
+            accepted_at_ms: 17,
+        };
+
+        let first = runtime.publish_task_frame(
+            "source",
+            "destination",
+            "stable-task",
+            (&identity_task, &first_delivery),
+            RelayFrame {
+                frame_id: original_receipt.frame_id.clone(),
+                task: Some(first_delivery.clone()),
+                result: None,
+                authenticated_source_node_id: "source".to_string(),
+                destination_node_id: "destination".to_string(),
+                nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
+            },
+            original_receipt.clone(),
+        );
+        assert!(matches!(first, PublishedTaskDelivery::New { .. }));
+
+        let retry = runtime.publish_task_frame(
+            "source",
+            "destination",
+            "stable-task",
+            (&identity_task, &second_delivery),
+            RelayFrame {
+                frame_id: "ignored-retry-frame".to_string(),
+                task: Some(second_delivery.clone()),
+                result: None,
+                authenticated_source_node_id: "source".to_string(),
+                destination_node_id: "destination".to_string(),
+                nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
+            },
+            PublishedTaskReceipt {
+                frame_id: "ignored-retry-frame".to_string(),
+                accepted_at_ms: 18,
+            },
+        );
+        assert_eq!(retry, PublishedTaskDelivery::Retry(original_receipt));
     }
 
     #[test]
@@ -1028,6 +1439,7 @@ mod tests {
                         authenticated_source_node_id: "source".to_string(),
                         destination_node_id: "destination".to_string(),
                         nodescale_identity_bind_v1: None,
+                        nodescale_identity_challenge_v1: None,
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -1087,6 +1499,7 @@ mod tests {
                     authenticated_source_node_id: "source".to_string(),
                     destination_node_id: "destination".to_string(),
                     nodescale_identity_bind_v1: None,
+                    nodescale_identity_challenge_v1: None,
                 },
             ),
             FrameDelivery::Mailboxed
@@ -1122,6 +1535,7 @@ mod tests {
                     authenticated_source_node_id: "source".to_string(),
                     destination_node_id: "destination".to_string(),
                     nodescale_identity_bind_v1: None,
+                    nodescale_identity_challenge_v1: None,
                 },
             ),
             FrameDelivery::Mailboxed
@@ -1171,6 +1585,7 @@ mod tests {
                         authenticated_source_node_id: "source".into(),
                         destination_node_id: "destination".into(),
                         nodescale_identity_bind_v1: None,
+                        nodescale_identity_challenge_v1: None,
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -1197,7 +1612,7 @@ mod tests {
                 "source",
                 "destination",
                 "capacity-overflow",
-                &overflow_task,
+                (&overflow_task, &overflow_task),
                 RelayFrame {
                     frame_id: overflow_receipt.frame_id.clone(),
                     task: Some(overflow_task.clone()),
@@ -1205,6 +1620,7 @@ mod tests {
                     authenticated_source_node_id: "source".into(),
                     destination_node_id: "destination".into(),
                     nodescale_identity_bind_v1: None,
+                    nodescale_identity_challenge_v1: None,
                 },
                 overflow_receipt,
             ),
@@ -1362,6 +1778,236 @@ mod tests {
             DirectControlCompletion::Accepted
         );
         assert_eq!(completion.await.unwrap().binding_id, "binding");
+    }
+
+    #[tokio::test]
+    async fn challenge_control_keeps_kind_specific_waiters_and_rejects_generic_ack() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+        let (bind_delivery, bind_completion) = runtime
+            .route_nodescale_identity_bind_waiting_for_completion(
+                "destination",
+                direct_control_frame("bind-frame"),
+            );
+        let (challenge_delivery, challenge_completion) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                "destination",
+                challenge_control_frame("challenge-frame"),
+            );
+        assert_eq!(bind_delivery, FrameDelivery::Mailboxed);
+        assert_eq!(challenge_delivery, FrameDelivery::Mailboxed);
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+
+        assert_eq!(
+            runtime.ack_frame("destination", "challenge-frame"),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_bind(
+                "destination",
+                "challenge-frame",
+                keryx_proto::v1::NodescaleIdentityBindResult {
+                    disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
+                    accepted: true,
+                    binding_id: "binding".to_string(),
+                    generation: 1,
+                    revision: 1,
+                    reason: String::new(),
+                    code: String::new(),
+                },
+            ),
+            DirectControlCompletion::UnknownFrame
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_challenge(
+                "other-destination",
+                "challenge-frame",
+                challenge_result(),
+            ),
+            DirectControlCompletion::WrongDestination
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_challenge(
+                "destination",
+                "challenge-frame",
+                challenge_result(),
+            ),
+            DirectControlCompletion::Accepted
+        );
+        assert_eq!(
+            challenge_completion
+                .unwrap()
+                .await
+                .unwrap()
+                .challenge_secret,
+            "delivery-only-test-secret"
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_challenge(
+                "destination",
+                "challenge-frame",
+                challenge_result(),
+            ),
+            DirectControlCompletion::UnknownFrame
+        );
+        assert_eq!(
+            runtime.complete_nodescale_identity_bind(
+                "destination",
+                "bind-frame",
+                keryx_proto::v1::NodescaleIdentityBindResult {
+                    disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
+                    accepted: true,
+                    binding_id: "binding".to_string(),
+                    generation: 1,
+                    revision: 1,
+                    reason: String::new(),
+                    code: String::new(),
+                },
+            ),
+            DirectControlCompletion::Accepted
+        );
+        assert_eq!(
+            bind_completion.unwrap().await.unwrap().binding_id,
+            "binding"
+        );
+    }
+
+    #[test]
+    fn typed_direct_control_routes_reject_empty_or_mismatched_targets_before_ownership() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        for (target_node_id, frame) in [
+            ("", direct_control_frame("empty-bind-target")),
+            (
+                "other-destination",
+                direct_control_frame("mismatched-bind-target"),
+            ),
+            ("", challenge_control_frame("empty-challenge-target")),
+            (
+                "other-destination",
+                challenge_control_frame("mismatched-challenge-target"),
+            ),
+        ] {
+            let (delivery, completion_present) = if frame.nodescale_identity_bind_v1.is_some() {
+                let (delivery, completion) = runtime
+                    .route_nodescale_identity_bind_waiting_for_completion(target_node_id, frame);
+                (delivery, completion.is_some())
+            } else {
+                let (delivery, completion) = runtime
+                    .route_nodescale_identity_challenge_waiting_for_completion(
+                        target_node_id,
+                        frame,
+                    );
+                (delivery, completion.is_some())
+            };
+            assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+            assert!(!completion_present);
+            assert_eq!(runtime.mailbox_depth("destination"), 0);
+            assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+            let guard = runtime.lock_peers();
+            assert!(guard.frame_destinations.is_empty());
+            assert!(guard.direct_control_waiters.is_empty());
+            assert!(guard.challenge_control_waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_control_routes_reject_task_or_result_mixed_frames_without_ownership() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+
+        let mut bind_with_task = direct_control_frame("bind-with-task");
+        bind_with_task.task = Some(task("mixed-bind-task"));
+        let (delivery, receiver) = runtime
+            .route_nodescale_identity_bind_waiting_for_completion("destination", bind_with_task);
+        assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+        assert!(receiver.is_none());
+
+        let mut bind_with_result = direct_control_frame("bind-with-result");
+        bind_with_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let (delivery, receiver) = runtime
+            .route_nodescale_identity_bind_waiting_for_completion("destination", bind_with_result);
+        assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+        assert!(receiver.is_none());
+
+        let mut challenge_with_task = challenge_control_frame("challenge-with-task");
+        challenge_with_task.task = Some(task("mixed-challenge-task"));
+        let (delivery, receiver) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                "destination",
+                challenge_with_task,
+            );
+        assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+        assert!(receiver.is_none());
+
+        let mut challenge_with_result = challenge_control_frame("challenge-with-result");
+        challenge_with_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+        let (delivery, receiver) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                "destination",
+                challenge_with_result,
+            );
+        assert_eq!(delivery, FrameDelivery::RejectedInvalid);
+        assert!(receiver.is_none());
+
+        assert_eq!(runtime.mailbox_depth("destination"), 0);
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+        let guard = runtime.lock_peers();
+        assert!(guard.direct_control_waiters.is_empty());
+        assert!(guard.challenge_control_waiters.is_empty());
+        assert!(guard.frame_destinations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_mixed_control_frames_and_challenge_restart_cleanup_are_fail_closed() {
+        let runtime = RelayRuntime::new("relay");
+        let mut malformed = direct_control_frame("mixed-frame");
+        malformed.nodescale_identity_challenge_v1 =
+            challenge_control_frame("unused").nodescale_identity_challenge_v1;
+        assert_eq!(
+            runtime
+                .route_nodescale_identity_bind_waiting_for_completion(
+                    "destination",
+                    malformed.clone()
+                )
+                .0,
+            FrameDelivery::RejectedInvalid
+        );
+        assert_eq!(
+            runtime
+                .route_nodescale_identity_challenge_waiting_for_completion("destination", malformed)
+                .0,
+            FrameDelivery::RejectedInvalid
+        );
+        assert_eq!(runtime.mailbox_depth("destination"), 0);
+
+        let (delivery, completion) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                "destination",
+                challenge_control_frame("restart-challenge-frame"),
+            );
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        drop(runtime);
+        assert!(completion.unwrap().await.is_err());
+    }
+
+    #[test]
+    fn abandoning_a_challenge_frame_is_scoped_and_releases_capacity() {
+        let runtime = RelayRuntime::new("relay");
+        let (delivery, completion) = runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                "destination",
+                challenge_control_frame("abandoned-challenge-frame"),
+            );
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        runtime.abandon_frame("destination", "abandoned-challenge-frame");
+        assert_eq!(runtime.mailbox_depth("destination"), 0);
+        assert_eq!(
+            runtime.ack_frame("destination", "abandoned-challenge-frame"),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert!(completion.unwrap().try_recv().is_err());
     }
 
     #[test]

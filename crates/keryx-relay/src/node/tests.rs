@@ -141,7 +141,9 @@ fn transient_result_delivery_failures_dead_letter_on_the_tenth_attempt() {
 struct RecordingDirectHandler {
     calls: Mutex<
         Vec<(
-            AuthenticatedDirectContext,
+            String,
+            String,
+            String,
             keryx_proto::v1::NodescaleIdentityBindV1,
         )>,
     >,
@@ -154,7 +156,12 @@ impl NodescaleIdentityBindHandler for RecordingDirectHandler {
         context: AuthenticatedDirectContext,
         operation: keryx_proto::v1::NodescaleIdentityBindV1,
     ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityBindResult> {
-        self.calls.lock().unwrap().push((context, operation));
+        self.calls.lock().unwrap().push((
+            context.authenticated_source_node_id().to_string(),
+            context.destination_node_id().to_string(),
+            context.relay_frame_id().to_string(),
+            operation,
+        ));
         Ok(keryx_proto::v1::NodescaleIdentityBindResult {
             disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
             accepted: true,
@@ -168,6 +175,70 @@ impl NodescaleIdentityBindHandler for RecordingDirectHandler {
 }
 
 struct FailingDirectHandler;
+
+struct FailingChallengeHandler;
+
+struct HangingChallengeHandler;
+
+#[derive(Default)]
+struct RecordingChallengeHandler {
+    calls: Mutex<
+        Vec<(
+            String,
+            String,
+            String,
+            keryx_proto::v1::NodescaleIdentityChallengeV1,
+        )>,
+    >,
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityChallengeHandler for RecordingChallengeHandler {
+    async fn handle_nodescale_identity_challenge(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: keryx_proto::v1::NodescaleIdentityChallengeV1,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityChallengeResult> {
+        self.calls.lock().unwrap().push((
+            context.authenticated_source_node_id().to_string(),
+            context.destination_node_id().to_string(),
+            context.relay_frame_id().to_string(),
+            operation,
+        ));
+        Ok(keryx_proto::v1::NodescaleIdentityChallengeResult {
+            disposition: keryx_proto::v1::NodescaleIdentityChallengeDisposition::Issued as i32,
+            accepted: true,
+            challenge_id: "challenge".to_string(),
+            challenge_secret: "test-only-secret".to_string(),
+            binding_generation: 1,
+            expires_at_unix_ms: 1,
+            reason: String::new(),
+            code: String::new(),
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityChallengeHandler for FailingChallengeHandler {
+    async fn handle_nodescale_identity_challenge(
+        &self,
+        _context: AuthenticatedDirectContext,
+        _operation: keryx_proto::v1::NodescaleIdentityChallengeV1,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityChallengeResult> {
+        anyhow::bail!("synthetic challenge handler failure")
+    }
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityChallengeHandler for HangingChallengeHandler {
+    async fn handle_nodescale_identity_challenge(
+        &self,
+        _context: AuthenticatedDirectContext,
+        _operation: keryx_proto::v1::NodescaleIdentityChallengeV1,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityChallengeResult> {
+        std::future::pending().await
+    }
+}
 
 #[tonic::async_trait]
 impl NodescaleIdentityBindHandler for FailingDirectHandler {
@@ -187,12 +258,17 @@ async fn typed_direct_handler_receives_exact_context_and_is_deterministic_withou
     let handler = Arc::new(RecordingDirectHandler::default());
     let handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: Some(handler.clone()),
+        nodescale_identity_challenge_v1: None,
     };
-    let context = AuthenticatedDirectContext {
+    let context = AuthenticatedDirectContext::from_authenticated_relay_frame(&RelayFrame {
+        frame_id: "frame".to_string(),
+        task: None,
+        result: None,
         authenticated_source_node_id: "source".to_string(),
         destination_node_id: "destination".to_string(),
-        relay_frame_id: "frame".to_string(),
-    };
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    });
     let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
         operation_id: "operation".to_string(),
         network_id: "network".to_string(),
@@ -213,17 +289,37 @@ async fn typed_direct_handler_receives_exact_context_and_is_deterministic_withou
     assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
     let calls = handler.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], (context.clone(), operation.clone()));
-    assert_eq!(calls[1], (context, operation));
+    assert_eq!(
+        calls[0],
+        (
+            "source".to_string(),
+            "destination".to_string(),
+            "frame".to_string(),
+            operation.clone(),
+        )
+    );
+    assert_eq!(
+        calls[1],
+        (
+            "source".to_string(),
+            "destination".to_string(),
+            "frame".to_string(),
+            operation,
+        )
+    );
 }
 
 #[tokio::test]
 async fn typed_direct_handler_absence_or_failure_returns_error_without_task_fallback() {
-    let context = AuthenticatedDirectContext {
+    let context = AuthenticatedDirectContext::from_authenticated_relay_frame(&RelayFrame {
+        frame_id: "frame".to_string(),
+        task: None,
+        result: None,
         authenticated_source_node_id: "source".to_string(),
         destination_node_id: "destination".to_string(),
-        relay_frame_id: "frame".to_string(),
-    };
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    });
     let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
         operation_id: "operation".to_string(),
         network_id: "network".to_string(),
@@ -243,12 +339,346 @@ async fn typed_direct_handler_absence_or_failure_returns_error_without_task_fall
     assert!(dispatch_nodescale_identity_bind_v1(
         &DirectControlHandlers {
             nodescale_identity_bind_v1: Some(Arc::new(FailingDirectHandler)),
+            nodescale_identity_challenge_v1: None,
         },
         context,
         operation,
     )
     .await
     .is_err());
+}
+
+#[tokio::test]
+async fn challenge_handler_receives_authenticated_context_without_task_routing() {
+    let runtime = RelayRuntime::new("challenge-handler-test");
+    let before = runtime.metrics().snapshot().tasks_routed;
+    let handler = Arc::new(RecordingChallengeHandler::default());
+    let typed_handler: Arc<dyn NodescaleIdentityChallengeHandler> = handler.clone();
+    let handlers = DirectControlHandlers {
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: Some(typed_handler),
+    };
+    let context = AuthenticatedDirectContext::from_authenticated_relay_frame(&RelayFrame {
+        frame_id: "challenge-frame".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "relay-authenticated-source".to_string(),
+        destination_node_id: "destination".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    });
+    let operation = keryx_proto::v1::NodescaleIdentityChallengeV1 {
+        operation_id: "challenge-operation".to_string(),
+        network_id: "network".to_string(),
+        device_id: "device".to_string(),
+        join_session_id: "session".to_string(),
+        agent_version: "v1".to_string(),
+    };
+    let result =
+        dispatch_nodescale_identity_challenge_v1(&handlers, context.clone(), operation.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        result.disposition,
+        keryx_proto::v1::NodescaleIdentityChallengeDisposition::Issued as i32
+    );
+    assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+    assert_eq!(
+        handler.calls.lock().unwrap().as_slice(),
+        &[(
+            "relay-authenticated-source".to_string(),
+            "destination".to_string(),
+            "challenge-frame".to_string(),
+            operation,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn failed_or_hung_challenge_handler_returns_secret_free_rejection_and_allows_next_frame() {
+    fn challenge_frame(frame_id: &str) -> RelayFrame {
+        RelayFrame {
+            frame_id: frame_id.to_string(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: Some(keryx_proto::v1::NodescaleIdentityChallengeV1 {
+                operation_id: format!("operation-{frame_id}"),
+                network_id: "network".to_string(),
+                device_id: "device".to_string(),
+                join_session_id: "session".to_string(),
+                agent_version: "v1".to_string(),
+            }),
+        }
+    }
+
+    for (handler, expected_code) in [
+        (
+            Arc::new(FailingChallengeHandler) as Arc<dyn NodescaleIdentityChallengeHandler>,
+            "handler_failed",
+        ),
+        (
+            Arc::new(HangingChallengeHandler) as Arc<dyn NodescaleIdentityChallengeHandler>,
+            "handler_timeout",
+        ),
+    ] {
+        let handlers = DirectControlHandlers {
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: Some(handler),
+        };
+        let dispatch = dispatch_relay_typed_control_for_local_bounded(
+            &handlers,
+            "destination",
+            &challenge_frame(expected_code),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        let Some(LocalTypedControlDispatch::Challenge(rejection)) = dispatch else {
+            panic!("challenge failure must produce a typed rejection");
+        };
+        assert_eq!(
+            rejection.disposition,
+            keryx_proto::v1::NodescaleIdentityChallengeDisposition::Rejected as i32
+        );
+        assert!(!rejection.accepted);
+        assert!(rejection.challenge_id.is_empty());
+        assert!(rejection.challenge_secret.is_empty());
+        assert_eq!(rejection.code, expected_code);
+    }
+
+    let later_task = RelayFrame {
+        frame_id: "later-task".to_string(),
+        task: Some(TaskEnvelope::default()),
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    };
+    assert!(dispatch_relay_typed_control_for_local_bounded(
+        &DirectControlHandlers::default(),
+        "destination",
+        &later_task,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap()
+    .is_none());
+}
+
+#[tokio::test]
+async fn direct_control_settlement_timeout_is_bounded() {
+    let timeout_error = await_bounded_direct_control_settlement(
+        std::future::pending::<anyhow::Result<()>>(),
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(timeout_error
+        .to_string()
+        .contains("typed direct-control completion timed out"));
+
+    await_bounded_direct_control_settlement(async { Ok(()) }, Duration::from_millis(50))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn node_rejects_a_malformed_frame_with_both_control_payloads() {
+    let frame = RelayFrame {
+        frame_id: "mixed-control-frame".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1 {
+            operation_id: "bind-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            binding_nonce: "nonce".to_string(),
+            binding_generation: 1,
+            agent_version: "v1".to_string(),
+        }),
+        nodescale_identity_challenge_v1: Some(keryx_proto::v1::NodescaleIdentityChallengeV1 {
+            operation_id: "challenge-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            agent_version: "v1".to_string(),
+        }),
+    };
+
+    assert!(validate_relay_frame_exactly_one_payload(&frame).is_err());
+}
+
+#[tokio::test]
+async fn edge_rejects_zero_and_multi_payload_frames_before_task_result_or_control_dispatch() {
+    let handlers = DirectControlHandlers::default();
+    let mut task_and_result = RelayFrame {
+        frame_id: "task-and-result".to_string(),
+        task: Some(TaskEnvelope::default()),
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "registered-local".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    };
+    task_and_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
+    let zero_payload = RelayFrame {
+        frame_id: "zero-payload".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "registered-local".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: None,
+    };
+
+    for frame in [task_and_result, zero_payload] {
+        assert!(
+            dispatch_relay_typed_control_for_local(&handlers, "registered-local", &frame)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn edge_fails_closed_when_exact_destination_challenge_handler_is_absent() {
+    let frame = RelayFrame {
+        frame_id: "challenge-without-handler".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "registered-local".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: Some(keryx_proto::v1::NodescaleIdentityChallengeV1 {
+            operation_id: "challenge-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            agent_version: "v1".to_string(),
+        }),
+    };
+
+    let error = match dispatch_relay_typed_control_for_local(
+        &DirectControlHandlers::default(),
+        "registered-local",
+        &frame,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => {
+            panic!("the absent handler must prevent completion, result, secret, or task fallback")
+        }
+    };
+    assert!(error
+        .to_string()
+        .contains("challenge handler is not installed"));
+    assert!(!error.to_string().contains("challenge_secret"));
+}
+
+#[tokio::test]
+async fn edge_rejects_typed_direct_destination_mismatch_before_handlers_issue_results() {
+    let bind_handler = Arc::new(RecordingDirectHandler::default());
+    let bind_handlers = DirectControlHandlers {
+        nodescale_identity_bind_v1: Some(bind_handler.clone()),
+        nodescale_identity_challenge_v1: None,
+    };
+    let bind_frame = RelayFrame {
+        frame_id: "wrong-bind-destination".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "another-registered-node".to_string(),
+        nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1 {
+            operation_id: "bind-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            binding_nonce: "nonce".to_string(),
+            binding_generation: 1,
+            agent_version: "v1".to_string(),
+        }),
+        nodescale_identity_challenge_v1: None,
+    };
+    let outcome =
+        dispatch_relay_typed_control_for_local(&bind_handlers, "registered-local", &bind_frame)
+            .await;
+    assert!(outcome.is_err());
+    let error = outcome.err().expect("mismatched direct control must fail");
+    assert!(!error.to_string().contains("test-only-secret"));
+    assert!(bind_handler.calls.lock().unwrap().is_empty());
+
+    let challenge_handler = Arc::new(RecordingChallengeHandler::default());
+    let challenge_handlers = DirectControlHandlers {
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: Some(challenge_handler.clone()),
+    };
+    let challenge_frame = RelayFrame {
+        frame_id: "wrong-challenge-destination".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "another-registered-node".to_string(),
+        nodescale_identity_bind_v1: None,
+        nodescale_identity_challenge_v1: Some(keryx_proto::v1::NodescaleIdentityChallengeV1 {
+            operation_id: "challenge-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            agent_version: "v1".to_string(),
+        }),
+    };
+    let outcome = dispatch_relay_typed_control_for_local(
+        &challenge_handlers,
+        "registered-local",
+        &challenge_frame,
+    )
+    .await;
+    assert!(outcome.is_err());
+    let error = outcome
+        .err()
+        .expect("mismatched challenge control must fail");
+    assert!(!error.to_string().contains("test-only-secret"));
+    assert!(challenge_handler.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edge_dispatches_typed_direct_control_only_for_its_exact_registered_destination() {
+    let handler = Arc::new(RecordingDirectHandler::default());
+    let handlers = DirectControlHandlers {
+        nodescale_identity_bind_v1: Some(handler.clone()),
+        nodescale_identity_challenge_v1: None,
+    };
+    let frame = RelayFrame {
+        frame_id: "local-bind-destination".to_string(),
+        task: None,
+        result: None,
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "registered-local".to_string(),
+        nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1 {
+            operation_id: "bind-operation".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            join_session_id: "session".to_string(),
+            binding_nonce: "nonce".to_string(),
+            binding_generation: 1,
+            agent_version: "v1".to_string(),
+        }),
+        nodescale_identity_challenge_v1: None,
+    };
+
+    assert!(matches!(
+        dispatch_relay_typed_control_for_local(&handlers, "registered-local", &frame).await,
+        Ok(Some(_))
+    ));
+    assert_eq!(handler.calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -372,11 +802,12 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
             ORIGIN,
             RelayFrame {
                 frame_id: format!("capacity-frame-{index}"),
-                task: None,
+                task: Some(TaskEnvelope::default()),
                 result: None,
                 authenticated_source_node_id: EXECUTOR.to_string(),
                 destination_node_id: ORIGIN.to_string(),
                 nodescale_identity_bind_v1: None,
+                nodescale_identity_challenge_v1: None,
             },
         );
     }
