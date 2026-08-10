@@ -71,14 +71,13 @@ function_names = [
     "temporary_daemon_failure_does_not_ack_and_retries_after_recovery",
 ]
 
-configured = 0
+configured = [0]
 raw_clients = 0
 for name in function_names:
     start, end, block = function_block(tests, name)
 
     def add_token(match: re.Match[str]) -> str:
-        nonlocal configured
-        configured += 1
+        configured[0] += 1
         indent = match.group("indent")
         expr = match.group("expr")
         return (
@@ -96,8 +95,8 @@ for name in function_names:
     block = block.replace("KeryxDaemonClient::connect(", "connect_authenticated_daemon(")
     tests = tests[:start] + block + tests[end:]
 
-if configured != 6:
-    raise SystemExit(f"expected six daemon runtime token insertions, found {configured}")
+if configured[0] != 6:
+    raise SystemExit(f"expected six daemon runtime token insertions, found {configured[0]}")
 if raw_clients != 2:
     raise SystemExit(f"expected two raw daemon client replacements, found {raw_clients}")
 if "KeryxDaemonClient::connect(" in "\n".join(function_block(tests, name)[2] for name in function_names):
