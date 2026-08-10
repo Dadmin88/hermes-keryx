@@ -38,6 +38,7 @@ jobs:
           set -euo pipefail
           python scripts/reconcile_unified_daemon_auth.py
           python scripts/repair_generated_routing_test.py
+          python scripts/repair_current_relay_target_contract.py
           python scripts/repair_worker_loop_auth.py
           python scripts/repair_health_probe_auth.py
           python scripts/repair_lease_recovery_auth.py
@@ -80,6 +81,7 @@ jobs:
           git config user.email "keryx-security-reconciliation@users.noreply.github.com"
           git rm scripts/reconcile_unified_daemon_auth.py
           git rm scripts/repair_generated_routing_test.py
+          git rm scripts/repair_current_relay_target_contract.py
           git rm scripts/repair_worker_loop_auth.py
           git rm scripts/repair_health_probe_auth.py
           git rm scripts/repair_lease_recovery_auth.py
