@@ -86,9 +86,9 @@ impl Allowlist {
             }
             if let Some(key_b64) = entry.ed25519_public_key_b64 {
                 let bytes = base64_decode_32(&key_b64)?;
-                let keypair = identity::Keypair::ed25519_from_bytes(bytes)
+                let public_key = identity::ed25519::PublicKey::try_from_bytes(&bytes)
                     .context("invalid ed25519 public key bytes")?;
-                peers.insert(keypair.public().to_peer_id());
+                peers.insert(identity::PublicKey::from(public_key).to_peer_id());
                 continue;
             }
             anyhow::bail!("allowlist entry must set peer_id or ed25519_public_key_b64");
@@ -353,6 +353,37 @@ mod tests {
         let list = Allowlist::load(&path, EmptyAllowlistPolicy::Deny).unwrap();
         assert!(list.is_allowed(&peer));
         assert!(!list.is_allowed(&test_keypair(10).public().to_peer_id()));
+    }
+
+    #[test]
+    fn loads_ed25519_public_keys_from_toml_without_treating_them_as_seeds() {
+        use base64::Engine;
+
+        let legitimate_keypair = test_keypair(19);
+        let legitimate_public_key = legitimate_keypair.public();
+        let legitimate_peer = legitimate_public_key.to_peer_id();
+        let public_key_bytes = legitimate_public_key
+            .try_into_ed25519()
+            .expect("test key is ed25519")
+            .to_bytes();
+        let seed_derived_attacker_peer = identity::Keypair::ed25519_from_bytes(public_key_bytes)
+            .expect("public key bytes are also accepted as an ed25519 seed")
+            .public()
+            .to_peer_id();
+        assert_ne!(legitimate_peer, seed_derived_attacker_peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allow.toml");
+        let encoded_public_key = base64::engine::general_purpose::STANDARD.encode(public_key_bytes);
+        std::fs::write(
+            &path,
+            format!("[[allowed]]\ned25519_public_key_b64 = \"{encoded_public_key}\"\n"),
+        )
+        .unwrap();
+
+        let list = Allowlist::load(&path, EmptyAllowlistPolicy::Deny).unwrap();
+        assert!(list.is_allowed(&legitimate_peer));
+        assert!(!list.is_allowed(&seed_derived_attacker_peer));
     }
 
     #[test]
