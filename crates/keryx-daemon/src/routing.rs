@@ -14,6 +14,18 @@ use tonic::transport::Channel;
 use tonic::Status;
 use tracing::{info, instrument, warn};
 
+const RELAY_TARGET_METADATA_KEYS: &[&str] = &[
+    "target_node_id",
+    "target_node",
+    "recipient_node_id",
+    "recipient_node",
+    "destination_node_id",
+    "destination_node",
+    "node_id",
+    "keryx.target_node_id",
+];
+const CANONICAL_RELAY_TARGET_METADATA_KEY: &str = "keryx.target_node_id";
+
 /// Default outbound delivery timeout when callers omit `timeout_ms`.
 pub const DEFAULT_SEND_TASK_TIMEOUT_MS: u64 = 30_000;
 
@@ -141,10 +153,7 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         mut envelope: TaskEnvelope,
         _timeout: Duration,
     ) -> Result<(), RoutingError> {
-        envelope
-            .metadata
-            .entry("keryx.target_node_id".to_string())
-            .or_insert_with(|| target_peer_id.as_str().to_string());
+        canonicalize_relay_target_metadata(&mut envelope, target_peer_id);
         let mut client = self.connect(target_peer_id).await?;
         client
             .publish_task(PublishTaskRequest {
@@ -556,13 +565,13 @@ impl TaskRouter {
             });
         }
 
-        let publisher = Arc::clone(&*self.publisher.read().await);
-        if !self.peers.is_routable(&target_peer_id).await && !publisher.is_configured() {
+        if !self.peers.is_routable(&target_peer_id).await {
             return Err(RoutingError::UnknownPeer {
                 peer_id: target_peer_id.to_string(),
             });
         }
 
+        let publisher = Arc::clone(&*self.publisher.read().await);
         let timeout = normalize_timeout(timeout_ms, self.default_timeout_ms);
         let delivery = tokio::time::timeout(
             timeout,
@@ -619,6 +628,16 @@ async fn accept_local_task(
         task_id,
         status: task_status_label(accepted.status).to_string(),
     })
+}
+
+fn canonicalize_relay_target_metadata(envelope: &mut TaskEnvelope, target_peer_id: &PeerId) {
+    for key in RELAY_TARGET_METADATA_KEYS {
+        envelope.metadata.remove(*key);
+    }
+    envelope.metadata.insert(
+        CANONICAL_RELAY_TARGET_METADATA_KEY.to_string(),
+        target_peer_id.as_str().to_string(),
+    );
 }
 
 fn envelope_capability_id(envelope: &TaskEnvelope) -> Option<String> {

@@ -215,13 +215,13 @@ async fn send_task_relay_timeout_maps_to_deadline_exceeded() {
 }
 
 #[tokio::test]
-async fn send_task_with_configured_relay_publisher_routes_unconnected_peer() {
+async fn send_task_with_configured_relay_publisher_rejects_unknown_peer() {
     let mut harness = RpcTestHarness::start().await;
     let mock = Arc::new(MockRelayPublisher::new());
     harness.runtime.router().set_publisher(mock.clone()).await;
     let remote = PeerId::new("node-relay-mailbox").unwrap();
 
-    let response = harness
+    let error = harness
         .client
         .send_task(SendTaskRequest {
             target_peer_id: remote.to_string(),
@@ -229,12 +229,10 @@ async fn send_task_with_configured_relay_publisher_routes_unconnected_peer() {
             timeout_ms: 5_000,
         })
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap_err();
 
-    assert_eq!(response.delivery_route, "relay");
-    assert_eq!(response.status, "delivered");
-    assert_eq!(mock.call_count(), 1);
+    assert_eq!(error.code(), Code::NotFound);
+    assert_eq!(mock.call_count(), 0);
     let peers = harness
         .client
         .list_peers(ListPeersRequest {})
@@ -288,6 +286,32 @@ async fn grpc_relay_task_publisher_publishes_to_relay_mailbox() {
         .unwrap();
 
     assert_eq!(runtime.mailbox_depth(remote.as_str()), 1);
+}
+
+#[tokio::test]
+async fn grpc_relay_task_publisher_canonicalizes_target_metadata() {
+    let runtime = RelayRuntime::new("relay-publisher-canonical-target-test");
+    runtime.mark_transport_listening();
+    let addr = spawn_relay(Arc::clone(&runtime)).await;
+    let publisher = GrpcRelayTaskPublisher::new(format!("http://{addr}"));
+    let remote = PeerId::new("node-grpc-canonical").unwrap();
+    let mut poisoned = envelope("route-grpc-canonical");
+    poisoned
+        .metadata
+        .insert("target_node_id".to_string(), "node-grpc-victim".to_string());
+    poisoned.metadata.insert(
+        "keryx.target_node_id".to_string(),
+        "node-grpc-spoofed".to_string(),
+    );
+
+    publisher
+        .deliver_task(&remote, poisoned, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.mailbox_depth(remote.as_str()), 1);
+    assert_eq!(runtime.mailbox_depth("node-grpc-victim"), 0);
+    assert_eq!(runtime.mailbox_depth("node-grpc-spoofed"), 0);
 }
 
 #[tokio::test]
