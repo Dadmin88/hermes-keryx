@@ -830,6 +830,11 @@ impl KeryxDaemonRuntime {
             .limits()
             .check_pending_tasks(pending_count)
             .map_err(|error| StoreError::Validation(error.into()))?;
+        let retained_bytes = self.store.retained_task_envelope_bytes().await?;
+        self.config
+            .limits()
+            .check_retained_envelope_bytes(retained_bytes, envelope.encoded_envelope.len() as u64)
+            .map_err(|error| StoreError::Validation(error.into()))?;
         let accepted = self
             .store
             .accept_task_with_envelope(record, envelope)
@@ -866,6 +871,11 @@ impl KeryxDaemonRuntime {
         self.config
             .limits()
             .check_pending_tasks(pending_count)
+            .map_err(|error| StoreError::Validation(error.into()))?;
+        let retained_bytes = self.store.retained_task_envelope_bytes().await?;
+        self.config
+            .limits()
+            .check_retained_envelope_bytes(retained_bytes, envelope.encoded_envelope.len() as u64)
             .map_err(|error| StoreError::Validation(error.into()))?;
         let accepted = self
             .store
@@ -1212,8 +1222,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let task_id = parse_required_task_id(envelope.task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let idempotency_key = parse_optional_idempotency_key(envelope.idempotency_key.as_ref())?;
-        let encoded_envelope = envelope.encode_to_vec();
-        let envelope_bytes = encoded_envelope.len() as u64;
+        let envelope_bytes = envelope.encoded_len() as u64;
         self.runtime
             .config()
             .limits()
@@ -1222,7 +1231,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let mut record = TaskRecord::new(task_id.clone(), TaskStatus::Pending, idempotency_key);
         record.deadline_ms = deadline_from_envelope(&envelope)?;
         let envelope_record =
-            TaskEnvelopeRecord::new(task_id.clone(), encoded_envelope, unix_ms_now());
+            TaskEnvelopeRecord::new(task_id.clone(), envelope.encode_to_vec(), unix_ms_now());
         let accepted = self
             .runtime
             .accept_pending_task_with_envelope_backpressure(record, envelope_record)

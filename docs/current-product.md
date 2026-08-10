@@ -97,6 +97,8 @@ The current schema version is `7`.
 
 The complete protobuf envelope is persisted atomically with task acceptance, which means nested messages, raw bytes, metadata maps, correlation identifiers, and capability hints survive daemon restart. Idempotent retries must agree with the stored task and envelope; conflicting bytes fail closed.
 
+Task admission enforces both a per-envelope encoded-size limit and an aggregate retained-envelope byte limit. The retained-envelope limit defaults to `256 MiB` and can be set to `0` only to opt into unlimited retained-envelope storage.
+
 The store treats the encoded envelope as opaque transport data. Protobuf encoding and decoding remain daemon/SDK responsibilities rather than leaking protocol types into the persistence boundary.
 
 ## Cross-node task delivery

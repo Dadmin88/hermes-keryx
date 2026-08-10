@@ -361,9 +361,9 @@ Triggered by SIGINT (`Ctrl+C`) in `keryxd` when the RPC listener is active.
 
 ### SubmitTask rejected by limits
 
-**Cause:** pending task count is at/above `max_pending_tasks` or envelope bytes exceed `max_envelope_bytes`.
+**Cause:** pending task count is at/above `max_pending_tasks`, envelope bytes exceed `max_envelope_bytes`, or retained durable envelope bytes would exceed the aggregate retained-envelope limit.
 
-**Action:** claim/drain pending work, increase limits in embedded config, or use `LimitsConfig::unlimited()` in tests. The current binary uses default limits until external config wiring is added.
+**Action:** claim/drain pending work, prune/recreate local test stores when retained completed envelopes are intentionally disposable, increase limits in embedded config, or use `LimitsConfig::unlimited()` in tests. The current binary uses default limits until external config wiring is added.
 
 ### Artifact upload rejected
 
