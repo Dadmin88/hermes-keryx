@@ -45,6 +45,7 @@ jobs:
           python scripts/repair_fail_retry_auth.py
           python scripts/repair_relay_node_daemon_auth.py
           python scripts/repair_python_daemon_channel_auth_fixture.py
+          python scripts/repair_e2e_daemon_auth.py
           bash sdk/python/scripts/generate_protos.sh
           cargo fmt --all
 
@@ -87,6 +88,7 @@ jobs:
           git rm scripts/repair_fail_retry_auth.py
           git rm scripts/repair_relay_node_daemon_auth.py
           git rm scripts/repair_python_daemon_channel_auth_fixture.py
+          git rm scripts/repair_e2e_daemon_auth.py
           git rm .github/workflows/reconcile-unified-daemon-auth.yml
           git add -A
           git diff --cached --check
