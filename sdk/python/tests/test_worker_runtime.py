@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hermes.keryx.v1 import common_pb2, daemon_pb2, task_pb2
-from keryx import AgentCard, KeryxNode, Skill
+from keryx import AgentCard, KeryxConfig, KeryxNode, Skill
 from keryx.task import Artifact, Part
 
 
@@ -95,6 +95,7 @@ def running_node(stub: Stub, **kwargs) -> KeryxNode:
         card,
         daemon_stub=stub,
         worker_id="worker-runtime",
+        config=KeryxConfig(claim_next_token="test-claim-token-123456"),
         **kwargs,
     )
     node._client = SimpleNamespace(close=AsyncMock())
@@ -138,6 +139,7 @@ async def test_worker_dispatches_full_task_and_completes() -> None:
 
     claim_request = stub.ClaimNextTask.await_args_list[0].args[0]
     assert list(claim_request.accepted_skill_ids) == ["backend"]
+    assert claim_request.claim_token == "test-claim-token-123456"
     complete_request = stub.CompleteTask.await_args.args[0]
     assert complete_request.result_metadata["result_text"] == "worker completed the task"
     assert complete_request.output_artifacts[0].path == "answer.txt"

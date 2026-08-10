@@ -1,8 +1,8 @@
 use anyhow::Result;
 use keryx_core::PeerId;
 use keryx_daemon::{
-    discovery_settings_from_env, relay_endpoint_from_env, serve_daemon_rpc, KeryxDaemonConfig,
-    KeryxDaemonRuntime,
+    claim_next_token_from_env, discovery_settings_from_env, relay_endpoint_from_env,
+    serve_daemon_rpc, KeryxDaemonConfig, KeryxDaemonRuntime,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ async fn main() -> Result<()> {
     }
     if let Some(relay_endpoint) = relay_endpoint_from_env() {
         config = config.with_relay_endpoint(Some(relay_endpoint));
+    }
+    if let Some(claim_next_token) = claim_next_token_from_env() {
+        config = config.with_claim_next_token(Some(claim_next_token));
     }
     let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await?);
     tracing::info!(

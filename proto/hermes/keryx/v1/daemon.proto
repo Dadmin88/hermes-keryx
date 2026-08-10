@@ -106,6 +106,8 @@ message ClaimNextTaskRequest {
   int64 lease_duration_ms = 4;
   // Zero returns immediately. Positive values are bounded by the daemon.
   int64 wait_timeout_ms = 5;
+  // Required bearer token for worker dequeue authorization.
+  string claim_token = 6;
 }
 
 message ClaimNextTaskResponse {

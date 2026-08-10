@@ -9,7 +9,9 @@ use keryx_proto::v1::{
 use keryx_store::{TaskEnvelopeRecord, TaskRecord};
 use prost::Message;
 use tempfile::tempdir;
-use tonic::Request;
+use tonic::{Code, Request};
+
+const CLAIM_TOKEN: &str = "test-claim-token-123456";
 
 fn envelope(task_id: &str, skill: &str) -> TaskEnvelope {
     TaskEnvelope {
@@ -34,6 +36,10 @@ fn envelope(task_id: &str, skill: &str) -> TaskEnvelope {
     }
 }
 
+fn config(data_dir: impl Into<std::path::PathBuf>) -> KeryxDaemonConfig {
+    KeryxDaemonConfig::new(data_dir, 0).with_claim_next_token(Some(CLAIM_TOKEN.to_string()))
+}
+
 fn claim_request(worker: &str, skills: &[&str], wait_timeout_ms: i64) -> ClaimNextTaskRequest {
     ClaimNextTaskRequest {
         worker_id: Some(AgentId {
@@ -43,6 +49,7 @@ fn claim_request(worker: &str, skills: &[&str], wait_timeout_ms: i64) -> ClaimNe
         accepted_capability_ids: Vec::new(),
         lease_duration_ms: 5_000,
         wait_timeout_ms,
+        claim_token: CLAIM_TOKEN.to_string(),
     }
 }
 
@@ -73,9 +80,52 @@ async fn direct_accept(
 }
 
 #[tokio::test]
-async fn claim_next_returns_no_work_without_waiting() {
+async fn claim_next_rejects_missing_claim_token() {
+    let dir = tempdir().unwrap();
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
+        .await
+        .unwrap();
+    direct_accept(&runtime, "task-secret", "ops", 1).await;
+    let service = KeryxDaemonRpcService::new(runtime);
+
+    let error = service
+        .claim_next_task(Request::new(ClaimNextTaskRequest {
+            worker_id: Some(AgentId {
+                value: "attacker-worker".into(),
+            }),
+            accepted_skill_ids: Vec::new(),
+            accepted_capability_ids: Vec::new(),
+            lease_duration_ms: 5_000,
+            wait_timeout_ms: 0,
+            claim_token: String::new(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn claim_next_rejects_when_daemon_token_is_not_configured() {
     let dir = tempdir().unwrap();
     let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path(), 0))
+        .await
+        .unwrap();
+    direct_accept(&runtime, "task-secret", "ops", 1).await;
+    let service = KeryxDaemonRpcService::new(runtime);
+
+    let error = service
+        .claim_next_task(Request::new(claim_request("worker-a", &["ops"], 0)))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn claim_next_returns_no_work_without_waiting() {
+    let dir = tempdir().unwrap();
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
         .await
         .unwrap();
     let service = KeryxDaemonRpcService::new(runtime);
@@ -91,7 +141,7 @@ async fn claim_next_returns_no_work_without_waiting() {
 #[tokio::test]
 async fn claim_next_selects_oldest_matching_envelope() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path(), 0))
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
         .await
         .unwrap();
     direct_accept(&runtime, "task-later", "backend", 20).await;
@@ -116,7 +166,7 @@ async fn claim_next_selects_oldest_matching_envelope() {
 #[tokio::test]
 async fn concurrent_workers_never_receive_the_same_task() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path(), 0))
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
         .await
         .unwrap();
     direct_accept(&runtime, "task-race", "backend", 1).await;
@@ -141,7 +191,7 @@ async fn concurrent_workers_never_receive_the_same_task() {
 #[tokio::test]
 async fn long_poll_wakes_after_submit() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path(), 0))
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
         .await
         .unwrap();
     let service = KeryxDaemonRpcService::new(runtime);
@@ -178,7 +228,7 @@ async fn long_poll_wakes_after_submit() {
 #[tokio::test]
 async fn stale_claim_is_recoverable_and_can_be_claimed_again() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(dir.path(), 0))
+    let runtime = KeryxDaemonRuntime::startup(config(dir.path()))
         .await
         .unwrap();
     direct_accept(&runtime, "task-recover", "ops", 1).await;
@@ -194,6 +244,7 @@ async fn stale_claim_is_recoverable_and_can_be_claimed_again() {
             accepted_capability_ids: Vec::new(),
             lease_duration_ms: 1,
             wait_timeout_ms: 0,
+            claim_token: CLAIM_TOKEN.to_string(),
         }))
         .await
         .unwrap()

@@ -181,6 +181,7 @@ Common variables:
 | `HERMES_KERYX_DAEMON_SKILLS` | daemon discovery | comma-separated daemon skills to register |
 | `HERMES_KERYX_NODE_SKILLS` | `keryx-node` | comma-separated edge-node skills to register |
 | `HERMES_KERYX_WORKER_ID` | Python SDK | default worker id for claim/heartbeat/complete/fail |
+| `HERMES_KERYX_CLAIM_NEXT_TOKEN` | daemon, Python SDK | required bearer token for `ClaimNextTask` worker dequeue |
 
 ## Validation commands
 

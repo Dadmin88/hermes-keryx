@@ -144,6 +144,7 @@ Environment variables:
 | `HERMES_KERYX_REGISTRY_ENDPOINT` / `KERYX_REGISTRY_ENDPOINT` | dual-run: `127.0.0.1:51053` | relay skill registry endpoint |
 | `HERMES_KERYX_RELAY_ENDPOINT` / `KERYX_RELAY_ENDPOINT` | unset | compatibility relay endpoint alias |
 | `HERMES_KERYX_WORKER_ID` / `KERYX_WORKER_ID` | unset | default worker id for claim/heartbeat/complete/fail |
+| `HERMES_KERYX_CLAIM_NEXT_TOKEN` / `KERYX_CLAIM_NEXT_TOKEN` | unset | bearer token sent with `ClaimNextTask`; must match daemon `HERMES_KERYX_CLAIM_NEXT_TOKEN` |
 | `HERMES_KERYX_DEFAULT_LEASE_DURATION_MS` / `KERYX_DEFAULT_LEASE_DURATION_MS` | `0` (daemon default) | claim/heartbeat lease duration |
 | `HERMES_KERYX_REQUEST_TIMEOUT_MS` / `KERYX_REQUEST_TIMEOUT_MS` | unset | caller-managed request timeout hint |
 

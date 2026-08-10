@@ -83,6 +83,7 @@ class KeryxNode:
                 registry_endpoint=registry_endpoint or loaded_config.registry_endpoint,
                 relay_endpoint=relay_endpoint or relay or loaded_config.relay_endpoint,
                 worker_id=worker_id or loaded_config.worker_id,
+                claim_next_token=loaded_config.claim_next_token,
                 default_lease_duration_ms=loaded_config.default_lease_duration_ms,
                 request_timeout_ms=loaded_config.request_timeout_ms,
             )
@@ -287,6 +288,7 @@ class KeryxNode:
                     else lease_duration_ms
                 ),
                 wait_timeout_ms=wait_timeout_ms,
+                claim_token=self._config.claim_next_token or "",
             )
         )
         return ClaimedTask.from_proto(response)

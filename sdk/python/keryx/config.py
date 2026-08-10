@@ -27,6 +27,7 @@ class KeryxConfig:
     registry_endpoint: str | None = None
     relay_endpoint: str | None = None
     worker_id: str | None = None
+    claim_next_token: str | None = None
     default_lease_duration_ms: int = 0
     request_timeout_ms: int | None = None
 
@@ -56,6 +57,11 @@ class KeryxConfig:
                 source,
                 "HERMES_KERYX_WORKER_ID",
                 "KERYX_WORKER_ID",
+            ),
+            claim_next_token=_first_env(
+                source,
+                "HERMES_KERYX_CLAIM_NEXT_TOKEN",
+                "KERYX_CLAIM_NEXT_TOKEN",
             ),
             default_lease_duration_ms=_first_int_env(
                 source,
@@ -99,6 +105,9 @@ class KeryxConfig:
             ),
             relay_endpoint=_optional_str(data.get("relay_endpoint") or relay.get("endpoint")),
             worker_id=_optional_str(data.get("worker_id") or worker.get("id")),
+            claim_next_token=_optional_str(
+                data.get("claim_next_token") or worker.get("claim_next_token")
+            ),
             default_lease_duration_ms=int(
                 data.get("default_lease_duration_ms")
                 or defaults.get("lease_duration_ms")
@@ -123,6 +132,10 @@ class KeryxConfig:
             changes["relay_endpoint"] = relay
         if worker := _first_env(source, "HERMES_KERYX_WORKER_ID", "KERYX_WORKER_ID"):
             changes["worker_id"] = worker
+        if token := _first_env(
+            source, "HERMES_KERYX_CLAIM_NEXT_TOKEN", "KERYX_CLAIM_NEXT_TOKEN"
+        ):
+            changes["claim_next_token"] = token
         lease = _first_optional_int_env(
             source,
             "HERMES_KERYX_DEFAULT_LEASE_DURATION_MS",

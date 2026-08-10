@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from keryx import ClaimedTask, KeryxNode
+from keryx import ClaimedTask, KeryxConfig, KeryxNode
 from hermes.keryx.v1 import common_pb2, daemon_pb2, task_pb2
 
 
@@ -29,7 +29,11 @@ async def test_claim_next_builds_request_and_returns_envelope() -> None:
             sender_peer_id="",
         )
     )
-    node = KeryxNode(daemon_stub=stub, worker_id="worker-next")
+    node = KeryxNode(
+        daemon_stub=stub,
+        worker_id="worker-next",
+        config=KeryxConfig(claim_next_token="test-claim-token-123456"),
+    )
 
     claimed = await node.claim_next(
         accepted_skill_ids=["backend"],
@@ -44,6 +48,7 @@ async def test_claim_next_builds_request_and_returns_envelope() -> None:
     assert request.worker_id.value == "worker-next"
     assert list(request.accepted_skill_ids) == ["backend"]
     assert request.wait_timeout_ms == 500
+    assert request.claim_token == "test-claim-token-123456"
 
 
 @pytest.mark.asyncio

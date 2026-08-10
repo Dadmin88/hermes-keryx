@@ -185,6 +185,7 @@ pub struct KeryxDaemonConfig {
     send_task_timeout_ms: u64,
     discovery: Option<DiscoverySettings>,
     relay_endpoint: Option<String>,
+    claim_next_token: Option<String>,
 }
 
 impl KeryxDaemonConfig {
@@ -206,6 +207,7 @@ impl KeryxDaemonConfig {
             send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
             discovery: None,
             relay_endpoint: None,
+            claim_next_token: None,
         }
     }
 
@@ -354,6 +356,19 @@ impl KeryxDaemonConfig {
     pub fn relay_endpoint(&self) -> Option<&str> {
         self.relay_endpoint.as_deref()
     }
+
+    #[must_use]
+    pub fn with_claim_next_token(mut self, claim_next_token: Option<String>) -> Self {
+        self.claim_next_token = claim_next_token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn claim_next_token(&self) -> Option<&str> {
+        self.claim_next_token.as_deref()
+    }
 }
 
 const RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
@@ -363,12 +378,21 @@ const DAEMON_SKILLS_ENV: &str = "HERMES_KERYX_DAEMON_SKILLS";
 const DAEMON_NAME_ENV: &str = "HERMES_KERYX_DAEMON_NAME";
 const DAEMON_DESCRIPTION_ENV: &str = "HERMES_KERYX_DAEMON_DESCRIPTION";
 const DAEMON_REGISTRATION_TTL_ENV: &str = "HERMES_KERYX_DAEMON_REGISTRATION_TTL_SECONDS";
+const CLAIM_NEXT_TOKEN_ENV: &str = "HERMES_KERYX_CLAIM_NEXT_TOKEN";
 
 /// Build relay task publishing endpoint from environment when configured.
 #[must_use]
 pub fn relay_endpoint_from_env() -> Option<String> {
     std::env::var(RELAY_ENDPOINT_ENV)
         .or_else(|_| std::env::var(RELAY_HEALTH_ENDPOINT_ENV))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[must_use]
+pub fn claim_next_token_from_env() -> Option<String> {
+    std::env::var(CLAIM_NEXT_TOKEN_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1180,6 +1204,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     ) -> Result<Response<ClaimNextTaskResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
         let inner = request.into_inner();
+        authorize_claim_next(self.runtime.config(), &inner.claim_token)?;
         let worker_id = parse_required_agent_id(inner.worker_id.as_ref())?;
         tracing::Span::current().record("worker_id", tracing::field::display(worker_id.as_str()));
         let accepted_skill_ids = normalized_filter_set(inner.accepted_skill_ids);
@@ -1601,6 +1626,35 @@ fn normalized_filter_set(values: Vec<String>) -> HashSet<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn authorize_claim_next(config: &KeryxDaemonConfig, presented_token: &str) -> Result<(), Status> {
+    let Some(expected_token) = config.claim_next_token() else {
+        return Err(Status::permission_denied(
+            "ClaimNextTask requires HERMES_KERYX_CLAIM_NEXT_TOKEN to be configured",
+        ));
+    };
+    if presented_token.trim().is_empty() {
+        return Err(Status::unauthenticated(
+            "ClaimNextTask claim_token is required",
+        ));
+    }
+    if !constant_time_eq(expected_token.as_bytes(), presented_token.as_bytes()) {
+        return Err(Status::permission_denied(
+            "ClaimNextTask claim_token is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 fn metadata_matches_any(
