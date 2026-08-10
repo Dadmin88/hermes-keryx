@@ -71,4 +71,82 @@ if transport.count(old_transport) != 2:
     )
 transport_path.write_text(transport.replace(old_transport, new_transport), encoding="utf-8")
 
+# Direct network-daemon CLI fixtures must configure the listener credential.
+# Status/doctor/node-status remain deliberately public RPCs, so those CLI calls
+# do not need the bearer token. Mutation/artifact CLI fixtures do.
+TEST_TOKEN = "keryx-cli-test-daemon-token"
+
+relay_cli_path = Path("crates/keryx-cli/tests/cli_relay_node.rs")
+relay_cli = relay_cli_path.read_text(encoding="utf-8")
+old_node_runtime = '''    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
+        dir.path().join("node-status-home"),
+        123,
+    ))
+    .await
+    .unwrap();
+'''
+new_node_runtime = f'''    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("node-status-home"), 123)
+            .with_daemon_rpc_token(Some("{TEST_TOKEN}".to_string())),
+    )
+    .await
+    .unwrap();
+'''
+if relay_cli.count(old_node_runtime) != 1:
+    raise SystemExit(f"expected one node-status direct daemon fixture, found {relay_cli.count(old_node_runtime)}")
+relay_cli_path.write_text(relay_cli.replace(old_node_runtime, new_node_runtime, 1), encoding="utf-8")
+
+client_path = Path("crates/keryx-cli/tests/daemon_client.rs")
+client = client_path.read_text(encoding="utf-8")
+
+# All three direct listeners in this file need an actual configured credential.
+runtime_patterns = [
+    ("cli-rpc-keryx-home", "123"),
+    ("cli-doctor-rpc-keryx-home", "123"),
+    ("cli-artifact-rpc-keryx-home", "123"),
+]
+for data_dir, now in runtime_patterns:
+    old_runtime = f'''    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
+        dir.path().join("{data_dir}"),
+        {now},
+    ))
+    .await
+    .unwrap();
+'''
+    new_runtime = f'''    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("{data_dir}"), {now})
+            .with_daemon_rpc_token(Some("{TEST_TOKEN}".to_string())),
+    )
+    .await
+    .unwrap();
+'''
+    if client.count(old_runtime) != 1:
+        raise SystemExit(f"expected one direct daemon fixture for {data_dir}, found {client.count(old_runtime)}")
+    client = client.replace(old_runtime, new_runtime, 1)
+
+# The generic argument helper is used only by sensitive task/artifact commands
+# in this file, so attach the same daemon token there. The simple status/doctor
+# helper intentionally remains token-free and proves those RPCs stay public.
+old_args_helper = '''fn run_keryx_args(args: &[&str], endpoint: String) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_keryx"))
+        .args(args)
+        .env("HERMES_KERYX_DAEMON_ENDPOINT", endpoint)
+        .output()
+        .unwrap()
+}
+'''
+new_args_helper = f'''fn run_keryx_args(args: &[&str], endpoint: String) -> std::process::Output {{
+    std::process::Command::new(env!("CARGO_BIN_EXE_keryx"))
+        .args(args)
+        .env("HERMES_KERYX_DAEMON_ENDPOINT", endpoint)
+        .env("HERMES_KERYX_DAEMON_TOKEN", "{TEST_TOKEN}")
+        .output()
+        .unwrap()
+}}
+'''
+if client.count(old_args_helper) != 1:
+    raise SystemExit(f"expected one daemon-client args helper, found {client.count(old_args_helper)}")
+client = client.replace(old_args_helper, new_args_helper, 1)
+client_path.write_text(client, encoding="utf-8")
+
 print("generated unified-auth integration fixtures repaired")
