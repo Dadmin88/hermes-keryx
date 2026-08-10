@@ -127,7 +127,7 @@ Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-re
 
 ### Typed Nodescale identity-binding control
 
-`nodescale.identity.bind.v1` is control traffic, not task traffic. A control-capable edge installs the public typed `NodescaleIdentityBindHandler` and advertises the `nodescale_identity_bind_v1` protocol feature. The edge can run this handler with a relay endpoint and no daemon endpoint; task or result frames still fail closed when no daemon is present.
+`nodescale.identity.bind.v1` is control traffic, not task traffic. A control-capable edge installs the public typed `NodescaleIdentityBindHandler` and advertises the `nodescale_identity_bind_v1` protocol feature. The edge can run this handler with a relay endpoint and no daemon endpoint. Only daemon-backed nodes advertise `daemon_task_consumer_v1`; the relay rejects task and result publications to destinations without that capability so unsupported frames cannot block their direct-control mailbox.
 
 Operational invariants:
 
