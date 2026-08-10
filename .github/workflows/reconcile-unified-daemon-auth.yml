@@ -38,6 +38,7 @@ jobs:
           set -euo pipefail
           python scripts/reconcile_unified_daemon_auth.py
           python scripts/repair_generated_routing_test.py
+          python scripts/repair_worker_loop_auth.py
           bash sdk/python/scripts/generate_protos.sh
           cargo fmt --all
 
@@ -73,6 +74,7 @@ jobs:
           git config user.email "keryx-security-reconciliation@users.noreply.github.com"
           git rm scripts/reconcile_unified_daemon_auth.py
           git rm scripts/repair_generated_routing_test.py
+          git rm scripts/repair_worker_loop_auth.py
           git rm .github/workflows/reconcile-unified-daemon-auth.yml
           git add -A
           git diff --cached --check
