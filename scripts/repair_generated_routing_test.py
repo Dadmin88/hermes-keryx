@@ -149,4 +149,27 @@ if client.count(old_args_helper) != 1:
 client = client.replace(old_args_helper, new_args_helper, 1)
 client_path.write_text(client, encoding="utf-8")
 
+# Discovery integration starts a real daemon listener but calls only the
+# deliberately public DiscoverSkills RPC. Configure the server credential while
+# keeping the raw client unauthenticated to preserve that contract in the test.
+discovery_path = Path("crates/keryx-daemon/tests/discovery_integration.rs")
+discovery = discovery_path.read_text(encoding="utf-8")
+old_discovery_config = '''    KeryxDaemonConfig::new(data_dir, 1)
+        .with_local_peer_id(PeerId::new(peer_id).unwrap())
+        .with_discovery(Some(settings))
+'''
+new_discovery_config = '''    KeryxDaemonConfig::new(data_dir, 1)
+        .with_local_peer_id(PeerId::new(peer_id).unwrap())
+        .with_discovery(Some(settings))
+        .with_daemon_rpc_token(Some("keryx-discovery-test-daemon-token".to_string()))
+'''
+if discovery.count(old_discovery_config) != 1:
+    raise SystemExit(
+        f"expected one discovery daemon config builder, found {discovery.count(old_discovery_config)}"
+    )
+discovery_path.write_text(
+    discovery.replace(old_discovery_config, new_discovery_config, 1),
+    encoding="utf-8",
+)
+
 print("generated unified-auth integration fixtures repaired")
