@@ -213,3 +213,7 @@ RFCs, ADRs, and migration documents may describe historical decisions. The curre
 ## License
 
 Hermes Keryx is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+### Local daemon RPC authorization
+
+When `keryxd` listens on `HERMES_KERYX_DAEMON_ADDR`, `HERMES_KERYX_DAEMON_TOKEN` is required. Sensitive reads, task/result dequeue, artifact access, task lifecycle mutation, remote ingress, and `SendTask` use the same `Authorization: Bearer ...` credential. Status, doctor, liveness, readiness, peer listing, and skill discovery remain read-only public-local diagnostics. Running-task cancellation also requires the exact active lease id and worker id; the daemon token alone does not grant lease ownership.

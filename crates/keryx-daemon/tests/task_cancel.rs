@@ -149,6 +149,8 @@ async fn remote_target_cancel_fails_closed_without_mutating_origin_state() {
             }),
             reason: "must not claim remote cancellation".to_string(),
             metadata: Default::default(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap_err();
@@ -207,6 +209,8 @@ async fn destination_cancel_emits_one_idempotent_canceled_result_delivery() {
             metadata: [("request".to_string(), "first".to_string())]
                 .into_iter()
                 .collect(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap()
@@ -251,6 +255,8 @@ async fn destination_cancel_emits_one_idempotent_canceled_result_delivery() {
             metadata: [("request".to_string(), "second".to_string())]
                 .into_iter()
                 .collect(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap()
@@ -305,6 +311,8 @@ async fn stale_result_delivery_ack_cannot_fence_out_a_new_same_worker_claim() {
             }),
             reason: "fenced cancellation".to_string(),
             metadata: Default::default(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap();
@@ -385,6 +393,8 @@ async fn pending_cancel_persists_canceled_terminal_result() {
             }),
             reason: "operator request".to_string(),
             metadata: Default::default(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap()
@@ -414,7 +424,7 @@ async fn pending_cancel_persists_canceled_terminal_result() {
 async fn running_cancel_persists_canceled_terminal_result() {
     let mut harness = RpcTestHarness::start().await;
     submit(&mut harness, "cancel-running").await;
-    harness
+    let running_claim = harness
         .client
         .claim_task(ClaimTaskRequest {
             task_id: Some(TaskId {
@@ -426,7 +436,8 @@ async fn running_cancel_persists_canceled_terminal_result() {
             lease_duration_ms: 60_000,
         })
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
 
     harness
         .client
@@ -436,6 +447,10 @@ async fn running_cancel_persists_canceled_terminal_result() {
             }),
             reason: "operator request".to_string(),
             metadata: Default::default(),
+            lease_id: running_claim.lease_id.clone(),
+            worker_id: Some(AgentId {
+                value: "cancel-worker".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -499,6 +514,8 @@ async fn terminal_cancel_fails_with_stable_precondition_error() {
             }),
             reason: "too late".to_string(),
             metadata: Default::default(),
+            lease_id: None,
+            worker_id: None,
         })
         .await
         .unwrap_err();

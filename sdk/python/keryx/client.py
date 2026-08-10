@@ -126,6 +126,44 @@ def _grpc_target(endpoint: str) -> str:
     return endpoint
 
 
+class _DaemonAuthInterceptor(grpc.aio.UnaryUnaryClientInterceptor):
+    def __init__(self, token: str) -> None:
+        self._authorization = f"Bearer {token}"
+
+    async def intercept_unary_unary(
+        self,
+        continuation: Any,
+        client_call_details: grpc.aio.ClientCallDetails,
+        request: Any,
+    ) -> Any:
+        metadata = list(client_call_details.metadata or ())
+        metadata.append(("authorization", self._authorization))
+        details = grpc.aio.ClientCallDetails(
+            client_call_details.method,
+            client_call_details.timeout,
+            metadata,
+            client_call_details.credentials,
+            client_call_details.wait_for_ready,
+        )
+        return await continuation(details, request)
+
+
+def _daemon_channel(
+    endpoint: str,
+    daemon_token: str | None,
+    *,
+    options: tuple[tuple[str, int], ...] = RESULT_ARTIFACT_GRPC_OPTIONS,
+) -> grpc.aio.Channel:
+    interceptors = (
+        [_DaemonAuthInterceptor(daemon_token)] if daemon_token is not None else None
+    )
+    return grpc.aio.insecure_channel(
+        _grpc_target(endpoint),
+        options=options,
+        interceptors=interceptors,
+    )
+
+
 def _registry_endpoint_target(endpoint: str) -> tuple[str, bool]:
     raw = endpoint.strip()
     parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
@@ -167,6 +205,7 @@ class DaemonClient:
         self,
         *,
         daemon_endpoint: str,
+        daemon_token: str | None = None,
         registry_endpoint: str | None = None,
         node_token: str | None = None,
         registry_ca_cert: str | os.PathLike[str] | None = None,
@@ -174,6 +213,14 @@ class DaemonClient:
         registry_channel: grpc.aio.Channel | None = None,
     ) -> None:
         self._daemon_endpoint = daemon_endpoint
+        configured_daemon_token = daemon_token or os.environ.get(
+            "HERMES_KERYX_DAEMON_TOKEN"
+        ) or os.environ.get("KERYX_DAEMON_TOKEN")
+        self._daemon_token = (
+            configured_daemon_token.strip()
+            if configured_daemon_token and configured_daemon_token.strip()
+            else None
+        )
         self._registry_endpoint = registry_endpoint or os.environ.get(
             "HERMES_KERYX_REGISTRY_ENDPOINT"
         )
@@ -195,9 +242,9 @@ class DaemonClient:
         if self._channel is None:
             _validate_unix_socket_endpoint(self._daemon_endpoint)
             _assert_unix_peer_owned_by_current_user(self._daemon_endpoint)
-            self._channel = grpc.aio.insecure_channel(
-                _grpc_target(self._daemon_endpoint),
-                options=RESULT_ARTIFACT_GRPC_OPTIONS,
+            self._channel = _daemon_channel(
+                self._daemon_endpoint,
+                self._daemon_token,
             )
         self._daemon = daemon_pb2_grpc.KeryxDaemonStub(self._channel)
         if self._registry_endpoint:

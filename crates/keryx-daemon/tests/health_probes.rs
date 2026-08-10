@@ -22,9 +22,12 @@ fn task(id: &str, idem: &str) -> TaskRecord {
 async fn liveness_rpc_is_always_true_while_daemon_is_running() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("liveness-home");
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir, 42))
-        .await
-        .unwrap();
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(data_dir, 42)
+            .with_daemon_rpc_token(Some("keryx-health-test-daemon-token".to_string())),
+    )
+    .await
+    .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -55,9 +58,12 @@ async fn readiness_rpc_reports_not_ready_after_store_corruption_probe() {
     store.accept_task(record.clone()).await.unwrap();
 
     let runtime = Arc::new(
-        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir.clone(), 1))
-            .await
-            .unwrap(),
+        KeryxDaemonRuntime::startup(
+            KeryxDaemonConfig::new(data_dir.clone(), 1)
+                .with_daemon_rpc_token(Some("keryx-health-test-daemon-token".to_string())),
+        )
+        .await
+        .unwrap(),
     );
 
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))

@@ -663,7 +663,7 @@ async fn authenticated_late_result_after_cancellation_rejects_artifacts_then_pre
         created_at_ms: 15,
     };
     store
-        .cancel_task_with_result(&task_id, "owner canceled", 15, canceled.clone())
+        .cancel_task_with_result(&task_id, None, None, "owner canceled", 15, canceled.clone())
         .await
         .unwrap();
     let before_events = store.events_for_task(&task_id).await.unwrap();

@@ -43,6 +43,7 @@ EXPECTED_ARTIFACT_BYTES = b"\x00\xffkeryx-cross-node-artifact\n" + bytes(range(2
 EXPECTED_ARTIFACT_NAME = "../../phase17-result.bin"
 SENDER_TOKEN = "sender-token-phase17"
 RECEIVER_TOKEN = "receiver-token-phase17"
+DAEMON_TOKEN = "daemon-token-cross-node-e2e"
 
 
 @dataclass
@@ -144,6 +145,7 @@ def base_env() -> dict[str, str]:
             "PYTHONPATH": python_path,
             "PYTHONUNBUFFERED": "1",
             "RUST_LOG": env.get("RUST_LOG", "info"),
+            "HERMES_KERYX_DAEMON_TOKEN": DAEMON_TOKEN,
         }
     )
     return env
@@ -211,6 +213,7 @@ async def run_worker(daemon_endpoint: str, signal_path: Path) -> None:
     node = KeryxNode(
         card,
         daemon_endpoint=daemon_endpoint,
+        daemon_token=DAEMON_TOKEN,
         worker_id="phase17-worker",
         claim_wait_timeout_ms=250,
         heartbeat_interval_ms=500,
@@ -266,6 +269,7 @@ async def wait_for_skill(node: KeryxNode, timeout: float = 20.0) -> None:
 async def send_and_assert(sender_port: int, registry_port: int, work_dir: Path) -> None:
     node = KeryxNode(
         daemon_endpoint=f"127.0.0.1:{sender_port}",
+        daemon_token=DAEMON_TOKEN,
         registry_endpoint=f"127.0.0.1:{registry_port}",
         worker_id="phase17-sender",
     )

@@ -337,3 +337,7 @@ A historical checkpoint or completed implementation phase is not proof for a cha
 - cross-node cancellation does not claim success without remote-observation evidence;
 - Python result observation is polling-based rather than a streaming subscription;
 - some AgentAnycast-era compatibility surfaces remain for migration of older consumers.
+
+### Local daemon RPC authorization
+
+When `keryxd` listens on `HERMES_KERYX_DAEMON_ADDR`, `HERMES_KERYX_DAEMON_TOKEN` is required. Sensitive reads, task/result dequeue, artifact access, task lifecycle mutation, remote ingress, and `SendTask` use the same `Authorization: Bearer ...` credential. Status, doctor, liveness, readiness, peer listing, and skill discovery remain read-only public-local diagnostics. Running-task cancellation also requires the exact active lease id and worker id; the daemon token alone does not grant lease ownership.

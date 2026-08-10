@@ -21,6 +21,7 @@ fi
 
 DAEMON_ADDR=${HERMES_KERYX_DAEMON_ADDR:-127.0.0.1:50051}
 DAEMON_ENDPOINT=${HERMES_KERYX_DAEMON_ENDPOINT:-"http://${DAEMON_ADDR}"}
+DAEMON_TOKEN=${HERMES_KERYX_DAEMON_TOKEN:-}
 # Dual-run defaults intentionally avoid common legacy AgentAnycast relay ports
 # (for example 4001/libp2p and 50052/health) while staying loopback-only.
 RELAY_HEALTH_GRPC_ADDR=${HERMES_KERYX_RELAY_HEALTH_GRPC_ADDR:-127.0.0.1:51052}
@@ -49,6 +50,7 @@ Default action is --start. Runtime files are kept outside the repo:
 Environment overrides:
   HERMES_KERYX_DAEMON_ADDR             default: ${DAEMON_ADDR}
   HERMES_KERYX_DAEMON_ENDPOINT         default: ${DAEMON_ENDPOINT}
+  HERMES_KERYX_DAEMON_TOKEN            required for --start
   HERMES_KERYX_RELAY_HEALTH_GRPC_ADDR  default: ${RELAY_HEALTH_GRPC_ADDR}
   HERMES_KERYX_REGISTRY_ENDPOINT       default: ${RELAY_REGISTRY_ADDR}
   HERMES_KERYX_RELAY_CONFIG            default: ${RELAY_CONFIG}
@@ -316,6 +318,11 @@ start_service() {
 }
 
 start_all() {
+  if [[ -z "$DAEMON_TOKEN" ]]; then
+    log "HERMES_KERYX_DAEMON_TOKEN is required to start the daemon RPC listener"
+    return 2
+  fi
+  export HERMES_KERYX_DAEMON_TOKEN="$DAEMON_TOKEN"
   ensure_dirs
   ensure_relay_config
   ensure_binaries

@@ -10,6 +10,25 @@ use keryx_proto::v1::{
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Interceptor;
+use tonic::Request;
+
+const TEST_DAEMON_TOKEN: &str = "keryx-worker-loop-test-daemon-token";
+
+#[derive(Clone)]
+struct TestDaemonTokenInterceptor;
+
+impl Interceptor for TestDaemonTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_DAEMON_TOKEN}")
+                .parse()
+                .expect("static test daemon token is valid metadata"),
+        );
+        Ok(request)
+    }
+}
 
 fn envelope(task_id: &str) -> TaskEnvelope {
     TaskEnvelope {
@@ -31,7 +50,8 @@ async fn full_worker_lifecycle_with_recovery_requeues_abandoned_lease() {
     let data_dir = dir.path().join("e2e-keryx-home");
     let config = KeryxDaemonConfig::new(data_dir, 0)
         .with_lease_recovery_interval_ms(25)
-        .with_fail_retry_policy(keryx_core::RetryPolicy::no_retries());
+        .with_fail_retry_policy(keryx_core::RetryPolicy::no_retries())
+        .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string()));
     let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await.unwrap());
     let recovery = LeaseRecoveryLoop::spawn(Arc::clone(&runtime));
 
@@ -43,9 +63,12 @@ async fn full_worker_lifecycle_with_recovery_requeues_abandoned_lease() {
         TcpListenerStream::new(listener),
     ));
 
-    let mut client = KeryxDaemonClient::connect(format!("http://{addr}"))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
         .await
         .unwrap();
+    let mut client = KeryxDaemonClient::with_interceptor(channel, TestDaemonTokenInterceptor);
 
     for id in ["e2e-task-1", "e2e-task-2", "e2e-task-3"] {
         client

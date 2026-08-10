@@ -15,6 +15,7 @@ fn run_keryx_args(args: &[&str], endpoint: String) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_keryx"))
         .args(args)
         .env("HERMES_KERYX_DAEMON_ENDPOINT", endpoint)
+        .env("HERMES_KERYX_DAEMON_TOKEN", "keryx-cli-test-daemon-token")
         .output()
         .unwrap()
 }
@@ -22,10 +23,10 @@ fn run_keryx_args(args: &[&str], endpoint: String) -> std::process::Output {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_status_uses_daemon_endpoint_when_configured() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
-        dir.path().join("cli-rpc-keryx-home"),
-        123,
-    ))
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("cli-rpc-keryx-home"), 123)
+            .with_daemon_rpc_token(Some("keryx-cli-test-daemon-token".to_string())),
+    )
     .await
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -52,10 +53,10 @@ async fn cli_status_uses_daemon_endpoint_when_configured() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_doctor_uses_daemon_endpoint_when_configured() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
-        dir.path().join("cli-doctor-rpc-keryx-home"),
-        123,
-    ))
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("cli-doctor-rpc-keryx-home"), 123)
+            .with_daemon_rpc_token(Some("keryx-cli-test-daemon-token".to_string())),
+    )
     .await
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -102,10 +103,10 @@ async fn cli_doctor_reports_unavailable_daemon_when_endpoint_cannot_connect() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
-        dir.path().join("cli-artifact-rpc-keryx-home"),
-        123,
-    ))
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("cli-artifact-rpc-keryx-home"), 123)
+            .with_daemon_rpc_token(Some("keryx-cli-test-daemon-token".to_string())),
+    )
     .await
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

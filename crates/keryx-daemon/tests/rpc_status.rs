@@ -9,9 +9,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 async fn daemon_rpc_reports_runtime_status_and_doctor_readiness() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("rpc-keryx-home");
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir.clone(), 42))
-        .await
-        .unwrap();
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(data_dir.clone(), 42)
+            .with_daemon_rpc_token(Some("keryx-status-test-daemon-token".to_string())),
+    )
+    .await
+    .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

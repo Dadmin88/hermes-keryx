@@ -178,10 +178,10 @@ async fn cli_relay_registry_list_shows_registrations() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_node_status_uses_daemon_endpoint() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
-        dir.path().join("node-status-home"),
-        123,
-    ))
+    let runtime = KeryxDaemonRuntime::startup(
+        KeryxDaemonConfig::new(dir.path().join("node-status-home"), 123)
+            .with_daemon_rpc_token(Some("keryx-cli-test-daemon-token".to_string())),
+    )
     .await
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
