@@ -8,10 +8,46 @@ use keryx_store::SqliteStore;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Interceptor;
+use tonic::transport::Channel;
+use tonic::Request;
 
 use keryx_core::{AgentId as CoreAgentId, IdempotencyKey, LeaseId};
 use keryx_daemon::serve_daemon_rpc;
 use keryx_store::{LeaseRecord, TaskRecord};
+
+const TEST_DAEMON_TOKEN: &str = "keryx-lease-recovery-test-daemon-token";
+
+#[derive(Clone)]
+struct TestDaemonTokenInterceptor;
+
+impl Interceptor for TestDaemonTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_DAEMON_TOKEN}")
+                .parse()
+                .expect("static lease-recovery token is valid metadata"),
+        );
+        Ok(request)
+    }
+}
+
+type TestDaemonClient = keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient<
+    tonic::service::interceptor::InterceptedService<Channel, TestDaemonTokenInterceptor>,
+>;
+
+async fn authenticated_client(addr: std::net::SocketAddr) -> TestDaemonClient {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient::with_interceptor(
+        channel,
+        TestDaemonTokenInterceptor,
+    )
+}
 
 fn task(id: &str, idem: &str) -> TaskRecord {
     TaskRecord::new(
@@ -94,7 +130,9 @@ async fn recovery_loop_returns_expired_lease_task_to_pending_and_logs_event() {
 async fn recovery_loop_recovers_rpc_claimed_task_after_lease_expires() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("loop-rpc-home");
-    let config = KeryxDaemonConfig::new(data_dir, 0).with_lease_recovery_interval_ms(20);
+    let config = KeryxDaemonConfig::new(data_dir, 0)
+        .with_lease_recovery_interval_ms(20)
+        .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string()));
     let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await.unwrap());
     let recovery = LeaseRecoveryLoop::spawn(Arc::clone(&runtime));
 
@@ -106,10 +144,7 @@ async fn recovery_loop_recovers_rpc_claimed_task_after_lease_expires() {
         TcpListenerStream::new(listener),
     ));
 
-    let mut client =
-        keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap();
+    let mut client = authenticated_client(addr).await;
 
     let task_id = TaskId {
         value: "loop-rpc-task-1".to_string(),

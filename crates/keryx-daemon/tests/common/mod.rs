@@ -10,17 +10,50 @@ use keryx_daemon::{
 };
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::TaskEnvelope;
+
+const TEST_DAEMON_TOKEN: &str = "keryx-rpc-test-daemon-token";
+
+#[derive(Clone)]
+pub(crate) struct TestDaemonTokenInterceptor;
+
+impl Interceptor for TestDaemonTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_DAEMON_TOKEN}")
+                .parse()
+                .expect("static test daemon token is valid metadata"),
+        );
+        Ok(request)
+    }
+}
+
+type TestDaemonClient = KeryxDaemonClient<InterceptedService<Channel, TestDaemonTokenInterceptor>>;
+
+async fn authenticated_client(addr: std::net::SocketAddr) -> TestDaemonClient {
+    let endpoint = format!("http://{addr}");
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    KeryxDaemonClient::with_interceptor(channel, TestDaemonTokenInterceptor)
+}
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::Channel;
+use tonic::Request;
 
 #[allow(dead_code)]
 pub struct RpcTestHarness {
     pub _dir: TempDir,
     pub runtime: Arc<KeryxDaemonRuntime>,
-    pub client: KeryxDaemonClient<tonic::transport::Channel>,
+    pub client: TestDaemonClient,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
@@ -39,6 +72,7 @@ impl RpcTestHarness {
 
     pub async fn start_with_config(config: KeryxDaemonConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let config = config.with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string()));
         let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await.unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -46,9 +80,7 @@ impl RpcTestHarness {
             runtime.as_ref().clone(),
             TcpListenerStream::new(listener),
         ));
-        let client = KeryxDaemonClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap();
+        let client = authenticated_client(addr).await;
         Self {
             _dir: dir,
             runtime,
@@ -59,7 +91,8 @@ impl RpcTestHarness {
 
     async fn start_with_data_dir_and_dir(data_dir: std::path::PathBuf, dir: TempDir) -> Self {
         let config = KeryxDaemonConfig::new(data_dir.clone(), 42)
-            .with_fail_retry_policy(keryx_core::RetryPolicy::no_retries());
+            .with_fail_retry_policy(keryx_core::RetryPolicy::no_retries())
+            .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string()));
         let runtime = Arc::new(KeryxDaemonRuntime::startup(config).await.unwrap());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -69,9 +102,7 @@ impl RpcTestHarness {
             TcpListenerStream::new(listener),
         ));
 
-        let client = KeryxDaemonClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap();
+        let client = authenticated_client(addr).await;
 
         Self {
             _dir: dir,

@@ -691,7 +691,8 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
     let data_dir = tempfile::tempdir().unwrap();
     let runtime = KeryxDaemonRuntime::startup(
         KeryxDaemonConfig::new(data_dir.path().join("daemon"), 0)
-            .with_local_peer_id(PeerId::new(EXECUTOR).unwrap()),
+            .with_local_peer_id(PeerId::new(EXECUTOR).unwrap())
+            .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
     )
     .await
     .unwrap();
@@ -733,7 +734,7 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
         runtime.clone(),
         TcpListenerStream::new(listener),
     ));
-    let mut client = KeryxDaemonClient::connect(format!("http://{daemon_addr}"))
+    let mut client = connect_authenticated_daemon(format!("http://{daemon_addr}"))
         .await
         .unwrap();
     let claim = client
@@ -1283,7 +1284,8 @@ async fn relay_restart_reconnects_reapplies_auth_and_processes_later_task() {
     let daemon_runtime = Arc::new(
         KeryxDaemonRuntime::startup(
             KeryxDaemonConfig::new(data_dir.path().join("daemon"), 0)
-                .with_local_peer_id(PeerId::new(DESTINATION).unwrap()),
+                .with_local_peer_id(PeerId::new(DESTINATION).unwrap())
+                .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
         )
         .await
         .unwrap(),
@@ -1440,7 +1442,8 @@ async fn late_result_is_settled_and_next_result_continues_on_same_stream() {
     let daemon_runtime = Arc::new(
         KeryxDaemonRuntime::startup(
             KeryxDaemonConfig::new(data_dir.path().join("daemon"), 0)
-                .with_local_peer_id(PeerId::new(DESTINATION).unwrap()),
+                .with_local_peer_id(PeerId::new(DESTINATION).unwrap())
+                .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
         )
         .await
         .unwrap(),
@@ -1613,7 +1616,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     let origin_runtime = Arc::new(
         KeryxDaemonRuntime::startup(
             KeryxDaemonConfig::new(origin_dir.path().join("daemon"), 0)
-                .with_local_peer_id(PeerId::new(ORIGIN).unwrap()),
+                .with_local_peer_id(PeerId::new(ORIGIN).unwrap())
+                .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
         )
         .await
         .unwrap(),
@@ -1621,7 +1625,8 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
     let executor_runtime = Arc::new(
         KeryxDaemonRuntime::startup(
             KeryxDaemonConfig::new(executor_dir.path().join("daemon"), 0)
-                .with_local_peer_id(PeerId::new(EXECUTOR).unwrap()),
+                .with_local_peer_id(PeerId::new(EXECUTOR).unwrap())
+                .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
         )
         .await
         .unwrap(),
@@ -1738,7 +1743,7 @@ async fn result_outbox_survives_relay_drop_then_reconnects_delivers_and_processe
         .unwrap()
         .unwrap();
 
-    let mut executor_client = KeryxDaemonClient::connect(format!("http://{executor_addr}"))
+    let mut executor_client = connect_authenticated_daemon(format!("http://{executor_addr}"))
         .await
         .unwrap();
     let claim = executor_client
@@ -1901,7 +1906,8 @@ async fn temporary_daemon_failure_does_not_ack_and_retries_after_recovery() {
     let daemon_runtime = Arc::new(
         KeryxDaemonRuntime::startup(
             KeryxDaemonConfig::new(data_dir.path().join("daemon"), 0)
-                .with_local_peer_id(PeerId::new(DESTINATION).unwrap()),
+                .with_local_peer_id(PeerId::new(DESTINATION).unwrap())
+                .with_daemon_rpc_token(Some(TEST_DAEMON_RPC_TOKEN.to_string())),
         )
         .await
         .unwrap(),

@@ -9,7 +9,39 @@ use keryx_proto::v1::{
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::Code;
+use tonic::service::Interceptor;
+use tonic::transport::Channel;
+use tonic::{Code, Request};
+
+const TEST_DAEMON_TOKEN: &str = "keryx-graceful-shutdown-daemon-token";
+
+#[derive(Clone)]
+struct TestDaemonTokenInterceptor;
+
+impl Interceptor for TestDaemonTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_DAEMON_TOKEN}")
+                .parse()
+                .expect("static graceful-shutdown token is valid metadata"),
+        );
+        Ok(request)
+    }
+}
+
+type TestDaemonClient = KeryxDaemonClient<
+    tonic::service::interceptor::InterceptedService<Channel, TestDaemonTokenInterceptor>,
+>;
+
+async fn authenticated_client(endpoint: String) -> TestDaemonClient {
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    KeryxDaemonClient::with_interceptor(channel, TestDaemonTokenInterceptor)
+}
 
 async fn spawn_rpc_server(
     runtime: Arc<KeryxDaemonRuntime>,
@@ -32,13 +64,16 @@ async fn in_flight_rpc_completes_during_shutdown() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("graceful-inflight-home");
     let runtime = Arc::new(
-        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir, 42))
-            .await
-            .unwrap(),
+        KeryxDaemonRuntime::startup(
+            KeryxDaemonConfig::new(data_dir, 42)
+                .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string())),
+        )
+        .await
+        .unwrap(),
     );
 
     let (endpoint, server) = spawn_rpc_server(Arc::clone(&runtime)).await;
-    let mut client = KeryxDaemonClient::connect(endpoint).await.unwrap();
+    let mut client = authenticated_client(endpoint).await;
 
     let status_task = tokio::spawn(async move { client.status(StatusRequest {}).await });
 
@@ -61,13 +96,16 @@ async fn new_rpc_rejected_when_daemon_is_shutting_down() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("graceful-reject-home");
     let runtime = Arc::new(
-        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir, 42))
-            .await
-            .unwrap(),
+        KeryxDaemonRuntime::startup(
+            KeryxDaemonConfig::new(data_dir, 42)
+                .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string())),
+        )
+        .await
+        .unwrap(),
     );
 
     let (endpoint, server) = spawn_rpc_server(Arc::clone(&runtime)).await;
-    let mut client = KeryxDaemonClient::connect(endpoint).await.unwrap();
+    let mut client = authenticated_client(endpoint).await;
 
     runtime.mark_shutting_down();
 
@@ -91,13 +129,16 @@ async fn result_delivery_mutations_are_rejected_when_daemon_is_shutting_down() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("graceful-result-mutations-home");
     let runtime = Arc::new(
-        KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir, 42))
-            .await
-            .unwrap(),
+        KeryxDaemonRuntime::startup(
+            KeryxDaemonConfig::new(data_dir, 42)
+                .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string())),
+        )
+        .await
+        .unwrap(),
     );
 
     let (endpoint, server) = spawn_rpc_server(Arc::clone(&runtime)).await;
-    let mut client = KeryxDaemonClient::connect(endpoint).await.unwrap();
+    let mut client = authenticated_client(endpoint).await;
 
     runtime.mark_shutting_down();
 

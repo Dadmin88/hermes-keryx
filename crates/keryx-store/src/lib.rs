@@ -129,6 +129,8 @@ pub enum StoreError {
         deadline_ms: i64,
         attempted_lease_at_ms: i64,
     },
+    #[error("running task cancellation requires active lease ownership proof: {0}")]
+    CancellationLeaseProofRequired(TaskId),
     #[error("lease {lease_id} does not own task {task_id}")]
     LeaseMismatch { task_id: TaskId, lease_id: LeaseId },
     #[error("worker {worker_id} does not own active lease for task {task_id}")]

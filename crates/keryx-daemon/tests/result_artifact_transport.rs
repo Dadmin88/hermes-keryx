@@ -501,6 +501,8 @@ async fn authenticated_result_after_cancellation_is_settled_without_reopening_ta
         .store()
         .cancel_task_with_result(
             &core_id,
+            None,
+            None,
             "owner canceled",
             8,
             TerminalResultRecord {
@@ -572,6 +574,8 @@ async fn corrupt_cancellation_result_fails_closed_instead_of_settling_late_frame
         .store()
         .cancel_task_with_result(
             &core_id,
+            None,
+            None,
             "owner canceled",
             8,
             TerminalResultRecord {

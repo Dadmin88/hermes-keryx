@@ -18,13 +18,13 @@ import grpc
 
 from keryx.card import AgentCard
 from keryx.client import (
-    RESULT_ARTIFACT_GRPC_OPTIONS,
     DaemonClient,
+    _daemon_channel,
     _validate_registration_ttl,
     _verified_artifact_content,
     _write_artifact_download,
 )
-from keryx.config import KeryxConfig, grpc_target, load_config
+from keryx.config import KeryxConfig, load_config
 from keryx.models import (
     ArtifactContent,
     ClaimedTask,
@@ -78,6 +78,7 @@ class KeryxNode:
         relay: str | None = None,
         daemon_endpoint: str | None = None,
         daemon_addr: str | None = None,
+        daemon_token: str | None = None,
         registry_endpoint: str | None = None,
         node_token: str | None = None,
         worker_id: str | None = None,
@@ -95,9 +96,18 @@ class KeryxNode:
         **_ignored: Any,
     ) -> None:
         loaded_config = config or load_config(config_path)
-        if daemon_endpoint or daemon_addr or registry_endpoint or relay_endpoint or relay or worker_id:
+        if (
+            daemon_endpoint
+            or daemon_addr
+            or daemon_token
+            or registry_endpoint
+            or relay_endpoint
+            or relay
+            or worker_id
+        ):
             loaded_config = KeryxConfig(
                 daemon_endpoint=daemon_endpoint or daemon_addr or loaded_config.daemon_endpoint,
+                daemon_token=daemon_token or loaded_config.daemon_token,
                 registry_endpoint=registry_endpoint or loaded_config.registry_endpoint,
                 relay_endpoint=relay_endpoint or relay or loaded_config.relay_endpoint,
                 worker_id=worker_id or loaded_config.worker_id,
@@ -112,6 +122,7 @@ class KeryxNode:
         self._daemon_bin = daemon_bin
         self._status_callback = status_callback
         self._daemon_endpoint = loaded_config.daemon_endpoint
+        self._daemon_token = loaded_config.daemon_token
         self._registry_endpoint = loaded_config.registry_endpoint
         self._node_token = node_token
         self._worker_id = loaded_config.worker_id
@@ -183,8 +194,9 @@ class KeryxNode:
         if self._status_callback:
             self._status_callback("Connecting to Keryx daemon")
         if self._channel is None:
-            self._channel = grpc.aio.insecure_channel(
-                grpc_target(self._daemon_endpoint), options=RESULT_ARTIFACT_GRPC_OPTIONS
+            self._channel = _daemon_channel(
+                self._daemon_endpoint,
+                self._daemon_token,
             )
             self._owns_channel = True
         if wait_ready and hasattr(self._channel, "channel_ready"):
@@ -465,15 +477,20 @@ class KeryxNode:
         *,
         reason: str = "",
         metadata: Mapping[str, str] | None = None,
+        lease_id: str | None = None,
+        worker_id: str | None = None,
     ) -> TaskResult:
         daemon = await self._daemon()
-        response = await daemon.CancelTask(
-            daemon_pb2.CancelTaskRequest(
-                task_id=common_pb2.TaskId(value=task_id),
-                reason=reason,
-                metadata=dict(metadata or {}),
-            )
+        request = daemon_pb2.CancelTaskRequest(
+            task_id=common_pb2.TaskId(value=task_id),
+            reason=reason,
+            metadata=dict(metadata or {}),
         )
+        if lease_id:
+            request.lease_id.value = lease_id
+        if worker_id:
+            request.worker_id.value = worker_id
+        response = await daemon.CancelTask(request)
         return TaskResult.from_cancel(response)
 
     async def cancel_task(self, *args: Any, **kwargs: Any) -> TaskResult:
@@ -506,6 +523,7 @@ class KeryxNode:
         factory = self._client_factory or DaemonClient
         client_kwargs: dict[str, Any] = dict(
             daemon_endpoint=self._daemon_endpoint,
+            daemon_token=self._daemon_token,
             registry_endpoint=self._registry_endpoint,
         )
         if self._node_token is not None:

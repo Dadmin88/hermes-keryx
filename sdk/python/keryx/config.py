@@ -24,6 +24,7 @@ class KeryxConfig:
     """
 
     daemon_endpoint: str = field(default_factory=default_daemon_endpoint)
+    daemon_token: str | None = None
     registry_endpoint: str | None = None
     relay_endpoint: str | None = None
     worker_id: str | None = None
@@ -42,6 +43,11 @@ class KeryxConfig:
                 "KERYX_DAEMON_ENDPOINT",
                 default=default_daemon_endpoint(),
             ) or default_daemon_endpoint(),
+            daemon_token=_first_env(
+                source,
+                "HERMES_KERYX_DAEMON_TOKEN",
+                "KERYX_DAEMON_TOKEN",
+            ),
             registry_endpoint=_first_env(
                 source,
                 "HERMES_KERYX_REGISTRY_ENDPOINT",
@@ -94,6 +100,9 @@ class KeryxConfig:
                 or daemon.get("endpoint")
                 or default_daemon_endpoint()
             ),
+            daemon_token=_optional_str(
+                data.get("daemon_token") or daemon.get("token")
+            ),
             registry_endpoint=_optional_str(
                 data.get("registry_endpoint") or registry.get("endpoint")
             ),
@@ -117,6 +126,10 @@ class KeryxConfig:
         changes: dict[str, Any] = {}
         if daemon := _first_env(source, "HERMES_KERYX_DAEMON_ENDPOINT", "KERYX_DAEMON_ENDPOINT"):
             changes["daemon_endpoint"] = daemon
+        if daemon_token := _first_env(
+            source, "HERMES_KERYX_DAEMON_TOKEN", "KERYX_DAEMON_TOKEN"
+        ):
+            changes["daemon_token"] = daemon_token
         if registry := _first_env(source, "HERMES_KERYX_REGISTRY_ENDPOINT", "KERYX_REGISTRY_ENDPOINT"):
             changes["registry_endpoint"] = registry
         if relay := _first_env(source, "HERMES_KERYX_RELAY_ENDPOINT", "KERYX_RELAY_ENDPOINT"):

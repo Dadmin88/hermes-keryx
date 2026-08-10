@@ -76,6 +76,7 @@ fn discovery_config(
     KeryxDaemonConfig::new(data_dir, 1)
         .with_local_peer_id(PeerId::new(peer_id).unwrap())
         .with_discovery(Some(settings))
+        .with_daemon_rpc_token(Some("keryx-discovery-test-daemon-token".to_string()))
 }
 
 #[tokio::test]

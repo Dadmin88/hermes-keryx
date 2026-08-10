@@ -237,14 +237,18 @@ async def test_sdk_created_daemon_channels_have_artifact_frame_options(monkeypat
     import keryx.client as client_module
     import keryx.node as node_module
 
-    calls: list[tuple[str, tuple[tuple[str, int], ...]]] = []
+    calls: list[tuple[str, tuple[tuple[str, int], ...], object | None]] = []
 
     class _Channel:
         async def close(self) -> None:
             return None
 
-    def insecure_channel(target: str, options: tuple[tuple[str, int], ...]) -> _Channel:
-        calls.append((target, options))
+    def insecure_channel(
+        target: str,
+        options: tuple[tuple[str, int], ...],
+        interceptors: object | None = None,
+    ) -> _Channel:
+        calls.append((target, options, interceptors))
         return _Channel()
 
     monkeypatch.setattr(client_module.grpc.aio, "insecure_channel", insecure_channel)
@@ -252,16 +256,28 @@ async def test_sdk_created_daemon_channels_have_artifact_frame_options(monkeypat
     monkeypatch.setattr(client_module.daemon_pb2_grpc, "KeryxDaemonStub", lambda channel: object())
     monkeypatch.setattr(node_module.daemon_pb2_grpc, "KeryxDaemonStub", lambda channel: object())
 
-    client = DaemonClient(daemon_endpoint="127.0.0.1:50051")
+    client = DaemonClient(
+        daemon_endpoint="127.0.0.1:50051",
+        daemon_token="sdk-channel-test-token",
+    )
     await client.connect()
-    node = KeryxNode(daemon_endpoint="127.0.0.1:50051")
+    node = KeryxNode(
+        daemon_endpoint="127.0.0.1:50051",
+        daemon_token="sdk-channel-test-token",
+    )
     await node.connect()
 
     expected = (
         ("grpc.max_send_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
         ("grpc.max_receive_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
     )
-    assert calls == [("127.0.0.1:50051", expected), ("127.0.0.1:50051", expected)]
+    assert len(calls) == 2
+    for target, options, interceptors in calls:
+        assert target == "127.0.0.1:50051"
+        assert options == expected
+        assert isinstance(interceptors, list)
+        assert len(interceptors) == 1
+        assert isinstance(interceptors[0], client_module._DaemonAuthInterceptor)
 
 
 @pytest.mark.asyncio

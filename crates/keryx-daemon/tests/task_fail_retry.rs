@@ -6,6 +6,42 @@ use keryx_proto::v1::{
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Interceptor;
+use tonic::transport::Channel;
+use tonic::Request;
+
+const TEST_DAEMON_TOKEN: &str = "keryx-fail-retry-test-daemon-token";
+
+#[derive(Clone)]
+struct TestDaemonTokenInterceptor;
+
+impl Interceptor for TestDaemonTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_DAEMON_TOKEN}")
+                .parse()
+                .expect("static fail-retry token is valid metadata"),
+        );
+        Ok(request)
+    }
+}
+
+type TestDaemonClient = keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient<
+    tonic::service::interceptor::InterceptedService<Channel, TestDaemonTokenInterceptor>,
+>;
+
+async fn authenticated_client(addr: std::net::SocketAddr) -> TestDaemonClient {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient::with_interceptor(
+        channel,
+        TestDaemonTokenInterceptor,
+    )
+}
 
 #[tokio::test]
 async fn fail_task_via_rpc_requeues_with_retry_count_until_dead_lettered() {
@@ -17,7 +53,9 @@ async fn fail_task_via_rpc_requeues_with_retry_count_until_dead_lettered() {
         dead_letter_after: 2,
     };
     let runtime = KeryxDaemonRuntime::startup(
-        KeryxDaemonConfig::new(data_dir, 42).with_fail_retry_policy(policy),
+        KeryxDaemonConfig::new(data_dir, 42)
+            .with_fail_retry_policy(policy)
+            .with_daemon_rpc_token(Some(TEST_DAEMON_TOKEN.to_string())),
     )
     .await
     .unwrap();
@@ -26,10 +64,7 @@ async fn fail_task_via_rpc_requeues_with_retry_count_until_dead_lettered() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_daemon_rpc(runtime, TcpListenerStream::new(listener)));
 
-    let mut client =
-        keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap();
+    let mut client = authenticated_client(addr).await;
 
     let task_id = TaskId {
         value: "task-fail-retry".to_string(),

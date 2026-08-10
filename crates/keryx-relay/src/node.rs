@@ -26,7 +26,9 @@ use libp2p::Multiaddr;
 use tokio::signal;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code, Request};
 use tracing::info;
 
@@ -46,11 +48,64 @@ const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const DAEMON_TOKEN_ENV: &str = "HERMES_KERYX_DAEMON_TOKEN";
+#[cfg(test)]
+const TEST_DAEMON_RPC_TOKEN: &str = "keryx-relay-node-test-daemon-token";
 const NODESCALE_IDENTITY_CHALLENGE_FEATURE: &str = "nodescale.identity.challenge.v1";
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 const DIRECT_CONTROL_HANDLER_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_CONTROL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct DaemonTokenInterceptor {
+    authorization: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+}
+
+impl DaemonTokenInterceptor {
+    fn from_env() -> Result<Self> {
+        let token = std::env::var(DAEMON_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        #[cfg(test)]
+        let token = token.or_else(|| Some(TEST_DAEMON_RPC_TOKEN.to_string()));
+        let token =
+            token.context("HERMES_KERYX_DAEMON_TOKEN is required for edge-to-daemon mutations")?;
+        let authorization = format!("Bearer {token}")
+            .parse()
+            .context("HERMES_KERYX_DAEMON_TOKEN is not valid gRPC metadata")?;
+        Ok(Self { authorization })
+    }
+}
+
+impl Interceptor for DaemonTokenInterceptor {
+    fn call(
+        &mut self,
+        mut request: Request<()>,
+    ) -> std::result::Result<Request<()>, tonic::Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.authorization.clone());
+        Ok(request)
+    }
+}
+
+type AuthorizedDaemonClient =
+    KeryxDaemonClient<InterceptedService<Channel, DaemonTokenInterceptor>>;
+
+async fn connect_authenticated_daemon(endpoint: String) -> Result<AuthorizedDaemonClient> {
+    let channel = Endpoint::from_shared(endpoint.clone())
+        .with_context(|| format!("invalid daemon endpoint {endpoint}"))?
+        .connect()
+        .await
+        .with_context(|| format!("daemon unavailable at {endpoint}"))?;
+    Ok(
+        KeryxDaemonClient::with_interceptor(channel, DaemonTokenInterceptor::from_env()?)
+            .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
+            .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RelayReconnectPolicy {
@@ -703,10 +758,7 @@ where
     let mut relay = KeryxRelayClient::new(channel)
         .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
         .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
-    let mut daemon = KeryxDaemonClient::connect(daemon_endpoint)
-        .await?
-        .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
-        .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+    let mut daemon = connect_authenticated_daemon(daemon_endpoint).await?;
     let delivery_worker = format!("edge-{registry_peer_id}");
     let mut delivery_tick = tokio::time::interval(Duration::from_millis(250));
     loop {
@@ -832,11 +884,11 @@ pub async fn run_relay_stream_with_direct_control_handlers(
         let daemon_endpoint = daemon_endpoint
             .as_ref()
             .context("task/result relay frame refused because no daemon endpoint is configured")?;
-        let mut daemon = KeryxDaemonClient::connect(daemon_endpoint.clone())
+        let mut daemon = connect_authenticated_daemon(daemon_endpoint.clone())
             .await
-            .with_context(|| format!("keryx node stream: daemon unavailable at {daemon_endpoint}"))?
-            .max_encoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES)
-            .max_decoding_message_size(RESULT_ARTIFACT_FRAME_MAX_BYTES);
+            .with_context(|| {
+                format!("keryx node stream: daemon unavailable at {daemon_endpoint}")
+            })?;
         if let Some(task) = frame.task {
             daemon
                 .submit_remote_task(SubmitRemoteTaskRequest {

@@ -19,6 +19,18 @@ use tonic::Request;
 use tonic::Status;
 use tracing::{info, instrument, warn};
 
+const RELAY_TARGET_METADATA_KEYS: &[&str] = &[
+    "target_node_id",
+    "target_node",
+    "recipient_node_id",
+    "recipient_node",
+    "destination_node_id",
+    "destination_node",
+    "node_id",
+    "keryx.target_node_id",
+];
+const CANONICAL_RELAY_TARGET_METADATA_KEY: &str = "target_node_id";
+
 use crate::grpc_transport::{ca_cert_path_from_env, secure_grpc_endpoint};
 
 /// Default outbound delivery timeout when callers omit `timeout_ms`.
@@ -194,10 +206,7 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
             .ok_or_else(|| RoutingError::InvalidEnvelope {
                 reason: "relay task envelope requires task_id".to_string(),
             })?;
-        envelope.metadata.insert(
-            "target_node_id".to_string(),
-            target_peer_id.as_str().to_string(),
-        );
+        canonicalize_relay_target_metadata(&mut envelope, target_peer_id);
         let mut client = self.connect(target_peer_id).await?;
         let mut request = Request::new(PublishTaskRequest {
             task: Some(envelope),
@@ -263,6 +272,16 @@ impl RelayTaskPublisher for GrpcRelayTaskPublisher {
         )?;
         Ok(receipt)
     }
+}
+
+fn canonicalize_relay_target_metadata(envelope: &mut TaskEnvelope, target_peer_id: &PeerId) {
+    for key in RELAY_TARGET_METADATA_KEYS {
+        envelope.metadata.remove(*key);
+    }
+    envelope.metadata.insert(
+        CANONICAL_RELAY_TARGET_METADATA_KEY.to_string(),
+        target_peer_id.as_str().to_string(),
+    );
 }
 
 fn validate_relay_receipt(
@@ -922,6 +941,30 @@ pub fn routing_error_to_status(error: RoutingError) -> Status {
 mod tests {
     use super::*;
     use keryx_proto::v1::TaskId as ProtoTaskId;
+
+    #[test]
+    fn relay_target_metadata_is_canonicalized() {
+        let target = PeerId::new("node-canonical-target").unwrap();
+        let mut envelope = TaskEnvelope::default();
+        for key in RELAY_TARGET_METADATA_KEYS {
+            envelope
+                .metadata
+                .insert((*key).to_string(), "node-poisoned".to_string());
+        }
+        canonicalize_relay_target_metadata(&mut envelope, &target);
+        for key in RELAY_TARGET_METADATA_KEYS {
+            if *key != CANONICAL_RELAY_TARGET_METADATA_KEY {
+                assert!(!envelope.metadata.contains_key(*key));
+            }
+        }
+        assert_eq!(
+            envelope
+                .metadata
+                .get(CANONICAL_RELAY_TARGET_METADATA_KEY)
+                .map(String::as_str),
+            Some(target.as_str())
+        );
+    }
 
     #[test]
     fn relay_receipt_must_match_the_submitted_task_identity() {
