@@ -61,6 +61,23 @@ jobs:
             exit 1
           }
 
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/keryx-daemon/tests/backpressure.rs')
+          text = path.read_text()
+          start = text.index('fn envelope(task_id: &str) -> TaskEnvelope')
+          end = text.index('\nasync fn harness_with_limits', start)
+          block = text[start:end]
+          if 'deadline_ms:' not in block:
+              needle = '        status: 0,\n'
+              if block.count(needle) != 2:
+                  raise SystemExit('Unexpected backpressure TaskEnvelope helper shape')
+              block = block.replace(needle, needle + '        deadline_ms: 0,\n')
+              text = text[:start] + block + text[end:]
+              path.write_text(text)
+          PY
+
           cargo fmt --all --check
           cargo check --workspace --all-targets --locked
           cargo test -p keryx-core -p keryx-store -p keryx-daemon --locked
