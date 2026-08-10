@@ -41,6 +41,7 @@ jobs:
           python scripts/repair_worker_loop_auth.py
           python scripts/repair_health_probe_auth.py
           python scripts/repair_lease_recovery_auth.py
+          python scripts/repair_fail_retry_auth.py
           bash sdk/python/scripts/generate_protos.sh
           cargo fmt --all
 
@@ -79,6 +80,7 @@ jobs:
           git rm scripts/repair_worker_loop_auth.py
           git rm scripts/repair_health_probe_auth.py
           git rm scripts/repair_lease_recovery_auth.py
+          git rm scripts/repair_fail_retry_auth.py
           git rm .github/workflows/reconcile-unified-daemon-auth.yml
           git add -A
           git diff --cached --check
