@@ -1,38 +1,93 @@
-name: N6 recovery reconciliation probe
+name: N6 recovery reconciliation
 
 on:
   push:
     branches: [feat/n6-authenticated-challenge]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  reconcile:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Probe merge with current main
+      - name: Merge current main with guarded product-doc resolution
         shell: bash
         run: |
-          set -uo pipefail
-          git config user.name "Keryx N6 Reconciliation Probe"
+          set -euo pipefail
+          git config user.name "Keryx N6 Reconciliation"
           git config user.email "keryx-n6-reconciliation@users.noreply.github.com"
           git fetch origin main
+
           set +e
           git merge --no-commit --no-ff origin/main
           status=$?
           set -e
-          if [ "$status" -eq 0 ]; then
-            echo MERGE_PROBE_CLEAN
-            git merge --abort || true
-            exit 0
+
+          if [ "$status" -ne 0 ]; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            test "$conflicts" = "docs/current-product.md" || {
+              echo "Unexpected conflict set:" >&2
+              printf '%s\n' "$conflicts" >&2
+              exit 1
+            }
+
+            git checkout --theirs -- docs/current-product.md
+            python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('docs/current-product.md')
+          text = path.read_text()
+
+          capability = '- `nodescale_identity_bind_v1` for the typed Nodescale identity-binding control path.\n'
+          capability_replacement = (
+              capability
+              + '- `nodescale_identity_challenge_v1` for the typed authenticated Nodescale challenge control path.\n'
+          )
+          if text.count(capability) != 1:
+              raise SystemExit('Unexpected protocol capability section')
+          text = text.replace(capability, capability_replacement, 1)
+
+          marker = (
+              'This control path exists so higher-level identity systems can use Keryx runtime provenance without pretending a generic task body is authenticated identity.\n\n'
+              '## Remote result artifacts\n'
+          )
+          section = '''This control path exists so higher-level identity systems can use Keryx runtime provenance without pretending a generic task body is authenticated identity.
+
+## Authenticated Nodescale identity challenge
+
+Keryx also exposes the typed non-execution operation `nodescale.identity.challenge.v1`.
+
+The challenge request carries no authoritative sender, peer, or nonce identity. The relay derives the source from authenticated node credentials, requires the destination to advertise `nodescale_identity_challenge_v1`, and returns a bounded typed result only through the authenticated destination completion path.
+
+Keryx provides authenticated at-least-once transport for this operation, not durable challenge issuance authority. The installed destination handler is responsible for durable serialization and deduplication of `(authenticated_sender_peer_id, operation_id)` across duplicate, concurrent, and restart retries. Keryx does not persist challenge secrets, route them through generic task/result storage, or expose this control path to Python task handlers.
+
+## Remote result artifacts
+'''
+          if text.count(marker) != 1:
+              raise SystemExit('Unexpected identity-binding section boundary')
+          text = text.replace(marker, section, 1)
+          path.write_text(text)
+          PY
+            git add docs/current-product.md
           fi
-          echo MERGE_PROBE_CONFLICTS
-          git diff --name-only --diff-filter=U
-          echo '--- combined diff ---'
-          git diff --cc
-          git merge --abort || true
-          exit 1
+
+          test -z "$(git diff --name-only --diff-filter=U)" || {
+            echo "Unresolved conflicts remain" >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          }
+
+          cargo fmt --all --check
+          cargo check --workspace --all-targets --locked
+          cargo test -p keryx-relay -p keryx-daemon --locked
+
+          git rm .github/workflows/reconcile-n6-recovery.yml
+          git add -A
+          git diff --cached --check
+          git commit -m "merge: reconcile authenticated Nodescale challenge with current main"
+          git push origin HEAD:feat/n6-authenticated-challenge
