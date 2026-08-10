@@ -44,6 +44,9 @@ jobs:
           python scripts/repair_fail_retry_auth.py
           bash sdk/python/scripts/generate_protos.sh
           cargo fmt --all
+          echo '--- source identity guard locations ---'
+          grep -R -n -F 'source_node_id metadata does not match authenticated node identity' crates proto sdk tests scripts || true
+          grep -R -n -F 'does not match authenticated node identity' crates proto sdk tests scripts || true
 
       - name: Validate Rust workspace
         shell: bash
