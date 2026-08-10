@@ -66,16 +66,30 @@ jobs:
 
           path = Path('crates/keryx-daemon/tests/backpressure.rs')
           text = path.read_text()
-          start = text.index('fn envelope(task_id: &str) -> TaskEnvelope')
-          end = text.index('\nasync fn harness_with_limits', start)
-          block = text[start:end]
-          if 'deadline_ms:' not in block:
+
+          def add_deadline_to_constructor(text: str, start_marker: str, end_marker: str) -> str:
+              start = text.index(start_marker)
+              end = text.index(end_marker, start)
+              block = text[start:end]
+              if 'deadline_ms:' in block:
+                  return text
               needle = '        status: 0,\n'
-              if block.count(needle) != 2:
-                  raise SystemExit('Unexpected backpressure TaskEnvelope helper shape')
-              block = block.replace(needle, needle + '        deadline_ms: 0,\n')
-              text = text[:start] + block + text[end:]
-              path.write_text(text)
+              if block.count(needle) != 1:
+                  raise SystemExit(f'Unexpected TaskEnvelope helper shape for {start_marker}')
+              block = block.replace(needle, needle + '        deadline_ms: 0,\n', 1)
+              return text[:start] + block + text[end:]
+
+          text = add_deadline_to_constructor(
+              text,
+              'fn envelope(task_id: &str) -> TaskEnvelope',
+              '\nfn sized_envelope',
+          )
+          text = add_deadline_to_constructor(
+              text,
+              'fn sized_envelope(task_id: &str, raw_len: usize) -> TaskEnvelope',
+              '\nasync fn harness_with_limits',
+          )
+          path.write_text(text)
           PY
 
           cargo fmt --all --check
