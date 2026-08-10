@@ -20,6 +20,12 @@ service KeryxRelay {
   rpc PublishNodescaleIdentityBind(PublishNodescaleIdentityBindRequest) returns (PublishNodescaleIdentityBindResponse);
   // Destination-only typed completion for a relay-issued control frame.
   rpc CompleteNodescaleIdentityBind(CompleteNodescaleIdentityBindRequest) returns (CompleteNodescaleIdentityBindResponse);
+  // Typed non-execution challenge issuance. Source identity is metadata-only. This is
+  // authenticated at-least-once transport: the installed Nodescale handler, not Keryx,
+  // must durably deduplicate `(authenticated_sender_peer_id, operation_id)`.
+  rpc PublishNodescaleIdentityChallenge(PublishNodescaleIdentityChallengeRequest) returns (PublishNodescaleIdentityChallengeResponse);
+  // Destination-only typed challenge completion for a relay-issued control frame.
+  rpc CompleteNodescaleIdentityChallenge(CompleteNodescaleIdentityChallengeRequest) returns (CompleteNodescaleIdentityChallengeResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
   // Destination-owned acknowledgement; the authenticated caller must own the relay frame.
   rpc AckFrame(AckFrameRequest) returns (AckFrameResponse);
@@ -50,6 +56,7 @@ message RelayFrame {
   string authenticated_source_node_id = 4;
   string destination_node_id = 5;
   NodescaleIdentityBindV1 nodescale_identity_bind_v1 = 6;
+  NodescaleIdentityChallengeV1 nodescale_identity_challenge_v1 = 7;
 }
 message RegisterNodeRequest { NodeId node_id = 1; string token = 2; }
 message RegisterNodeResponse { bool accepted = 1; }
@@ -92,6 +99,20 @@ message CompleteNodescaleIdentityBindRequest {
   NodescaleIdentityBindResult result = 2;
 }
 message CompleteNodescaleIdentityBindResponse { bool accepted = 1; }
+message PublishNodescaleIdentityChallengeRequest {
+  NodescaleIdentityChallengeV1 operation = 1;
+  string target_node_id = 2;
+}
+message PublishNodescaleIdentityChallengeResponse {
+  string frame_id = 1;
+  string destination_node_id = 2;
+  NodescaleIdentityChallengeResult result = 3;
+}
+message CompleteNodescaleIdentityChallengeRequest {
+  string frame_id = 1;
+  NodescaleIdentityChallengeResult result = 2;
+}
+message CompleteNodescaleIdentityChallengeResponse { bool accepted = 1; }
 message AckTaskRequest { TaskId task_id = 1; }
 message AckTaskResponse { bool accepted = 1; }
 message AckFrameRequest { string frame_id = 1; }

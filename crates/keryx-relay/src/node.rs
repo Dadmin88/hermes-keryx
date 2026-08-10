@@ -1,5 +1,6 @@
 //! Edge node runtime: libp2p relay client with optional registry registration.
 
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,9 +14,11 @@ use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
 use keryx_proto::v1::{
     AckFrameRequest, AckResultDeliveryRequest, ClaimNextResultDeliveryRequest,
-    CompleteNodescaleIdentityBindRequest, FailResultDeliveryRequest, IngestRemoteResultRequest,
-    NodeFrame, NodescaleIdentityBindResult, NodescaleIdentityBindV1, PublishResultRequest,
-    SubmitRemoteTaskRequest,
+    CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityChallengeRequest,
+    FailResultDeliveryRequest, IngestRemoteResultRequest, NodeFrame,
+    NodescaleIdentityBindDisposition, NodescaleIdentityBindResult, NodescaleIdentityBindV1,
+    NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
+    NodescaleIdentityChallengeV1, PublishResultRequest, SubmitRemoteTaskRequest,
 };
 use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
 use libp2p::swarm::SwarmEvent;
@@ -43,8 +46,11 @@ const NODE_RELAY_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_ENDPOINT";
 const NODE_RELAY_HEALTH_ENDPOINT_ENV: &str = "HERMES_KERYX_RELAY_HEALTH_ENDPOINT";
 const NODE_TOKEN_ENV: &str = "HERMES_KERYX_NODE_TOKEN";
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
+const NODESCALE_IDENTITY_CHALLENGE_FEATURE: &str = "nodescale.identity.challenge.v1";
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+const DIRECT_CONTROL_HANDLER_TIMEOUT: Duration = Duration::from_secs(15);
+const DIRECT_CONTROL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 struct RelayReconnectPolicy {
@@ -145,9 +151,37 @@ async fn supervise_relay_stream<F, Fut>(
 /// Provenance projected by the relay for a direct non-execution operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedDirectContext {
-    pub authenticated_source_node_id: String,
-    pub destination_node_id: String,
-    pub relay_frame_id: String,
+    authenticated_source_node_id: String,
+    destination_node_id: String,
+    relay_frame_id: String,
+}
+
+impl AuthenticatedDirectContext {
+    /// Source identity projected from the relay-authenticated frame.
+    #[must_use]
+    pub fn authenticated_source_node_id(&self) -> &str {
+        &self.authenticated_source_node_id
+    }
+
+    /// Destination identity projected from the relay-authenticated frame.
+    #[must_use]
+    pub fn destination_node_id(&self) -> &str {
+        &self.destination_node_id
+    }
+
+    /// Relay-owned frame identity associated with this delivery.
+    #[must_use]
+    pub fn relay_frame_id(&self) -> &str {
+        &self.relay_frame_id
+    }
+
+    fn from_authenticated_relay_frame(frame: &keryx_proto::v1::RelayFrame) -> Self {
+        Self {
+            authenticated_source_node_id: frame.authenticated_source_node_id.clone(),
+            destination_node_id: frame.destination_node_id.clone(),
+            relay_frame_id: frame.frame_id.clone(),
+        }
+    }
 }
 
 /// Closed typed direct-control seam. It cannot receive a daemon or task envelope.
@@ -160,9 +194,27 @@ pub trait NodescaleIdentityBindHandler: Send + Sync {
     ) -> Result<NodescaleIdentityBindResult>;
 }
 
+/// Closed typed challenge-control seam. It cannot receive a daemon or task envelope.
+///
+/// The installed Nodescale handler, not Keryx, owns challenge issuance. It MUST use
+/// `(context.authenticated_source_node_id, operation.operation_id)` as a durable idempotency key
+/// and serialize that key so duplicate, concurrent, and post-restart at-least-once deliveries never
+/// issue a second challenge secret. Keryx deliberately does not cache or persist challenge secrets
+/// and provides no durable issuance idempotency across restart. A duplicate rejection MUST contain
+/// no challenge secret.
+#[tonic::async_trait]
+pub trait NodescaleIdentityChallengeHandler: Send + Sync {
+    async fn handle_nodescale_identity_challenge(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: NodescaleIdentityChallengeV1,
+    ) -> Result<NodescaleIdentityChallengeResult>;
+}
+
 #[derive(Clone, Default)]
 pub struct DirectControlHandlers {
     pub nodescale_identity_bind_v1: Option<Arc<dyn NodescaleIdentityBindHandler>>,
+    pub nodescale_identity_challenge_v1: Option<Arc<dyn NodescaleIdentityChallengeHandler>>,
 }
 
 impl DirectControlHandlers {
@@ -170,10 +222,15 @@ impl DirectControlHandlers {
     pub fn has_nodescale_identity_bind_handler(&self) -> bool {
         self.nodescale_identity_bind_v1.is_some()
     }
+
+    #[must_use]
+    pub fn has_nodescale_identity_challenge_handler(&self) -> bool {
+        self.nodescale_identity_challenge_v1.is_some()
+    }
 }
 
 /// Dispatch a typed direct control operation without any daemon/task dependency.
-pub async fn dispatch_nodescale_identity_bind_v1(
+pub(crate) async fn dispatch_nodescale_identity_bind_v1(
     handlers: &DirectControlHandlers,
     context: AuthenticatedDirectContext,
     operation: NodescaleIdentityBindV1,
@@ -192,6 +249,202 @@ pub async fn dispatch_nodescale_identity_bind_v1(
     handler
         .handle_nodescale_identity_bind(context, operation)
         .await
+}
+
+/// Dispatch a typed challenge control operation without any daemon/task dependency.
+pub(crate) async fn dispatch_nodescale_identity_challenge_v1(
+    handlers: &DirectControlHandlers,
+    context: AuthenticatedDirectContext,
+    operation: NodescaleIdentityChallengeV1,
+) -> Result<NodescaleIdentityChallengeResult> {
+    anyhow::ensure!(
+        !context.authenticated_source_node_id.trim().is_empty()
+            && !context.destination_node_id.trim().is_empty()
+            && !context.relay_frame_id.trim().is_empty()
+            && !operation.operation_id.trim().is_empty(),
+        "direct control frame provenance and operation id are required"
+    );
+    let handler = handlers
+        .nodescale_identity_challenge_v1
+        .as_ref()
+        .context("nodescale identity challenge handler is not installed")?;
+    handler
+        .handle_nodescale_identity_challenge(context, operation)
+        .await
+}
+
+pub(crate) enum LocalTypedControlDispatch {
+    Bind(NodescaleIdentityBindResult),
+    Challenge(NodescaleIdentityChallengeResult),
+}
+
+pub(crate) async fn dispatch_relay_typed_control_for_local(
+    handlers: &DirectControlHandlers,
+    registry_peer_id: &str,
+    frame: &keryx_proto::v1::RelayFrame,
+) -> Result<Option<LocalTypedControlDispatch>> {
+    validate_relay_frame_exactly_one_payload(frame)?;
+    if frame.nodescale_identity_bind_v1.is_none() && frame.nodescale_identity_challenge_v1.is_none()
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        frame.destination_node_id == registry_peer_id,
+        "typed direct control frame destination does not match the registered local node"
+    );
+
+    if let Some(operation) = frame.nodescale_identity_challenge_v1.clone() {
+        anyhow::ensure!(
+            frame.task.is_none()
+                && frame.result.is_none()
+                && frame.nodescale_identity_bind_v1.is_none(),
+            "direct challenge frame must carry only one control payload"
+        );
+        return dispatch_nodescale_identity_challenge_v1(
+            handlers,
+            AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
+            operation,
+        )
+        .await
+        .map(|result| Some(LocalTypedControlDispatch::Challenge(result)));
+    }
+
+    let operation = frame
+        .nodescale_identity_bind_v1
+        .clone()
+        .expect("typed bind frame was checked above");
+    anyhow::ensure!(
+        frame.task.is_none()
+            && frame.result.is_none()
+            && frame.nodescale_identity_challenge_v1.is_none(),
+        "direct control frame must carry only one control payload"
+    );
+    dispatch_nodescale_identity_bind_v1(
+        handlers,
+        AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
+        operation,
+    )
+    .await
+    .map(|result| Some(LocalTypedControlDispatch::Bind(result)))
+}
+
+async fn dispatch_relay_typed_control_for_local_bounded(
+    handlers: &DirectControlHandlers,
+    registry_peer_id: &str,
+    frame: &keryx_proto::v1::RelayFrame,
+    handler_timeout: Duration,
+) -> Result<Option<LocalTypedControlDispatch>> {
+    validate_relay_frame_exactly_one_payload(frame)?;
+    let is_challenge = frame.nodescale_identity_challenge_v1.is_some();
+    let is_bind = frame.nodescale_identity_bind_v1.is_some();
+    if !is_challenge && !is_bind {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        frame.destination_node_id == registry_peer_id,
+        "typed direct control frame destination does not match the registered local node"
+    );
+
+    match tokio::time::timeout(
+        handler_timeout,
+        dispatch_relay_typed_control_for_local(handlers, registry_peer_id, frame),
+    )
+    .await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => {
+            tracing::warn!(
+                relay_frame_id = %frame.frame_id,
+                "typed direct-control handler failed; completing with a bounded rejection"
+            );
+            Ok(Some(direct_control_rejection(is_challenge, false)))
+        }
+        Err(_) => {
+            tracing::warn!(
+                relay_frame_id = %frame.frame_id,
+                "typed direct-control handler timed out; completing with a bounded rejection"
+            );
+            Ok(Some(direct_control_rejection(is_challenge, true)))
+        }
+    }
+}
+
+fn direct_control_rejection(is_challenge: bool, timed_out: bool) -> LocalTypedControlDispatch {
+    let (reason, code) = if timed_out {
+        ("direct-control handler timed out", "handler_timeout")
+    } else {
+        ("direct-control handler failed", "handler_failed")
+    };
+    if is_challenge {
+        LocalTypedControlDispatch::Challenge(NodescaleIdentityChallengeResult {
+            disposition: NodescaleIdentityChallengeDisposition::Rejected as i32,
+            reason: reason.to_string(),
+            code: code.to_string(),
+            ..NodescaleIdentityChallengeResult::default()
+        })
+    } else {
+        LocalTypedControlDispatch::Bind(NodescaleIdentityBindResult {
+            disposition: NodescaleIdentityBindDisposition::Rejected as i32,
+            accepted: false,
+            binding_id: String::new(),
+            generation: 0,
+            revision: 0,
+            reason: reason.to_string(),
+            code: code.to_string(),
+        })
+    }
+}
+
+async fn await_bounded_direct_control_settlement<F>(settlement: F, timeout: Duration) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::time::timeout(timeout, settlement)
+        .await
+        .context("typed direct-control completion timed out")??;
+    Ok(())
+}
+
+async fn complete_local_typed_control(
+    relay_endpoint: &str,
+    registry_peer_id: &str,
+    node_token: Option<&str>,
+    frame_id: &str,
+    dispatch: LocalTypedControlDispatch,
+) -> Result<()> {
+    await_bounded_direct_control_settlement(
+        async {
+            let completion_channel = secure_endpoint_builder(relay_endpoint)?.connect().await?;
+            let mut completion_client = KeryxRelayClient::new(completion_channel);
+            match dispatch {
+                LocalTypedControlDispatch::Challenge(result) => {
+                    let mut request = Request::new(CompleteNodescaleIdentityChallengeRequest {
+                        frame_id: frame_id.to_string(),
+                        result: Some(result),
+                    });
+                    add_node_auth_metadata(&mut request, registry_peer_id, node_token)?;
+                    completion_client
+                        .complete_nodescale_identity_challenge(request)
+                        .await
+                        .context("keryx node stream: relay challenge completion failed")?;
+                }
+                LocalTypedControlDispatch::Bind(result) => {
+                    let mut request = Request::new(CompleteNodescaleIdentityBindRequest {
+                        frame_id: frame_id.to_string(),
+                        result: Some(result),
+                    });
+                    add_node_auth_metadata(&mut request, registry_peer_id, node_token)?;
+                    completion_client
+                        .complete_nodescale_identity_bind(request)
+                        .await
+                        .context("keryx node stream: relay direct-control completion failed")?;
+                }
+            }
+            Ok(())
+        },
+        DIRECT_CONTROL_COMPLETION_TIMEOUT,
+    )
+    .await
 }
 
 /// Run an edge node until SIGINT: listen, dial bootstrap peers, optionally register skills.
@@ -236,6 +489,7 @@ pub async fn run_edge_node_with_direct_control_handlers(
         &registry_peer_id,
         daemon_endpoint().is_some(),
         direct_control_handlers.has_nodescale_identity_bind_handler(),
+        direct_control_handlers.has_nodescale_identity_challenge_handler(),
     )
     .await?;
 
@@ -527,7 +781,10 @@ async fn run_relay_stream(
     .await
 }
 
-async fn run_relay_stream_with_direct_control_handlers(
+/// Runs one configured authenticated edge stream until the relay closes it or
+/// the caller cancels the future. This is the deterministic composition seam
+/// for applications that own their own readiness and shutdown lifecycle.
+pub async fn run_relay_stream_with_direct_control_handlers(
     relay_endpoint: String,
     registry_peer_id: String,
     node_token: Option<String>,
@@ -553,36 +810,22 @@ async fn run_relay_stream_with_direct_control_handlers(
 
     while let Some(frame) = stream.next().await {
         let frame = frame.context("keryx node stream: relay frame failed")?;
-        if let Some(operation) = frame.nodescale_identity_bind_v1.clone() {
-            anyhow::ensure!(
-                frame.task.is_none() && frame.result.is_none(),
-                "direct control frame must not carry task or result payload"
-            );
-            let result = dispatch_nodescale_identity_bind_v1(
-                &direct_control_handlers,
-                AuthenticatedDirectContext {
-                    authenticated_source_node_id: frame.authenticated_source_node_id.clone(),
-                    destination_node_id: frame.destination_node_id.clone(),
-                    relay_frame_id: frame.frame_id.clone(),
-                },
-                operation,
-            )
-            .await?;
-            let completion_channel = secure_endpoint_builder(&relay_endpoint)?.connect().await?;
-            let mut completion_client = KeryxRelayClient::new(completion_channel);
-            let mut completion_request = Request::new(CompleteNodescaleIdentityBindRequest {
-                frame_id: frame.frame_id,
-                result: Some(result),
-            });
-            add_node_auth_metadata(
-                &mut completion_request,
+        if let Some(dispatch) = dispatch_relay_typed_control_for_local_bounded(
+            &direct_control_handlers,
+            &registry_peer_id,
+            &frame,
+            DIRECT_CONTROL_HANDLER_TIMEOUT,
+        )
+        .await?
+        {
+            complete_local_typed_control(
+                &relay_endpoint,
                 &registry_peer_id,
                 node_token.as_deref(),
-            )?;
-            completion_client
-                .complete_nodescale_identity_bind(completion_request)
-                .await
-                .context("keryx node stream: relay direct-control completion failed")?;
+                &frame.frame_id,
+                dispatch,
+            )
+            .await?;
             continue;
         }
 
@@ -629,6 +872,18 @@ async fn run_relay_stream_with_direct_control_handlers(
             .context("keryx node stream: relay AckFrame failed")?;
     }
     drop(request_sender);
+    Ok(())
+}
+
+fn validate_relay_frame_exactly_one_payload(frame: &keryx_proto::v1::RelayFrame) -> Result<()> {
+    let payload_count = usize::from(frame.task.is_some())
+        + usize::from(frame.result.is_some())
+        + usize::from(frame.nodescale_identity_bind_v1.is_some())
+        + usize::from(frame.nodescale_identity_challenge_v1.is_some());
+    anyhow::ensure!(
+        payload_count == 1,
+        "relay frame must carry exactly one payload kind"
+    );
     Ok(())
 }
 
@@ -680,6 +935,7 @@ async fn register_node_skills(
     registry_peer_id: &str,
     daemon_task_consumer_enabled: bool,
     nodescale_identity_bind_enabled: bool,
+    nodescale_identity_challenge_enabled: bool,
 ) -> Result<()> {
     let Some(endpoint) = registry_endpoint() else {
         return Ok(());
@@ -694,6 +950,9 @@ async fn register_node_skills(
     }
     if nodescale_identity_bind_enabled {
         protocol_features.push("nodescale_identity_bind_v1".to_string());
+    }
+    if nodescale_identity_challenge_enabled {
+        protocol_features.push(NODESCALE_IDENTITY_CHALLENGE_FEATURE.to_string());
     }
 
     let mut client = connect_registry_client(&endpoint).await?;

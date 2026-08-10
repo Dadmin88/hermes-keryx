@@ -174,6 +174,7 @@ Current examples include:
 - `result_artifact_bytes_v1` for bounded byte-bearing terminal result artifacts;
 - `daemon_task_consumer_v1` for nodes backed by a daemon that can consume task and result frames;
 - `nodescale_identity_bind_v1` for the typed Nodescale identity-binding control path.
+- `nodescale_identity_challenge_v1` for the typed authenticated Nodescale challenge control path.
 
 Unknown or unsupported destinations fail explicitly when a requested feature cannot safely be downgraded.
 
@@ -195,6 +196,14 @@ Properties of this path:
 Timeout, cancellation, restart, missing handler, or handler failure cannot fabricate semantic success.
 
 This control path exists so higher-level identity systems can use Keryx runtime provenance without pretending a generic task body is authenticated identity.
+
+## Authenticated Nodescale identity challenge
+
+Keryx also exposes the typed non-execution operation `nodescale.identity.challenge.v1`.
+
+The challenge request carries no authoritative sender, peer, or nonce identity. The relay derives the source from authenticated node credentials, requires the destination to advertise `nodescale_identity_challenge_v1`, and returns a bounded typed result only through the authenticated destination completion path.
+
+Keryx provides authenticated at-least-once transport for this operation, not durable challenge issuance authority. The installed destination handler is responsible for durable serialization and deduplication of `(authenticated_sender_peer_id, operation_id)` across duplicate, concurrent, and restart retries. Keryx does not persist challenge secrets, route them through generic task/result storage, or expose this control path to Python task handlers.
 
 ## Remote result artifacts
 

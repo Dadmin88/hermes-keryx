@@ -5,7 +5,9 @@ use keryx_daemon::{
     handle_incoming_task, IncomingDispatchConfig, IncomingHandleResult, IncomingRelayTask,
     KeryxDaemonConfig, KeryxDaemonRuntime, StaticSenderAllowlist,
 };
-use keryx_proto::v1::{ClaimTaskRequest, TaskEnvelope, TaskId};
+use keryx_proto::v1::{
+    ClaimTaskRequest, NodescaleIdentityBindV1, RelayFrame, TaskEnvelope, TaskId,
+};
 use tokio::sync::mpsc;
 
 mod common;
@@ -149,6 +151,64 @@ async fn incoming_task_accepted_into_store() {
         .unwrap()
         .into_inner();
     assert_eq!(claim.status, "running");
+}
+
+#[tokio::test]
+async fn invalid_relay_payload_frames_cannot_reach_daemon_storage_or_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
+        dir.path().join("mixed-control-home"),
+        0,
+    ))
+    .await
+    .unwrap();
+    let submitted_before = runtime.metrics().snapshot().tasks_submitted;
+
+    let mixed_frames = [
+        RelayFrame {
+            frame_id: "bind-task-frame".to_string(),
+            task: Some(envelope("mixed-bind-task")),
+            result: None,
+            authenticated_source_node_id: "node-trusted".to_string(),
+            destination_node_id: "node-local".to_string(),
+            nodescale_identity_bind_v1: Some(NodescaleIdentityBindV1::default()),
+            nodescale_identity_challenge_v1: None,
+        },
+        RelayFrame {
+            frame_id: "task-result-frame".to_string(),
+            task: Some(envelope("mixed-task-result")),
+            result: Some(keryx_proto::v1::TaskResultEnvelope::default()),
+            authenticated_source_node_id: "node-trusted".to_string(),
+            destination_node_id: "node-local".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
+        },
+        RelayFrame {
+            frame_id: "zero-payload-frame".to_string(),
+            task: None,
+            result: None,
+            authenticated_source_node_id: "node-trusted".to_string(),
+            destination_node_id: "node-local".to_string(),
+            nodescale_identity_bind_v1: None,
+            nodescale_identity_challenge_v1: None,
+        },
+    ];
+
+    for frame in mixed_frames {
+        assert!(IncomingRelayTask::from_relay_frame("node-trusted", frame).is_err());
+    }
+
+    for task_id in ["mixed-bind-task", "mixed-task-result"] {
+        assert!(runtime
+            .store()
+            .get_task(&CoreTaskId::new(task_id).unwrap())
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        runtime.metrics().snapshot().tasks_submitted,
+        submitted_before
+    );
 }
 
 #[tokio::test]

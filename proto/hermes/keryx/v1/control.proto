@@ -32,3 +32,35 @@ message NodescaleIdentityBindResult {
   string reason = 6;
   string code = 7;
 }
+
+// Dedicated at-least-once challenge issuance request. The relay derives source
+// identity exclusively from authenticated transport metadata; the installed
+// Nodescale handler must durably deduplicate by (authenticated source, operation_id).
+// This message intentionally contains no peer, source, sender, nonce, or task fields.
+message NodescaleIdentityChallengeV1 {
+  string operation_id = 1;
+  string network_id = 2;
+  string device_id = 3;
+  string join_session_id = 4;
+  string agent_version = 5;
+}
+
+enum NodescaleIdentityChallengeDisposition {
+  NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_UNSPECIFIED = 0;
+  NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_ISSUED = 1;
+  NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_REJECTED = 2;
+}
+
+// The plaintext challenge_secret is delivery-only, returned only over the
+// authenticated completion response. It must never enter persistence, logs,
+// task envelopes, generic ACKs, callbacks, or dead letters.
+message NodescaleIdentityChallengeResult {
+  NodescaleIdentityChallengeDisposition disposition = 1;
+  bool accepted = 2;
+  string challenge_id = 3;
+  string challenge_secret = 4;
+  uint64 binding_generation = 5;
+  uint64 expires_at_unix_ms = 6;
+  string reason = 7;
+  string code = 8;
+}

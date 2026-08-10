@@ -24,17 +24,23 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dhermes/keryx/v1/control.proto\x12\x0fhermes.keryx.v1\"\xb9\x01\n\x17NodescaleIdentityBindV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\rbinding_nonce\x18\x05 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x06 \x01(\x04\x12\x15\n\ragent_version\x18\x07 \x01(\t\"\xcf\x01\n\x1bNodescaleIdentityBindResult\x12\x46\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x31.hermes.keryx.v1.NodescaleIdentityBindDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x12\n\nbinding_id\x18\x03 \x01(\t\x12\x12\n\ngeneration\x18\x04 \x01(\x04\x12\x10\n\x08revision\x18\x05 \x01(\x04\x12\x0e\n\x06reason\x18\x06 \x01(\t\x12\x0c\n\x04\x63ode\x18\x07 \x01(\t*\xf4\x01\n NodescaleIdentityBindDisposition\x12\x33\n/NODESCALE_IDENTITY_BIND_DISPOSITION_UNSPECIFIED\x10\x00\x12.\n*NODESCALE_IDENTITY_BIND_DISPOSITION_ACTIVE\x10\x01\x12\x39\n5NODESCALE_IDENTITY_BIND_DISPOSITION_ALREADY_CONFIRMED\x10\x02\x12\x30\n,NODESCALE_IDENTITY_BIND_DISPOSITION_REJECTED\x10\x03\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dhermes/keryx/v1/control.proto\x12\x0fhermes.keryx.v1\"\xb9\x01\n\x17NodescaleIdentityBindV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\rbinding_nonce\x18\x05 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x06 \x01(\x04\x12\x15\n\ragent_version\x18\x07 \x01(\t\"\xcf\x01\n\x1bNodescaleIdentityBindResult\x12\x46\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x31.hermes.keryx.v1.NodescaleIdentityBindDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x12\n\nbinding_id\x18\x03 \x01(\t\x12\x12\n\ngeneration\x18\x04 \x01(\x04\x12\x10\n\x08revision\x18\x05 \x01(\x04\x12\x0e\n\x06reason\x18\x06 \x01(\t\x12\x0c\n\x04\x63ode\x18\x07 \x01(\t\"\x8b\x01\n\x1cNodescaleIdentityChallengeV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\ragent_version\x18\x05 \x01(\t\"\x87\x02\n NodescaleIdentityChallengeResult\x12K\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x36.hermes.keryx.v1.NodescaleIdentityChallengeDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x14\n\x0c\x63hallenge_id\x18\x03 \x01(\t\x12\x18\n\x10\x63hallenge_secret\x18\x04 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x05 \x01(\x04\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x06 \x01(\x04\x12\x0e\n\x06reason\x18\x07 \x01(\t\x12\x0c\n\x04\x63ode\x18\x08 \x01(\t*\xf4\x01\n NodescaleIdentityBindDisposition\x12\x33\n/NODESCALE_IDENTITY_BIND_DISPOSITION_UNSPECIFIED\x10\x00\x12.\n*NODESCALE_IDENTITY_BIND_DISPOSITION_ACTIVE\x10\x01\x12\x39\n5NODESCALE_IDENTITY_BIND_DISPOSITION_ALREADY_CONFIRMED\x10\x02\x12\x30\n,NODESCALE_IDENTITY_BIND_DISPOSITION_REJECTED\x10\x03*\xcd\x01\n%NodescaleIdentityChallengeDisposition\x12\x38\n4NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_UNSPECIFIED\x10\x00\x12\x33\n/NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_ISSUED\x10\x01\x12\x35\n1NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_REJECTED\x10\x02\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'hermes.keryx.v1.control_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_start=449
-  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_end=693
+  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_start=857
+  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_end=1101
+  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_start=1104
+  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_end=1309
   _globals['_NODESCALEIDENTITYBINDV1']._serialized_start=51
   _globals['_NODESCALEIDENTITYBINDV1']._serialized_end=236
   _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_start=239
   _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_end=446
+  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_start=449
+  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_end=588
+  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_start=591
+  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_end=854
 # @@protoc_insertion_point(module_scope)
