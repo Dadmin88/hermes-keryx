@@ -11,6 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/hermes/keryx/v1/result.proto",
         "../../proto/hermes/keryx/v1/event.proto",
         "../../proto/hermes/keryx/v1/policy.proto",
+        "../../proto/hermes/keryx/v1/control.proto",
         "../../proto/hermes/keryx/v1/daemon.proto",
         "../../proto/hermes/keryx/v1/relay.proto",
         "../../proto/hermes/keryx/v1/registry.proto",

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use keryx_daemon::grpc_transport::{ca_cert_path_from_env, secure_grpc_endpoint};
 use keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
 use keryx_proto::v1::{DiscoverBySkillRequest, ListPeersRequest, ReadinessRequest};
@@ -94,9 +95,11 @@ async fn run_status() -> Result<()> {
 
 async fn run_discover(skill: &str, limit: u32) -> Result<()> {
     let endpoint = require_registry_endpoint()?;
-    let mut client = RegistryServiceClient::connect(endpoint.clone())
+    let channel = secure_grpc_endpoint(&endpoint, ca_cert_path_from_env().as_deref())?
+        .connect()
         .await
         .with_context(|| format!("keryx node discover: registry unavailable at {endpoint}"))?;
+    let mut client = RegistryServiceClient::new(channel);
     let response = client
         .discover_by_skill(DiscoverBySkillRequest {
             skill_id: skill.to_string(),

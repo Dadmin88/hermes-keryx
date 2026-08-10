@@ -22,6 +22,7 @@ fn envelope(task_id: &str) -> TaskEnvelope {
         status: 0,
         messages: Vec::new(),
         metadata: Default::default(),
+        deadline_ms: 0,
     }
 }
 
@@ -33,6 +34,7 @@ fn sized_envelope(task_id: &str, raw_len: usize) -> TaskEnvelope {
         correlation_id: None,
         idempotency_key: None,
         status: 0,
+        deadline_ms: 0,
         messages: vec![TaskMessage {
             parts: vec![TaskMessagePart {
                 media_type: "application/octet-stream".to_string(),

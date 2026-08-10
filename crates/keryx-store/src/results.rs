@@ -1,12 +1,19 @@
 //! Durable authenticated task context, terminal results, and result-delivery outbox.
 
-use keryx_core::{AgentId, KeryxEventType, LeaseId, PeerId, RetryPolicy, TaskId, TaskStatus};
+use std::{collections::HashSet, path::Path};
+
+use keryx_core::{
+    origin_result_artifact_id, AgentId, ArtifactMeta, Digest, KeryxEventType, LeaseId, PeerId,
+    RetryPolicy, TaskId, TaskStatus, MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES,
+};
 use sqlx::Row;
 
 use super::*;
 
 pub const AUTHENTICATED_SENDER_METADATA_KEY: &str = "keryx.authenticated_sender_peer_id";
 pub const EXPECTED_EXECUTOR_METADATA_KEY: &str = "keryx.expected_executor_peer_id";
+pub const MAX_RESULT_DELIVERY_ATTEMPTS: u32 = 10;
+pub const MAX_RESULT_DELIVERY_RETRY_DELAY_MS: i64 = 60_000;
 
 pub(super) const MIGRATION_007: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS task_transport_context (task_id TEXT PRIMARY KEY, authenticated_sender_peer_id TEXT, expected_executor_peer_id TEXT, destination_peer_id TEXT NOT NULL, relay_frame_id TEXT, received_at_ms INTEGER NOT NULL, FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE)",
@@ -14,6 +21,32 @@ pub(super) const MIGRATION_007: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS result_outbox (delivery_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, target_peer_id TEXT NOT NULL, state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL, lease_owner TEXT, lease_expires_at_ms INTEGER, last_error TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, FOREIGN KEY(task_id) REFERENCES task_terminal_results(task_id) ON DELETE CASCADE)",
     "CREATE INDEX IF NOT EXISTS result_outbox_due_idx ON result_outbox(state, next_attempt_at_ms, created_at_ms, delivery_id)",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteResultTerminalReason {
+    DeadlineExpired,
+    Canceled,
+}
+
+impl std::fmt::Display for RemoteResultTerminalReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::DeadlineExpired => "deadline_expired",
+            Self::Canceled => "canceled",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteResultIngestOutcome {
+    Applied(TaskRecord),
+    Duplicate(TaskRecord),
+    SettledTerminal {
+        task: TaskRecord,
+        reason: RemoteResultTerminalReason,
+        canonical_result: Option<TerminalResultRecord>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTransportContextRecord {
@@ -33,6 +66,17 @@ pub struct TerminalResultRecord {
     pub return_peer_id: Option<PeerId>,
     pub executor_peer_id: PeerId,
     pub created_at_ms: i64,
+}
+
+/// Store-level artifact ingress record. This intentionally has no protobuf dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginResultArtifact {
+    /// The result-list ordinal assigned by the origin protocol boundary.
+    pub ordinal: u32,
+    /// Canonical descriptor that will be persisted after byte validation.
+    pub meta: ArtifactMeta,
+    /// Transport bytes; zero bytes are valid when this record exists.
+    pub content: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +157,74 @@ fn make_outbox(result: &TerminalResultRecord) -> Option<ResultOutboxRecord> {
         })
 }
 
+fn validate_origin_result_artifacts(
+    task_id: &TaskId,
+    artifacts: &[OriginResultArtifact],
+) -> StoreResult<Vec<ArtifactRecord>> {
+    let mut aggregate_len = 0_u64;
+    let mut records = Vec::with_capacity(artifacts.len());
+    let mut next_minimum_ordinal = 0_u32;
+    for artifact in artifacts {
+        if artifact.ordinal < next_minimum_ordinal {
+            return Err(StoreError::OriginResultArtifactOrdinalMismatch {
+                expected: next_minimum_ordinal,
+                actual: artifact.ordinal,
+            });
+        }
+        next_minimum_ordinal = artifact.ordinal.checked_add(1).ok_or(
+            StoreError::OriginResultArtifactOrdinalMismatch {
+                expected: artifact.ordinal,
+                actual: artifact.ordinal,
+            },
+        )?;
+        if artifact.meta.task_id != *task_id {
+            return Err(StoreError::OriginResultArtifactTaskMismatch {
+                task_id: task_id.clone(),
+                artifact_task_id: artifact.meta.task_id.clone(),
+            });
+        }
+        if artifact.meta.artifact_id != origin_result_artifact_id(task_id, artifact.ordinal) {
+            return Err(StoreError::OriginResultArtifactIdMismatch {
+                task_id: task_id.clone(),
+                ordinal: artifact.ordinal,
+            });
+        }
+        let actual_len = artifact.content.len() as u64;
+        if artifact.meta.byte_len != actual_len {
+            return Err(StoreError::ArtifactLengthMismatch {
+                declared: artifact.meta.byte_len,
+                actual: actual_len,
+            });
+        }
+        let actual_digest = Digest::compute(&artifact.content);
+        if artifact.meta.digest != actual_digest {
+            return Err(StoreError::DigestMismatch {
+                expected: artifact.meta.digest.as_str().to_owned(),
+                actual: actual_digest.as_str().to_owned(),
+            });
+        }
+        aggregate_len =
+            aggregate_len
+                .checked_add(actual_len)
+                .ok_or(StoreError::ArtifactTooLarge {
+                    byte_len: u64::MAX,
+                    limit_bytes: MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64,
+                })?;
+        if aggregate_len > MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64 {
+            return Err(StoreError::ArtifactTooLarge {
+                byte_len: aggregate_len,
+                limit_bytes: MAX_CROSS_NODE_RESULT_ARTIFACT_BYTES as u64,
+            });
+        }
+        records.push(artifact_record_from_meta(
+            &artifact.meta,
+            actual_digest,
+            actual_len,
+        ));
+    }
+    Ok(records)
+}
+
 fn ensure_result_task(result: &TerminalResultRecord, task_id: &TaskId) -> StoreResult<()> {
     result.validate()?;
     if &result.task_id == task_id {
@@ -136,29 +248,148 @@ fn ensure_context_task(context: &TaskTransportContextRecord, task_id: &TaskId) -
     }
 }
 
+fn same_delivered_envelope(left: &TaskEnvelopeRecord, right: &TaskEnvelopeRecord) -> bool {
+    left.task_id == right.task_id && left.encoded_envelope == right.encoded_envelope
+}
+
+fn same_transport_identity(
+    left: &TaskTransportContextRecord,
+    right: &TaskTransportContextRecord,
+) -> bool {
+    left.task_id == right.task_id
+        && left.authenticated_sender_peer_id == right.authenticated_sender_peer_id
+        && left.expected_executor_peer_id == right.expected_executor_peer_id
+        && left.destination_peer_id == right.destination_peer_id
+}
+
 impl InMemoryStore {
+    pub fn cancel_task_with_result(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+        result: TerminalResultRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_result_task(&result, task_id)?;
+        result.validate()?;
+        let mut state = self.lock()?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+        if task.status == TaskStatus::Running {
+            let active = state
+                .leases
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        if state.terminal_results.contains_key(task_id) {
+            return Err(StoreError::TerminalResultConflict(task_id.clone()));
+        }
+        if result.terminal_status != transition.to {
+            return Err(StoreError::TerminalResultNotTerminal(task_id.clone()));
+        }
+        let mut updated = task;
+        updated.status = transition.to;
+        state.leases.remove(task_id);
+        append_in_memory_event(
+            &mut state,
+            task_id,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        );
+        state.tasks.insert(task_id.clone(), updated.clone());
+        if let Some(outbox) = make_outbox(&result) {
+            state
+                .result_outbox
+                .insert(outbox.delivery_id.clone(), outbox);
+        }
+        state.terminal_results.insert(task_id.clone(), result);
+        Ok(updated)
+    }
+
+    pub fn put_transport_context(
+        &self,
+        context: TaskTransportContextRecord,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let mut state = self.lock()?;
+        if !state.tasks.contains_key(&context.task_id) {
+            return Err(StoreError::TaskNotFound(context.task_id));
+        }
+        match state.transport_contexts.get(&context.task_id) {
+            Some(existing) if existing == &context => return Ok(existing.clone()),
+            Some(_) => return Err(StoreError::TransportContextConflict(context.task_id)),
+            None => {}
+        }
+        state
+            .transport_contexts
+            .insert(context.task_id.clone(), context.clone());
+        Ok(context)
+    }
+
     pub fn accept_task_with_envelope_and_context(
         &self,
         task: TaskRecord,
         envelope: TaskEnvelopeRecord,
         context: TaskTransportContextRecord,
     ) -> StoreResult<TaskRecord> {
+        validate_accepted_task_status(&task)?;
+        ensure_pending_accept(&task)?;
+        ensure_matching_envelope_task_id(&task, &envelope)?;
         ensure_context_task(&context, task.task_id())?;
-        let accepted = self.accept_task_with_envelope(task, envelope)?;
         let mut state = self.lock()?;
-        match state.transport_contexts.get(accepted.task_id()) {
-            Some(existing) if existing == &context => return Ok(accepted),
-            Some(_) => {
-                return Err(StoreError::TransportContextConflict(
-                    accepted.task_id().clone(),
-                ))
+        if let Some(existing) = state.tasks.get(task.task_id()).cloned() {
+            if existing == task
+                && state
+                    .envelopes
+                    .get(task.task_id())
+                    .is_some_and(|stored| same_delivered_envelope(stored, &envelope))
+                && state
+                    .transport_contexts
+                    .get(task.task_id())
+                    .is_some_and(|stored| same_transport_identity(stored, &context))
+            {
+                if state
+                    .transport_contexts
+                    .get(task.task_id())
+                    .is_some_and(|stored| stored.relay_frame_id != context.relay_frame_id)
+                {
+                    state
+                        .transport_contexts
+                        .insert(task.task_id().clone(), context);
+                }
+                return Ok(existing);
             }
-            None => {}
+            return Err(StoreError::TransportContextConflict(task.task_id().clone()));
         }
-        state
-            .transport_contexts
-            .insert(accepted.task_id().clone(), context);
-        Ok(accepted)
+        if let Some(key) = &task.idempotency_key {
+            if let Some(existing_task_id) = state.idempotency.get(key) {
+                return Err(StoreError::IdempotencyConflict {
+                    key: key.clone(),
+                    existing_task_id: existing_task_id.clone(),
+                });
+            }
+        }
+        let task_id = task.task_id().clone();
+        if let Some(key) = &task.idempotency_key {
+            state.idempotency.insert(key.clone(), task_id.clone());
+        }
+        append_in_memory_event(
+            &mut state,
+            &task_id,
+            KeryxEventType::TaskAccepted,
+            None,
+            task.status,
+        );
+        state.tasks.insert(task_id.clone(), task.clone());
+        state.envelopes.insert(task_id.clone(), envelope);
+        state.transport_contexts.insert(task_id, context);
+        Ok(task)
     }
 
     pub fn get_transport_context(
@@ -281,6 +512,18 @@ impl InMemoryStore {
             .ok_or_else(|| StoreError::TerminalResultNotFound(task_id.clone()))
     }
 
+    pub fn result_delivery_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Option<ResultOutboxRecord>> {
+        Ok(self
+            .lock()?
+            .result_outbox
+            .values()
+            .find(|row| &row.task_id == task_id)
+            .cloned())
+    }
+
     pub fn pending_result_deliveries(&self, limit: usize) -> StoreResult<Vec<ResultOutboxRecord>> {
         let state = self.lock()?;
         let mut values = state
@@ -300,6 +543,127 @@ impl InMemoryStore {
 }
 
 impl SqliteStore {
+    pub async fn cancel_task_with_result(
+        &self,
+        task_id: &TaskId,
+        _reason: &str,
+        now_ms: i64,
+        result: TerminalResultRecord,
+    ) -> StoreResult<TaskRecord> {
+        ensure_result_task(&result, task_id)?;
+        result.validate()?;
+        let mut tx = self.pool.begin().await?;
+        let task = fetch_task_with_executor(&mut tx, task_id).await?;
+        if task.status == TaskStatus::Running {
+            let active = fetch_active_lease_with_executor(&mut tx, task_id)
+                .await?
+                .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            ensure_active_lease_unexpired(&active, now_ms)?;
+        }
+        let transition = validate_cancel_transition(task.status)?;
+        if fetch_terminal_result_optional(&mut tx, task_id)
+            .await?
+            .is_some()
+        {
+            return Err(StoreError::TerminalResultConflict(task_id.clone()));
+        }
+        if result.terminal_status != transition.to {
+            return Err(StoreError::TerminalResultNotTerminal(task_id.clone()));
+        }
+        let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+        deactivate_lease_for_task_with_executor(&mut tx, task_id).await?;
+        update_task_status_with_executor(&mut tx, task_id, transition.to).await?;
+        insert_event(
+            &mut tx,
+            task_id,
+            sequence,
+            transition.event_type,
+            Some(transition.from),
+            transition.to,
+        )
+        .await?;
+        insert_terminal_result_and_outbox(&mut tx, &result).await?;
+        tx.commit().await?;
+        self.get_task(task_id).await
+    }
+
+    pub async fn put_transport_context(
+        &self,
+        context: TaskTransportContextRecord,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let mut tx = self.pool.begin().await?;
+        match fetch_task_with_executor(&mut tx, &context.task_id).await {
+            Ok(_) => {}
+            Err(StoreError::TaskNotFound(_)) => {
+                return Err(StoreError::TaskNotFound(context.task_id));
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(existing) = fetch_transport_context_optional(&mut tx, &context.task_id).await? {
+            if existing == context {
+                tx.commit().await?;
+                return Ok(existing);
+            }
+            return Err(StoreError::TransportContextConflict(context.task_id));
+        }
+        insert_transport_context(&mut tx, &context).await?;
+        tx.commit().await?;
+        Ok(context)
+    }
+
+    pub async fn record_relay_receipt(
+        &self,
+        task_id: &TaskId,
+        authenticated_source_peer_id: &PeerId,
+        accepted_destination_peer_id: &PeerId,
+        relay_frame_id: &str,
+        accepted_at_ms: i64,
+    ) -> StoreResult<TaskTransportContextRecord> {
+        let frame_id = relay_frame_id.trim();
+        if frame_id.is_empty() {
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut context = fetch_transport_context_optional(&mut tx, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TransportContextNotFound(task_id.clone()))?;
+        if context.expected_executor_peer_id.as_ref() != Some(accepted_destination_peer_id)
+            || context.destination_peer_id != *accepted_destination_peer_id
+        {
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        if let Some(existing_frame_id) = context.relay_frame_id.as_deref() {
+            if existing_frame_id == frame_id
+                && context.authenticated_sender_peer_id.as_ref()
+                    == Some(authenticated_source_peer_id)
+                && context.received_at_ms == accepted_at_ms
+            {
+                tx.commit().await?;
+                return Ok(context);
+            }
+            if context.authenticated_sender_peer_id.as_ref() != Some(authenticated_source_peer_id) {
+                return Err(StoreError::TransportContextConflict(task_id.clone()));
+            }
+        }
+        let update = sqlx::query(
+            "UPDATE task_transport_context SET authenticated_sender_peer_id = ?, relay_frame_id = ?, received_at_ms = ? WHERE task_id = ?",
+        )
+        .bind(authenticated_source_peer_id.as_str())
+        .bind(frame_id)
+        .bind(accepted_at_ms)
+        .bind(task_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if update.rows_affected() != 1 {
+            return Err(StoreError::TransportContextConflict(task_id.clone()));
+        }
+        context.authenticated_sender_peer_id = Some(authenticated_source_peer_id.clone());
+        context.relay_frame_id = Some(frame_id.to_string());
+        context.received_at_ms = accepted_at_ms;
+        tx.commit().await?;
+        Ok(context)
+    }
+
     pub async fn accept_task_with_envelope_and_context(
         &self,
         task: TaskRecord,
@@ -318,9 +682,26 @@ impl SqliteStore {
             let existing_context =
                 fetch_transport_context_optional(&mut tx, task.task_id()).await?;
             if existing == task
-                && existing_envelope.as_ref() == Some(&envelope)
-                && existing_context.as_ref() == Some(&context)
+                && existing_envelope
+                    .as_ref()
+                    .is_some_and(|stored| same_delivered_envelope(stored, &envelope))
+                && existing_context
+                    .as_ref()
+                    .is_some_and(|stored| same_transport_identity(stored, &context))
             {
+                if existing_context
+                    .as_ref()
+                    .is_some_and(|stored| stored.relay_frame_id != context.relay_frame_id)
+                {
+                    sqlx::query(
+                        "UPDATE task_transport_context SET relay_frame_id = ?, received_at_ms = ? WHERE task_id = ?",
+                    )
+                    .bind(context.relay_frame_id.as_deref())
+                    .bind(context.received_at_ms)
+                    .bind(task.task_id().as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 tx.commit().await?;
                 return Ok(existing);
             }
@@ -482,6 +863,17 @@ impl SqliteStore {
         Ok(value)
     }
 
+    pub async fn result_delivery_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> StoreResult<Option<ResultOutboxRecord>> {
+        let row = sqlx::query("SELECT delivery_id, task_id, target_peer_id, state, attempt_count, next_attempt_at_ms, lease_owner, lease_expires_at_ms, last_error, created_at_ms, updated_at_ms FROM result_outbox WHERE task_id = ?")
+            .bind(task_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_outbox).transpose()
+    }
+
     pub async fn pending_result_deliveries(
         &self,
         limit: usize,
@@ -500,7 +892,12 @@ impl SqliteStore {
         lease_duration_ms: i64,
     ) -> StoreResult<Option<(ResultOutboxRecord, TerminalResultRecord)>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE result_outbox SET state = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ? WHERE state = 'leased' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?")
+        sqlx::query("UPDATE result_outbox SET state = CASE WHEN attempt_count >= ? THEN 'dead_lettered' ELSE 'pending' END, attempt_count = CASE WHEN attempt_count >= ? THEN ? ELSE attempt_count + 1 END, next_attempt_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, last_error = ?, updated_at_ms = ? WHERE state = 'leased' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?")
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS - 1))
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS - 1))
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS))
+            .bind(now_ms)
+            .bind("result delivery lease expired")
             .bind(now_ms)
             .bind(now_ms)
             .execute(&mut *tx)
@@ -542,12 +939,15 @@ impl SqliteStore {
         &self,
         delivery_id: &str,
         worker_id: &str,
+        lease_expires_at_ms: i64,
         now_ms: i64,
     ) -> StoreResult<()> {
-        let changed = sqlx::query("UPDATE result_outbox SET state = 'delivered', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ?")
+        let changed = sqlx::query("UPDATE result_outbox SET state = 'delivered', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?")
             .bind(now_ms)
             .bind(delivery_id)
             .bind(worker_id)
+            .bind(lease_expires_at_ms)
+            .bind(now_ms)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -563,24 +963,26 @@ impl SqliteStore {
     pub async fn fail_result_delivery(
         &self,
         delivery_id: &str,
-        worker_id: &str,
+        claim: (&str, i64),
         now_ms: i64,
         retry_at_ms: i64,
         error: &str,
         dead_letter: bool,
     ) -> StoreResult<()> {
-        let state = if dead_letter {
-            "dead_lettered"
-        } else {
-            "pending"
-        };
-        let changed = sqlx::query("UPDATE result_outbox SET state = ?, attempt_count = attempt_count + 1, next_attempt_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, last_error = ?, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ?")
-            .bind(state)
+        let retry_at_ms =
+            retry_at_ms.min(now_ms.saturating_add(MAX_RESULT_DELIVERY_RETRY_DELAY_MS));
+        let changed = sqlx::query("UPDATE result_outbox SET state = CASE WHEN ? OR attempt_count >= ? THEN 'dead_lettered' ELSE 'pending' END, attempt_count = CASE WHEN attempt_count >= ? THEN ? ELSE attempt_count + 1 END, next_attempt_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, last_error = ?, updated_at_ms = ? WHERE delivery_id = ? AND state = 'leased' AND lease_owner = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?")
+            .bind(dead_letter)
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS - 1))
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS - 1))
+            .bind(i64::from(MAX_RESULT_DELIVERY_ATTEMPTS))
             .bind(retry_at_ms)
             .bind(error)
             .bind(now_ms)
             .bind(delivery_id)
-            .bind(worker_id)
+            .bind(claim.0)
+            .bind(claim.1)
+            .bind(now_ms)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -598,6 +1000,52 @@ impl SqliteStore {
         result: TerminalResultRecord,
         authenticated_executor_peer_id: &PeerId,
     ) -> StoreResult<TaskRecord> {
+        self.apply_remote_result_with_artifacts(
+            result,
+            &[],
+            authenticated_executor_peer_id,
+            Path::new(""),
+        )
+        .await
+    }
+
+    /// Atomically applies an authenticated remote terminal result and its origin-owned artifacts.
+    ///
+    /// The caller supplies a descriptor-only result record; this store intentionally has no
+    /// protocol dependency and persists that exact record only after all payload checks pass.
+    pub async fn apply_remote_result_with_artifacts(
+        &self,
+        result: TerminalResultRecord,
+        artifacts: &[OriginResultArtifact],
+        authenticated_executor_peer_id: &PeerId,
+        blob_dir: impl AsRef<Path>,
+    ) -> StoreResult<TaskRecord> {
+        let task_id = result.task_id.clone();
+        match self
+            .ingest_remote_result_with_artifacts(
+                result,
+                artifacts,
+                authenticated_executor_peer_id,
+                blob_dir,
+            )
+            .await?
+        {
+            RemoteResultIngestOutcome::Applied(task)
+            | RemoteResultIngestOutcome::Duplicate(task) => Ok(task),
+            RemoteResultIngestOutcome::SettledTerminal { reason, .. } => {
+                Err(StoreError::RemoteResultTerminallySettled { task_id, reason })
+            }
+        }
+    }
+
+    /// Applies, deduplicates, or safely settles an authenticated remote terminal result.
+    pub async fn ingest_remote_result_with_artifacts(
+        &self,
+        result: TerminalResultRecord,
+        artifacts: &[OriginResultArtifact],
+        authenticated_executor_peer_id: &PeerId,
+        blob_dir: impl AsRef<Path>,
+    ) -> StoreResult<RemoteResultIngestOutcome> {
         result.validate()?;
         if &result.executor_peer_id != authenticated_executor_peer_id {
             return Err(StoreError::RemoteResultExecutorMismatch {
@@ -606,15 +1054,9 @@ impl SqliteStore {
                 actual: result.executor_peer_id.clone(),
             });
         }
+        let records = validate_origin_result_artifacts(&result.task_id, artifacts)?;
+        let blob_dir = blob_dir.as_ref().to_path_buf();
         let mut tx = self.pool.begin().await?;
-        if let Some(existing) = fetch_terminal_result_optional(&mut tx, &result.task_id).await? {
-            if existing == result {
-                let task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
-                tx.commit().await?;
-                return Ok(task);
-            }
-            return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
-        }
         let context = fetch_transport_context_optional(&mut tx, &result.task_id)
             .await?
             .ok_or_else(|| StoreError::TransportContextNotFound(result.task_id.clone()))?;
@@ -627,37 +1069,179 @@ impl SqliteStore {
                 actual: authenticated_executor_peer_id.clone(),
             });
         }
-        let mut task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
-        if task.status == TaskStatus::Pending {
+
+        let task = fetch_task_with_executor(&mut tx, &result.task_id).await?;
+        let terminal_reason = remote_result_terminal_reason_with_executor(&mut tx, &task).await?;
+        let existing = fetch_terminal_result_optional(&mut tx, &result.task_id).await?;
+        if terminal_reason.is_none() && existing.as_ref().is_some_and(|stored| stored == &result) {
+            let stored = fetch_artifacts_for_task_with_executor(&mut tx, &result.task_id).await?;
+            if stored.len() != records.len() || stored.iter().any(|row| !records.contains(row)) {
+                return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
+            }
+            tx.commit().await?;
+            for artifact in artifacts {
+                let (_, persisted) = self
+                    .get_artifact(&artifact.meta.artifact_id, &blob_dir)
+                    .await?;
+                if persisted != artifact.content {
+                    return Err(StoreError::OriginResultArtifactConflict(
+                        artifact.meta.artifact_id.clone(),
+                    ));
+                }
+            }
+            return self
+                .get_task(&result.task_id)
+                .await
+                .map(RemoteResultIngestOutcome::Duplicate);
+        }
+
+        for record in &records {
+            if fetch_artifact_optional_with_executor(&mut tx, &record.artifact_id)
+                .await?
+                .is_some()
+            {
+                return Err(StoreError::OriginResultArtifactConflict(
+                    record.artifact_id.clone(),
+                ));
+            }
+        }
+
+        let settlement_reason = match (terminal_reason, existing.as_ref()) {
+            (Some(RemoteResultTerminalReason::DeadlineExpired), None) => {
+                Some(RemoteResultTerminalReason::DeadlineExpired)
+            }
+            (Some(RemoteResultTerminalReason::Canceled), Some(_)) => {
+                Some(RemoteResultTerminalReason::Canceled)
+            }
+            _ => None,
+        };
+        if let Some(reason) = settlement_reason {
+            if !records.is_empty() {
+                return Err(StoreError::RemoteResultTerminalArtifactsRejected {
+                    task_id: result.task_id.clone(),
+                    reason,
+                });
+            }
+            tx.commit().await?;
+            return Ok(RemoteResultIngestOutcome::SettledTerminal {
+                task,
+                reason,
+                canonical_result: existing,
+            });
+        }
+        if existing.is_some() {
+            return Err(StoreError::TerminalResultConflict(result.task_id.clone()));
+        }
+
+        let mut prepared = Vec::new();
+        let mut prepared_digests = HashSet::new();
+        for (artifact, record) in artifacts.iter().zip(&records) {
+            if !record.inline && prepared_digests.insert(record.digest.clone()) {
+                match prepare_blob_write_with_executor(
+                    &mut tx,
+                    &record.digest,
+                    &artifact.content,
+                    &blob_dir,
+                )
+                .await
+                {
+                    Ok(prepared_blob) => prepared.push(prepared_blob),
+                    Err(error) => {
+                        tx.rollback().await.ok();
+                        for prepared_blob in &prepared {
+                            rollback_prepared_blob_write(Some(prepared_blob))?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let apply_result = async {
+            let mut task = task;
+            if task.status == TaskStatus::Pending {
+                let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
+                update_task_status_with_executor(&mut tx, &result.task_id, TaskStatus::Running)
+                    .await?;
+                insert_event(
+                    &mut tx,
+                    &result.task_id,
+                    sequence,
+                    KeryxEventType::TaskStarted,
+                    Some(TaskStatus::Pending),
+                    TaskStatus::Running,
+                )
+                .await?;
+                task.status = TaskStatus::Running;
+            }
+            let transition = validate_transition(task.status, result.terminal_status)?;
             let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
-            update_task_status_with_executor(&mut tx, &result.task_id, TaskStatus::Running).await?;
+            update_task_status_with_executor(&mut tx, &result.task_id, result.terminal_status)
+                .await?;
             insert_event(
                 &mut tx,
                 &result.task_id,
                 sequence,
-                KeryxEventType::TaskStarted,
-                Some(TaskStatus::Pending),
-                TaskStatus::Running,
+                transition.event_type,
+                Some(transition.from),
+                transition.to,
             )
             .await?;
-            task.status = TaskStatus::Running;
+            for (artifact, record) in artifacts.iter().zip(&records) {
+                if !record.inline {
+                    increment_blob_ref_with_executor(&mut tx, &record.digest, record.byte_len)
+                        .await?;
+                }
+                insert_origin_artifact(&mut tx, record, &artifact.content).await?;
+            }
+            insert_terminal_result_only(&mut tx, &result).await
         }
-        let transition = validate_transition(task.status, result.terminal_status)?;
-        let sequence = next_sequence_with_executor(&mut tx, &result.task_id).await?;
-        update_task_status_with_executor(&mut tx, &result.task_id, result.terminal_status).await?;
-        insert_event(
-            &mut tx,
-            &result.task_id,
-            sequence,
-            transition.event_type,
-            Some(transition.from),
-            transition.to,
-        )
-        .await?;
-        insert_terminal_result_only(&mut tx, &result).await?;
-        tx.commit().await?;
-        self.get_task(&result.task_id).await
+        .await;
+        if let Err(error) = apply_result {
+            tx.rollback().await.ok();
+            for prepared_blob in &prepared {
+                rollback_prepared_blob_write(Some(prepared_blob))?;
+            }
+            return Err(error);
+        }
+        if let Err(error) = tx.commit().await {
+            for prepared_blob in &prepared {
+                rollback_prepared_blob_write(Some(prepared_blob))?;
+            }
+            return Err(error.into());
+        }
+        self.get_task(&result.task_id)
+            .await
+            .map(RemoteResultIngestOutcome::Applied)
     }
+}
+
+async fn remote_result_terminal_reason_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &TaskRecord,
+) -> StoreResult<Option<RemoteResultTerminalReason>> {
+    if task.status != TaskStatus::Failed {
+        return Ok(None);
+    }
+    let rows = sqlx::query(
+        "SELECT task_id, sequence, event_type, from_status, to_status FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
+    )
+    .bind(task.task_id().as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    let events = rows
+        .into_iter()
+        .map(row_to_event)
+        .collect::<StoreResult<Vec<_>>>()?;
+    replay_task_from_snapshot_and_events(task, &events)?;
+    Ok(events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type {
+            KeryxEventType::TaskTimedOut => Some(RemoteResultTerminalReason::DeadlineExpired),
+            KeryxEventType::TaskCanceled => Some(RemoteResultTerminalReason::Canceled),
+            _ => None,
+        }))
 }
 
 async fn insert_transport_context(
@@ -755,6 +1339,40 @@ async fn fetch_terminal_result_optional(
         .fetch_optional(&mut **tx)
         .await?;
     row.map(row_to_terminal_result).transpose()
+}
+
+async fn fetch_artifacts_for_task_with_executor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &TaskId,
+) -> StoreResult<Vec<ArtifactRecord>> {
+    let rows = sqlx::query(
+        "SELECT artifact_id, task_id, digest, media_type, byte_len, inline, created_at FROM artifacts WHERE task_id = ?",
+    )
+    .bind(task_id.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(row_to_artifact).collect()
+}
+
+async fn insert_origin_artifact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &ArtifactRecord,
+    content: &[u8],
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO artifacts (artifact_id, task_id, digest, media_type, byte_len, inline, inline_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(record.artifact_id.as_str())
+    .bind(record.task_id.as_str())
+    .bind(record.digest.as_str())
+    .bind(record.media_type.as_str())
+    .bind(record.byte_len as i64)
+    .bind(i64::from(record.inline))
+    .bind(record.inline.then_some(content))
+    .bind(&record.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn row_to_terminal_result(row: sqlx::sqlite::SqliteRow) -> StoreResult<TerminalResultRecord> {
@@ -896,6 +1514,178 @@ mod tests {
                 Err(StoreError::TerminalResultNotFound(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn result_delivery_failure_budget_and_retry_deadline_are_store_enforced() {
+        let dir = tempdir().unwrap();
+        let store = SqliteStore::connect(dir.path().join("keryx.db"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let task_id = TaskId::new("result-delivery-budget").unwrap();
+        let worker = AgentId::new("delivery-worker").unwrap();
+        let lease_id = LeaseId::new("lease-result-delivery-budget").unwrap();
+        store
+            .accept_task(TaskRecord::new(task_id.clone(), TaskStatus::Pending, None))
+            .await
+            .unwrap();
+        store
+            .lease_task(
+                &task_id,
+                LeaseRecord::new(lease_id.clone(), task_id.clone(), worker.clone(), 1, 1000),
+            )
+            .await
+            .unwrap();
+        store
+            .complete_task_with_result(
+                &task_id,
+                &lease_id,
+                &worker,
+                result(&task_id, Some("sender-peer")),
+            )
+            .await
+            .unwrap();
+
+        let mut now_ms = 10_000;
+        for attempt in 1..=10 {
+            let (delivery, _) = store
+                .claim_next_result_delivery("delivery-worker", now_ms, 1_000)
+                .await
+                .unwrap()
+                .expect("nonterminal result delivery must remain claimable");
+            store
+                .fail_result_delivery(
+                    &delivery.delivery_id,
+                    ("delivery-worker", delivery.lease_expires_at_ms.unwrap()),
+                    now_ms,
+                    i64::MAX,
+                    "transient failure",
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let delivery = store
+                .result_delivery_for_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivery.attempt_count, attempt);
+            assert!(
+                delivery.next_attempt_at_ms <= now_ms.saturating_add(60_000),
+                "a caller must not park delivery beyond the one-minute retry ceiling"
+            );
+            if attempt < 10 {
+                assert_eq!(delivery.state, ResultDeliveryState::Pending);
+                now_ms = delivery.next_attempt_at_ms;
+            } else {
+                assert_eq!(delivery.state, ResultDeliveryState::DeadLettered);
+                assert!(
+                    store
+                        .claim_next_result_delivery(
+                            "other-worker",
+                            now_ms.saturating_add(60_000),
+                            1_000,
+                        )
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "dead-lettered deliveries must be unclaimable"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_result_delivery_leases_consume_the_finite_retry_budget() {
+        let dir = tempdir().unwrap();
+        let store = SqliteStore::connect(dir.path().join("keryx.db"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let task_id = TaskId::new("expired-result-delivery-budget").unwrap();
+        let worker = AgentId::new("delivery-worker").unwrap();
+        let lease_id = LeaseId::new("lease-expired-result-delivery-budget").unwrap();
+        store
+            .accept_task(TaskRecord::new(task_id.clone(), TaskStatus::Pending, None))
+            .await
+            .unwrap();
+        store
+            .lease_task(
+                &task_id,
+                LeaseRecord::new(lease_id.clone(), task_id.clone(), worker.clone(), 1, 1000),
+            )
+            .await
+            .unwrap();
+        let canonical_result = result(&task_id, Some("sender-peer"));
+        store
+            .complete_task_with_result(&task_id, &lease_id, &worker, canonical_result.clone())
+            .await
+            .unwrap();
+
+        let mut now_ms = 10_000;
+        let mut delivery = store
+            .claim_next_result_delivery("delivery-worker", now_ms, 1_000)
+            .await
+            .unwrap()
+            .expect("the first delivery attempt must be claimable")
+            .0;
+        for expired_attempt in 1..=MAX_RESULT_DELIVERY_ATTEMPTS {
+            now_ms = delivery.lease_expires_at_ms.unwrap();
+            let reclaimed = store
+                .claim_next_result_delivery("replacement-worker", now_ms, 1_000)
+                .await
+                .unwrap();
+            let persisted = store
+                .result_delivery_for_task(&task_id)
+                .await
+                .unwrap()
+                .expect("result delivery must remain durable");
+            assert_eq!(persisted.attempt_count, expired_attempt);
+            assert_eq!(
+                persisted.lease_owner.as_deref(),
+                if expired_attempt < MAX_RESULT_DELIVERY_ATTEMPTS {
+                    Some("replacement-worker")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                persisted.lease_expires_at_ms.is_some(),
+                expired_attempt < MAX_RESULT_DELIVERY_ATTEMPTS
+            );
+            if expired_attempt < MAX_RESULT_DELIVERY_ATTEMPTS {
+                assert_eq!(persisted.state, ResultDeliveryState::Leased);
+                assert!(persisted.next_attempt_at_ms <= now_ms);
+                delivery = reclaimed
+                    .expect("attempts one through nine must be reclaimed")
+                    .0;
+            } else {
+                assert!(
+                    reclaimed.is_none(),
+                    "the tenth expired attempt must dead-letter"
+                );
+                assert_eq!(persisted.state, ResultDeliveryState::DeadLettered);
+                assert_eq!(
+                    persisted.last_error.as_deref(),
+                    Some("result delivery lease expired")
+                );
+            }
+        }
+
+        assert_eq!(
+            store.get_terminal_result(&task_id).await.unwrap(),
+            canonical_result
+        );
+        assert!(
+            store
+                .claim_next_result_delivery("another-worker", now_ms.saturating_add(60_000), 1_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "dead-lettered deliveries must be permanently unclaimable"
+        );
     }
 
     #[test]

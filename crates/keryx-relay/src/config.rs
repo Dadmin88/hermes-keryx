@@ -56,6 +56,12 @@ pub struct RelayConfig {
     /// gRPC bind address for the skill registry API. Empty disables registry gRPC.
     #[serde(default = "default_registry_grpc_bind")]
     pub registry_grpc_bind: String,
+    /// PEM certificate chain for registry TLS. Required with the key on non-loopback binds.
+    #[serde(default)]
+    pub registry_tls_cert_path: Option<PathBuf>,
+    /// PEM private key for registry TLS. Required with the certificate on non-loopback binds.
+    #[serde(default)]
+    pub registry_tls_key_path: Option<PathBuf>,
 }
 
 pub fn default_max_circuits() -> usize {
@@ -101,6 +107,8 @@ impl Default for RelayConfig {
             health_grpc_bind: default_health_grpc_bind(),
             health_http_bind: default_health_http_bind(),
             registry_grpc_bind: default_registry_grpc_bind(),
+            registry_tls_cert_path: None,
+            registry_tls_key_path: None,
         }
     }
 }
@@ -116,7 +124,12 @@ impl RelayConfig {
     }
 
     pub fn parse_health_grpc_bind(&self) -> anyhow::Result<Option<std::net::SocketAddr>> {
-        parse_optional_socket_addr(&self.health_grpc_bind)
+        let addr = parse_optional_socket_addr(&self.health_grpc_bind)?;
+        let tls_configured = self.grpc_tls_configured()?;
+        if addr.is_some_and(|addr| !addr.ip().is_loopback()) && !tls_configured {
+            anyhow::bail!("non-loopback relay control bind requires TLS certificate and key");
+        }
+        Ok(addr)
     }
 
     pub fn parse_health_http_bind(&self) -> anyhow::Result<Option<std::net::SocketAddr>> {
@@ -124,7 +137,25 @@ impl RelayConfig {
     }
 
     pub fn parse_registry_grpc_bind(&self) -> anyhow::Result<Option<std::net::SocketAddr>> {
-        parse_optional_socket_addr(&self.registry_grpc_bind)
+        let addr = parse_optional_socket_addr(&self.registry_grpc_bind)?;
+        let tls_configured = self.grpc_tls_configured()?;
+        if addr.is_some_and(|addr| !addr.ip().is_loopback()) && !tls_configured {
+            anyhow::bail!("non-loopback registry bind requires TLS certificate and key");
+        }
+        Ok(addr)
+    }
+
+    fn grpc_tls_configured(&self) -> anyhow::Result<bool> {
+        match (
+            self.registry_tls_cert_path.as_ref(),
+            self.registry_tls_key_path.as_ref(),
+        ) {
+            (Some(_), Some(_)) => Ok(true),
+            (None, None) => Ok(false),
+            _ => anyhow::bail!(
+                "Keryx gRPC TLS requires both registry_tls_cert_path and registry_tls_key_path"
+            ),
+        }
     }
 
     pub fn connection_timeout(&self) -> Duration {
@@ -209,6 +240,58 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert!(addrs[0].to_string().contains("/tcp/"));
         assert!(addrs[1].to_string().contains("/quic-v1"));
+    }
+
+    #[test]
+    fn non_loopback_registry_bind_requires_tls_identity() {
+        let config = RelayConfig {
+            registry_grpc_bind: "0.0.0.0:50053".to_string(),
+            ..RelayConfig::default()
+        };
+
+        let error = config.parse_registry_grpc_bind().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-loopback registry bind requires TLS"));
+    }
+
+    #[test]
+    fn non_loopback_control_bind_requires_tls_identity() {
+        let config = RelayConfig {
+            health_grpc_bind: "0.0.0.0:50052".to_string(),
+            ..RelayConfig::default()
+        };
+
+        let error = config.parse_health_grpc_bind().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-loopback relay control bind requires TLS"));
+    }
+
+    #[test]
+    fn non_loopback_registry_bind_accepts_complete_tls_identity() {
+        let config = RelayConfig {
+            registry_grpc_bind: "0.0.0.0:50053".to_string(),
+            registry_tls_cert_path: Some("registry-cert.pem".into()),
+            registry_tls_key_path: Some("registry-key.pem".into()),
+            ..RelayConfig::default()
+        };
+
+        assert_eq!(
+            config.parse_registry_grpc_bind().unwrap(),
+            Some("0.0.0.0:50053".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn registry_tls_identity_rejects_partial_configuration() {
+        let config = RelayConfig {
+            registry_tls_cert_path: Some("registry-cert.pem".into()),
+            ..RelayConfig::default()
+        };
+
+        let error = config.parse_registry_grpc_bind().unwrap_err();
+        assert!(error.to_string().contains("requires both"));
     }
 
     #[test]

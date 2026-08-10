@@ -16,7 +16,7 @@ members = [
 edition = "2021"
 rust-version = "1.80"
 license-file = "LICENSE"
-repository = "https://github.com/DeployFaith/hermes-keryx"
+repository = "https://github.com/Dadmin88/hermes-keryx"
 
 [workspace.dependencies]
 anyhow = "1"

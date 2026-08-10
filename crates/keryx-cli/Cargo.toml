@@ -21,6 +21,7 @@ tonic = "0.14"
 
 [dev-dependencies]
 keryx-relay = { path = "../keryx-relay" }
+rcgen = "0.13"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }

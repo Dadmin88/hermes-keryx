@@ -5,7 +5,7 @@ import warnings
 
 from hermes.keryx.v1 import relay_pb2 as hermes_dot_keryx_dot_v1_dot_relay__pb2
 
-GRPC_GENERATED_VERSION = '1.82.1'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -54,6 +54,16 @@ class KeryxRelayStub:
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultResponse.FromString,
                 _registered_method=True)
+        self.PublishNodescaleIdentityBind = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityBind',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.FromString,
+                _registered_method=True)
+        self.CompleteNodescaleIdentityBind = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/CompleteNodescaleIdentityBind',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindResponse.FromString,
+                _registered_method=True)
         self.AckTask = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxRelay/AckTask',
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.AckTaskRequest.SerializeToString,
@@ -75,7 +85,9 @@ class KeryxRelayServicer:
     """Missing associated documentation comment in .proto file."""
 
     def ConnectNode(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Receive-only delivery stream. Task/result mutation frames sent by clients are rejected;
+        use the authenticated unary PublishTask and PublishResult RPCs instead.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -87,13 +99,30 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def PublishTask(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary task publication.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def PublishResult(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Authenticated unary terminal-result publication. Success is returned only after the
+        authenticated destination persists the result and acknowledges the relay-issued frame.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PublishNodescaleIdentityBind(self, request, context):
+        """Typed non-execution relay-to-edge control. Source identity is metadata-only.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CompleteNodescaleIdentityBind(self, request, context):
+        """Destination-only typed completion for a relay-issued control frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -105,7 +134,8 @@ class KeryxRelayServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AckFrame(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Destination-owned acknowledgement; the authenticated caller must own the relay frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -138,6 +168,16 @@ def add_KeryxRelayServicer_to_server(servicer, server):
                     servicer.PublishResult,
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultResponse.SerializeToString,
+            ),
+            'PublishNodescaleIdentityBind': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishNodescaleIdentityBind,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.SerializeToString,
+            ),
+            'CompleteNodescaleIdentityBind': grpc.unary_unary_rpc_method_handler(
+                    servicer.CompleteNodescaleIdentityBind,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindResponse.SerializeToString,
             ),
             'AckTask': grpc.unary_unary_rpc_method_handler(
                     servicer.AckTask,
@@ -263,6 +303,60 @@ class KeryxRelay:
             '/hermes.keryx.v1.KeryxRelay/PublishResult',
             hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultRequest.SerializeToString,
             hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishResultResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PublishNodescaleIdentityBind(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityBind',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CompleteNodescaleIdentityBind(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/CompleteNodescaleIdentityBind',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindResponse.FromString,
             options,
             channel_credentials,
             insecure,

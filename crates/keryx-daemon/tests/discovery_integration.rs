@@ -1,6 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use keryx_core::PeerId;
+use keryx_core::{NodeId, PeerId};
 use keryx_daemon::{
     serve_daemon_rpc, ConfiguredSkill, DiscoverySettings, KeryxDaemonConfig, KeryxDaemonRuntime,
     RegistrationSettings, DEFAULT_REGISTRATION_TTL_SECONDS,
@@ -10,7 +11,8 @@ use keryx_proto::v1::{
     registry_service_client::RegistryServiceClient, DiscoverBySkillRequest, DiscoverSkillsRequest,
 };
 use keryx_relay::{
-    serve_registry_rpc, RegistryRpcService, SkillRegistry, DEFAULT_REGISTRATION_TTL,
+    security::NodeTokenAuth, serve_registry_rpc, RegistryRpcService, SkillRegistry,
+    DEFAULT_REGISTRATION_TTL,
 };
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -21,14 +23,26 @@ async fn start_registry(
 ) -> (
     String,
     RegistryServiceClient<tonic::transport::Channel>,
-    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let endpoint = format!("http://{addr}");
+    let tokens = ["daemon-peer-a", "daemon-peer-b"]
+        .into_iter()
+        .map(|peer_id| {
+            (
+                NodeId::new(peer_id).unwrap(),
+                format!("{peer_id}-test-token"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let server = tokio::spawn(serve_registry_rpc(
-        RegistryRpcService::new(registry),
-        TcpListenerStream::new(listener),
+        RegistryRpcService::with_auth(
+            registry,
+            Arc::new(NodeTokenAuth::new(tokens, HashSet::new())),
+        ),
+        listener,
     ));
     let client = RegistryServiceClient::connect(endpoint.clone())
         .await
@@ -43,6 +57,7 @@ fn discovery_config(
 ) -> KeryxDaemonConfig {
     let settings = DiscoverySettings {
         registry_endpoint,
+        registry_ca_cert_path: None,
         registration: Some(RegistrationSettings {
             skills: vec![ConfiguredSkill {
                 skill_id: "python".into(),
@@ -56,6 +71,7 @@ fn discovery_config(
                 DEFAULT_REGISTRATION_TTL_SECONDS,
             ),
         }),
+        node_token: Some(format!("{peer_id}-test-token")),
     };
     KeryxDaemonConfig::new(data_dir, 1)
         .with_local_peer_id(PeerId::new(peer_id).unwrap())

@@ -39,7 +39,8 @@ from keryx.task import Artifact, Message, Part, TaskStatus  # noqa: E402
 SKILL_ID = "e2e.echo"
 SENDER_PEER = "sender-peer"
 RECEIVER_PEER = "receiver-peer"
-EXPECTED_TEXT = "remote-result:phase17-cross-node"
+EXPECTED_ARTIFACT_BYTES = b"\x00\xffkeryx-cross-node-artifact\n" + bytes(range(256))
+EXPECTED_ARTIFACT_NAME = "../../phase17-result.bin"
 SENDER_TOKEN = "sender-token-phase17"
 RECEIVER_TOKEN = "receiver-token-phase17"
 
@@ -183,48 +184,6 @@ def edge_env(
     key_path.parent.mkdir(parents=True, exist_ok=True)
     seed = 1 if peer_id == SENDER_PEER else 2
     key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    seed = 1 if peer_id == SENDER_PEER else 2
-    key_path.write_bytes(bytes([seed]) + bytes(31))
     env = base_env()
     env.update(
         {
@@ -275,8 +234,13 @@ async def run_worker(daemon_endpoint: str, signal_path: Path) -> None:
             [
                 Artifact(
                     artifact_id="phase17-artifact",
-                    name="phase17-result.txt",
-                    parts=[Part(text=EXPECTED_TEXT, media_type="text/plain")],
+                    name=EXPECTED_ARTIFACT_NAME,
+                    parts=[
+                        Part(
+                            raw=EXPECTED_ARTIFACT_BYTES,
+                            media_type="application/octet-stream",
+                        )
+                    ],
                 )
             ]
         )
@@ -299,7 +263,7 @@ async def wait_for_skill(node: KeryxNode, timeout: float = 20.0) -> None:
     raise TimeoutError(f"receiver skill {SKILL_ID!r} was not discoverable")
 
 
-async def send_and_assert(sender_port: int, registry_port: int) -> None:
+async def send_and_assert(sender_port: int, registry_port: int, work_dir: Path) -> None:
     node = KeryxNode(
         daemon_endpoint=f"127.0.0.1:{sender_port}",
         registry_endpoint=f"127.0.0.1:{registry_port}",
@@ -324,17 +288,29 @@ async def send_and_assert(sender_port: int, registry_port: int) -> None:
             raise AssertionError("sender-side result must not overwrite task originator")
         if not result.metadata or result.metadata.get("executor_peer_id") != RECEIVER_PEER:
             raise AssertionError(f"unexpected executor metadata: {result.metadata}")
-        texts = [
-            part.text
-            for artifact in result.artifacts
-            for part in artifact.parts
-            if part.text
-        ]
-        if EXPECTED_TEXT not in texts:
-            raise AssertionError(f"returned artifact text missing: {texts}")
+        if len(result.artifacts) != 1:
+            raise AssertionError(f"unexpected artifact descriptors: {result.artifacts}")
+        descriptor = result.artifacts[0]
+        if not descriptor.artifact_id:
+            raise AssertionError("origin-assigned artifact id missing")
+        if descriptor.name != EXPECTED_ARTIFACT_NAME:
+            raise AssertionError(f"logical artifact name changed: {descriptor.name!r}")
+        artifact = await node.get_artifact(descriptor.artifact_id)
+        if artifact.content != EXPECTED_ARTIFACT_BYTES:
+            raise AssertionError("retrieved artifact bytes differ")
+        download_dir = work_dir / "sender-download"
+        download_dir.mkdir(mode=0o700)
+        download_path = download_dir / "chosen-output.bin"
+        await node.download_artifact(descriptor.artifact_id, download_path)
+        if download_path.read_bytes() != EXPECTED_ARTIFACT_BYTES:
+            raise AssertionError("downloaded artifact bytes differ")
+        if (work_dir / "phase17-result.bin").exists():
+            raise AssertionError("remote logical name influenced the local download path")
         print("PASS terminal result returned through relay")
         print("PASS authenticated executor verified")
-        print("PASS artifact verified")
+        print("PASS artifact descriptor canonicalized")
+        print("PASS exact artifact bytes retrieved")
+        print("PASS explicit-path artifact download verified")
     finally:
         await node.stop()
 
@@ -479,7 +455,7 @@ token = "{RECEIVER_TOKEN}"
         group.assert_alive()
         print("PASS edges and receiver worker started")
 
-        asyncio.run(send_and_assert(sender_port, registry_port))
+        asyncio.run(send_and_assert(sender_port, registry_port, work_dir))
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not worker_signal.exists():
             group.assert_alive()

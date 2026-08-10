@@ -1,6 +1,6 @@
 # Transaction Boundaries
 
-Keryx persists state before acknowledging ownership-changing operations.
+Keryx daemons persist state before acknowledging ownership-changing operations. Relay mailbox and acknowledgement tracking are bounded process-local state, not durable transaction boundaries.
 
 ## Minimum boundaries
 
@@ -8,7 +8,7 @@ Keryx persists state before acknowledging ownership-changing operations.
 - `SubscribeTasks`/leasing: persist the lease and `TaskLeased` event before streaming a task to an agent.
 - `CompleteTask`: persist terminal task state and `TaskCompleted` event before notifying the sender.
 - Relay send: persist an outbox frame before attempting network delivery.
-- Relay receive: persist mailbox item or terminal state before acknowledging the relay frame.
+- Relay receive: record process-local mailbox/frame ownership before delivery; the authenticated destination acknowledges only after its daemon persistence boundary succeeds. Relay state does not survive relay restart.
 - Startup recovery: persist recovery events before exposing recovered state.
 
 ## Current SQLite boundaries

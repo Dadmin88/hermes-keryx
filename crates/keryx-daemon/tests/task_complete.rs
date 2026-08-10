@@ -2,8 +2,8 @@ mod common;
 
 use common::RpcTestHarness;
 use keryx_proto::v1::{
-    AgentId, ClaimTaskRequest, CompleteTaskRequest, SubmitTaskRequest, TaskArtifact, TaskEnvelope,
-    TaskId,
+    AgentId, ClaimTaskRequest, CompleteTaskRequest, GetTaskResultRequest, SubmitTaskRequest,
+    TaskArtifact, TaskEnvelope, TaskId,
 };
 use tonic::Code;
 
@@ -23,6 +23,7 @@ async fn complete_task_via_rpc_clears_lease_and_marks_completed() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await
@@ -59,6 +60,10 @@ async fn complete_task_via_rpc_clears_lease_and_marks_completed() {
                 path: "/tmp/out.txt".to_string(),
                 media_type: "text/plain".to_string(),
                 metadata: Default::default(),
+                content: Vec::new(),
+                byte_len: 0,
+                sha256: String::new(),
+                content_present: false,
             }],
         })
         .await
@@ -73,6 +78,19 @@ async fn complete_task_via_rpc_clears_lease_and_marks_completed() {
         Some("done")
     );
     assert_eq!(completed.output_artifacts.len(), 1);
+    let persisted = harness
+        .client
+        .get_task_result(GetTaskResultRequest {
+            task_id: Some(task_id.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .unwrap();
+    assert_eq!(persisted.protocol_version, 1);
+    assert!(!persisted.output_artifacts[0].content_present);
+    assert!(persisted.output_artifacts[0].content.is_empty());
 
     let second_complete = harness
         .client

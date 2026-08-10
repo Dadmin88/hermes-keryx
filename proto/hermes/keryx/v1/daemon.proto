@@ -93,6 +93,8 @@ message GetTaskResultResponse {
   string status = 2;
   TaskResultEnvelope result = 3;
   uint64 update_sequence = 4;
+  bool terminal_result_unavailable = 5;
+  string data_unavailable_reason = 6;
 }
 message ClaimNextResultDeliveryRequest {
   string worker_id = 1;
@@ -109,6 +111,8 @@ message ClaimNextResultDeliveryResponse {
 message AckResultDeliveryRequest {
   string delivery_id = 1;
   string worker_id = 2;
+  // Fences acknowledgement to the exact active claim generation.
+  int64 lease_expires_at_ms = 3;
 }
 message AckResultDeliveryResponse { bool accepted = 1; }
 message FailResultDeliveryRequest {
@@ -117,6 +121,8 @@ message FailResultDeliveryRequest {
   string error_reason = 3;
   int64 retry_delay_ms = 4;
   bool dead_letter = 5;
+  // Fences failure to the exact active claim generation.
+  int64 lease_expires_at_ms = 6;
 }
 message FailResultDeliveryResponse { bool accepted = 1; }
 message IngestRemoteResultRequest {
@@ -174,7 +180,7 @@ message ClaimNextTaskResponse {
   string status = 8;
   uint32 retry_count = 9;
   bool dead_lettered = 10;
-  // Empty until the relay/edge authenticated identity contract is persisted.
+  // Authenticated sender identity persisted by SubmitRemoteTask.
   string sender_peer_id = 11;
 }
 
@@ -195,6 +201,11 @@ message TaskArtifact {
   string path = 1;
   string media_type = 2;
   map<string, string> metadata = 3;
+  bytes content = 4;
+  uint64 byte_len = 5;
+  string sha256 = 6;
+  // Distinguishes a descriptor-only artifact from a valid zero-byte payload.
+  bool content_present = 7;
 }
 
 message CompleteTaskRequest {
@@ -234,6 +245,8 @@ message FailTaskResponse {
 }
 
 message CancelTaskRequest {
+  // A task targeted at another executor fails closed with FAILED_PRECONDITION;
+  // this RPC does not claim to stop remote work.
   TaskId task_id = 1;
   string reason = 2;
   map<string, string> metadata = 3;
@@ -259,6 +272,13 @@ message SendTaskResponse {
   string status = 2;
   string routed_to = 3;
   string delivery_route = 4;
+  // The following receipt fields prove relay acceptance only, not execution or
+  // durable destination acknowledgement.
+  string relay_frame_id = 5;
+  string authenticated_source_peer_id = 6;
+  string accepted_destination_peer_id = 7;
+  string accepted_route = 8;
+  int64 accepted_at_ms = 9;
 }
 
 message ListPeersRequest {}

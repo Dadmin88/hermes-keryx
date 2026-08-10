@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import os
+import re
 import socket
 import stat
 import struct
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import grpc
 
@@ -25,6 +30,30 @@ from hermes.keryx.v1 import (  # noqa: E402
     registry_pb2_grpc,
     task_pb2,
 )
+
+from keryx.models import ArtifactContent  # noqa: E402
+
+if TYPE_CHECKING:
+    from keryx.card import AgentCard
+
+
+RESULT_ARTIFACT_FRAME_MAX_BYTES = 5 * 1024 * 1024
+RESULT_ARTIFACT_GRPC_OPTIONS = (
+    ("grpc.max_send_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
+    ("grpc.max_receive_message_length", RESULT_ARTIFACT_FRAME_MAX_BYTES),
+)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+REGISTRY_RPC_TIMEOUT_SECONDS = 10.0
+
+
+def _validate_registration_ttl(ttl_seconds: object) -> int:
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or not 0 < ttl_seconds <= 2**64 - 1
+    ):
+        raise ValueError("ttl_seconds must be a positive unsigned 64-bit integer")
+    return ttl_seconds
 
 
 def default_daemon_endpoint() -> str:
@@ -97,6 +126,33 @@ def _grpc_target(endpoint: str) -> str:
     return endpoint
 
 
+def _registry_endpoint_target(endpoint: str) -> tuple[str, bool]:
+    raw = endpoint.strip()
+    parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+    host = parsed.hostname or ""
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    secure = parsed.scheme.lower() == "https"
+    if not secure and not loopback:
+        raise RuntimeError("remote Keryx registry endpoints require TLS (https://)")
+    return parsed.netloc or parsed.path, secure
+
+
+def _registry_channel(
+    endpoint: str, ca_cert_path: str | os.PathLike[str] | None
+) -> grpc.aio.Channel:
+    target, secure = _registry_endpoint_target(endpoint)
+    if not secure:
+        return grpc.aio.insecure_channel(target)
+    root_certificates = None
+    if ca_cert_path:
+        root_certificates = Path(ca_cert_path).expanduser().read_bytes()
+    credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+    return grpc.aio.secure_channel(target, credentials)
+
+
 @dataclass
 class PeerInfo:
     peer_id: str
@@ -112,12 +168,23 @@ class DaemonClient:
         *,
         daemon_endpoint: str,
         registry_endpoint: str | None = None,
+        node_token: str | None = None,
+        registry_ca_cert: str | os.PathLike[str] | None = None,
         channel: grpc.aio.Channel | None = None,
         registry_channel: grpc.aio.Channel | None = None,
     ) -> None:
         self._daemon_endpoint = daemon_endpoint
         self._registry_endpoint = registry_endpoint or os.environ.get(
             "HERMES_KERYX_REGISTRY_ENDPOINT"
+        )
+        token = (
+            os.environ.get("HERMES_KERYX_NODE_TOKEN")
+            if node_token is None
+            else node_token
+        )
+        self._node_token = token.strip() if token and token.strip() else None
+        self._registry_ca_cert = registry_ca_cert or os.environ.get(
+            "HERMES_KERYX_REGISTRY_CA_CERT"
         )
         self._channel = channel
         self._registry_channel = registry_channel
@@ -129,13 +196,19 @@ class DaemonClient:
             _validate_unix_socket_endpoint(self._daemon_endpoint)
             _assert_unix_peer_owned_by_current_user(self._daemon_endpoint)
             self._channel = grpc.aio.insecure_channel(
-                _grpc_target(self._daemon_endpoint)
+                _grpc_target(self._daemon_endpoint),
+                options=RESULT_ARTIFACT_GRPC_OPTIONS,
             )
         self._daemon = daemon_pb2_grpc.KeryxDaemonStub(self._channel)
         if self._registry_endpoint:
+            if self._registry_channel is not None and self._node_token:
+                raise RuntimeError(
+                    "credential-bearing Keryx registry clients cannot use injected channels"
+                )
+            _registry_endpoint_target(self._registry_endpoint)
             if self._registry_channel is None:
-                self._registry_channel = grpc.aio.insecure_channel(
-                    _grpc_target(self._registry_endpoint)
+                self._registry_channel = _registry_channel(
+                    self._registry_endpoint, self._registry_ca_cert
                 )
             self._registry = registry_pb2_grpc.RegistryServiceStub(
                 self._registry_channel
@@ -175,9 +248,18 @@ class DaemonClient:
         task_id: str,
         message_text: str,
         metadata: dict[str, str] | None = None,
+        deadline_ms: int = 0,
         timeout_ms: int = 0,
     ) -> daemon_pb2.SendTaskResponse:
         assert self._daemon is not None
+        if (
+            isinstance(deadline_ms, bool)
+            or not isinstance(deadline_ms, int)
+            or not 0 <= deadline_ms <= 2**63 - 1
+        ):
+            raise ValueError(
+                "deadline_ms must be zero or a positive signed 64-bit integer"
+            )
         envelope = task_pb2.TaskEnvelope(
             task_id=common_pb2.TaskId(value=task_id),
             status=task_pb2.TASK_STATUS_CREATED,
@@ -192,6 +274,7 @@ class DaemonClient:
                 )
             ],
             metadata=metadata or {},
+            deadline_ms=deadline_ms,
         )
         request = daemon_pb2.SendTaskRequest(
             target_peer_id=target_peer_id,
@@ -200,15 +283,38 @@ class DaemonClient:
         )
         return await self._daemon.SendTask(request)
 
-    async def get_task_result(
-        self, task_id: str
-    ) -> daemon_pb2.GetTaskResultResponse:
+    async def get_task_result(self, task_id: str) -> daemon_pb2.GetTaskResultResponse:
         assert self._daemon is not None
         return await self._daemon.GetTaskResult(
-            daemon_pb2.GetTaskResultRequest(
-                task_id=common_pb2.TaskId(value=task_id)
+            daemon_pb2.GetTaskResultRequest(task_id=common_pb2.TaskId(value=task_id))
+        )
+
+    async def get_artifact(
+        self, artifact_id: str, *, metadata_only: bool = False
+    ) -> ArtifactContent:
+        assert self._daemon is not None
+        response = await self._daemon.GetArtifact(
+            daemon_pb2.GetArtifactRequest(
+                artifact_id=common_pb2.ArtifactId(value=artifact_id),
+                metadata_only=metadata_only,
             )
         )
+        return _verified_artifact_content(
+            response,
+            requested_artifact_id=artifact_id,
+            metadata_only=metadata_only,
+        )
+
+    async def download_artifact(
+        self,
+        artifact_id: str,
+        destination: str | Path,
+        *,
+        overwrite: bool = False,
+    ) -> ArtifactContent:
+        artifact = await self.get_artifact(artifact_id)
+        _write_artifact_download(artifact, destination, overwrite=overwrite)
+        return artifact
 
     async def cancel_task(
         self, task_id: str, *, reason: str = ""
@@ -277,6 +383,7 @@ class DaemonClient:
                 "agent_name": registration.name,
                 "agent_description": registration.description,
                 "skills": [skill.skill_id for skill in registration.skills],
+                "protocol_features": list(registration.protocol_features),
             }
             for registration in registrations
         ]
@@ -287,9 +394,11 @@ class DaemonClient:
         peer_id: str,
         name: str,
         description: str,
-        skills: list[tuple[str, str]],
+        skills: list[tuple[str, str, list[str]]],
         ttl_seconds: int = 300,
+        protocol_features: list[str] | None = None,
     ) -> bool:
+        ttl_seconds = _validate_registration_ttl(ttl_seconds)
         if self._registry is None:
             return False
         assert self._registry is not None
@@ -298,20 +407,28 @@ class DaemonClient:
             name=name,
             description=description,
             ttl_seconds=ttl_seconds,
+            protocol_features=(
+                protocol_features
+                if protocol_features is not None
+                else ["absolute_deadlines_v1", "result_artifact_bytes_v1"]
+            ),
             skills=[
                 registry_pb2.SkillInfo(
                     skill_id=skill_id,
                     description=skill_description,
+                    tags=tags,
                 )
-                for skill_id, skill_description in skills
+                for skill_id, skill_description, tags in skills
             ],
         )
-        response = await self._registry.RegisterSkills(request)
-        return bool(response.accepted)
+        response = await self._registry.RegisterSkills(
+            request,
+            timeout=REGISTRY_RPC_TIMEOUT_SECONDS,
+            metadata=self._registry_auth_metadata(peer_id),
+        )
+        return response.accepted
 
-    async def unregister_skills(
-        self, *, peer_id: str, skill_ids: list[str]
-    ) -> bool:
+    async def unregister_skills(self, *, peer_id: str, skill_ids: list[str]) -> bool:
         if self._registry is None:
             return False
         assert self._registry is not None
@@ -319,9 +436,17 @@ class DaemonClient:
             registry_pb2.UnregisterSkillsRequest(
                 peer_id=peer_id,
                 skill_ids=skill_ids,
-            )
+            ),
+            timeout=REGISTRY_RPC_TIMEOUT_SECONDS,
+            metadata=self._registry_auth_metadata(peer_id),
         )
-        return bool(response.accepted)
+        return response.accepted
+
+    def _registry_auth_metadata(self, peer_id: str) -> tuple[tuple[str, str], ...]:
+        metadata = [("x-keryx-node-id", peer_id)]
+        if self._node_token is not None:
+            metadata.append(("x-keryx-node-token", self._node_token))
+        return tuple(metadata)
 
     async def get_card(self, peer_id: str) -> "AgentCard":
         from keryx.card import AgentCard, Skill
@@ -341,9 +466,102 @@ class DaemonClient:
                         Skill(
                             id=skill.skill_id,
                             description=skill.description,
+                            tags=list(skill.tags),
                         )
                         for skill in registration.skills
                     ],
                     peer_id=registration.peer_id,
+                    protocol_features=list(registration.protocol_features),
                 )
         raise RuntimeError(f"No agent card for peer {peer_id}")
+
+
+def _verified_artifact_content(
+    response: daemon_pb2.GetArtifactResponse,
+    *,
+    requested_artifact_id: str,
+    metadata_only: bool,
+) -> ArtifactContent:
+    returned_artifact_id = response.artifact_id.value
+    if returned_artifact_id != requested_artifact_id:
+        raise ValueError("returned artifact id does not match the request")
+    if not _SHA256_RE.fullmatch(response.digest):
+        raise ValueError("artifact digest must be lowercase SHA-256")
+
+    content = bytes(response.content)
+    if not metadata_only or content:
+        if response.byte_len != len(content):
+            raise ValueError("artifact byte_len does not match content")
+        if hashlib.sha256(content).hexdigest() != response.digest:
+            raise ValueError("artifact digest does not match content")
+
+    return ArtifactContent(
+        artifact_id=returned_artifact_id,
+        task_id=response.task_id.value,
+        digest=response.digest,
+        media_type=response.media_type,
+        byte_len=response.byte_len,
+        inline=response.inline,
+        created_at=response.created_at,
+        content=None if metadata_only else content,
+    )
+
+
+def _write_artifact_download(
+    artifact: ArtifactContent,
+    destination: str | Path,
+    *,
+    overwrite: bool,
+) -> Path:
+    if artifact.content is None:
+        raise ValueError("artifact content is required for download")
+    content = artifact.content
+    if len(content) != artifact.byte_len:
+        raise ValueError("artifact byte_len does not match content")
+    if not _SHA256_RE.fullmatch(artifact.digest):
+        raise ValueError("artifact digest must be lowercase SHA-256")
+    if hashlib.sha256(content).hexdigest() != artifact.digest:
+        raise ValueError("artifact digest does not match content")
+
+    target = Path(destination).expanduser()
+    parent = target.parent
+    if not parent.exists() or not parent.is_dir():
+        raise FileNotFoundError(
+            f"artifact destination parent is not a directory: {parent}"
+        )
+    if target.is_symlink():
+        raise ValueError("artifact destination must not be a symlink")
+    if target.exists() and not overwrite:
+        raise FileExistsError(target)
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    published = False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            if target.is_symlink():
+                raise ValueError("artifact destination must not be a symlink")
+            os.replace(temporary, target)
+        else:
+            os.link(temporary, target, follow_symlinks=False)
+            temporary.unlink()
+        published = True
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not published:
+            temporary.unlink(missing_ok=True)
+    return target

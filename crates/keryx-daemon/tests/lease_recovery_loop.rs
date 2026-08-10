@@ -123,6 +123,7 @@ async fn recovery_loop_recovers_rpc_claimed_task_after_lease_expires() {
                 status: 0,
                 messages: vec![],
                 metadata: Default::default(),
+                deadline_ms: 0,
             }),
         })
         .await

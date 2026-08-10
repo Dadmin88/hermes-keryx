@@ -94,7 +94,7 @@ Daemon configuration: `KeryxDaemonConfig::with_fail_retry_policy(...)` (see inte
 | No retry policy (`max_retries = 0`) | `failed` | `retry_count` unchanged, not dead-lettered |
 | Success | `completed` | lease cleared |
 
-Cancellation, timeout, and rejection at the lifecycle layer are still represented as `failed` plus typed reasons in metadata/events when those paths exist; worker `FailTask` uses `error_reason` and optional `failure_metadata`.
+Cancellation, timeout, and rejection remain persisted as the strict four-state lifecycle value `failed`, while terminal result APIs and reattached handles expose their truthful typed outcomes (`canceled`, `timed_out`, or `rejected`). Worker `FailTask` uses `error_reason` and optional `failure_metadata`.
 
 ## CLI worker example
 

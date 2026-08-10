@@ -7,16 +7,19 @@ use futures::StreamExt;
 use libp2p::{gossipsub, swarm::SwarmEvent};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio_stream::wrappers::TcpListenerStream;
+
+use tonic::transport::Identity;
 use tracing::info;
 
 use keryx_relay::{
     autonat::map_autonat_status,
     bootstrap::dial_bootstrap_peers,
     config::RelayConfig,
-    health_server::{serve_grpc_health, serve_grpc_health_with_auth, serve_http_health},
+    health_server::{
+        serve_grpc_health_with_auth_and_tls, serve_grpc_health_with_tls, serve_http_health,
+    },
     registry::{SkillRegistry, DEFAULT_CLEANUP_INTERVAL, REGISTRY_GOSSIP_TOPIC},
-    registry_server::{serve_registry_rpc, RegistryRpcService},
+    registry_server::{serve_registry_rpc_with_tls, RegistryRpcService},
     runtime::RelayRuntime,
     security::{new_shared_allowlist, sync_allowlist_to_swarm, RelayTomlConfig, SharedAllowlist},
     transport::{
@@ -29,6 +32,32 @@ struct ProcessConfig {
     relay: RelayConfig,
     toml: Option<RelayTomlConfig>,
     allowlist: Option<keryx_relay::Allowlist>,
+}
+
+fn load_grpc_tls_identity(config_path: &Path, relay: &RelayConfig) -> Result<Option<Identity>> {
+    let (Some(cert_path), Some(key_path)) = (
+        relay.registry_tls_cert_path.as_ref(),
+        relay.registry_tls_key_path.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let resolve = |path: &Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path)
+        }
+    };
+    let cert_path = resolve(cert_path);
+    let key_path = resolve(key_path);
+    let cert = std::fs::read(&cert_path)
+        .with_context(|| format!("read Keryx gRPC TLS certificate {}", cert_path.display()))?;
+    let key = std::fs::read(&key_path)
+        .with_context(|| format!("read Keryx gRPC TLS private key {}", key_path.display()))?;
+    Ok(Some(Identity::from_pem(cert, key)))
 }
 
 fn load_process_config(path: &Path) -> Result<ProcessConfig> {
@@ -83,6 +112,7 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let node_auth_configured = node_auth.is_configured();
     let node_auth = Arc::new(node_auth);
+    let grpc_tls_identity = load_grpc_tls_identity(&config_path, &process.relay)?;
 
     let shared_allowlist: Option<SharedAllowlist> = process
         .allowlist
@@ -104,11 +134,12 @@ async fn main() -> Result<()> {
         let rt = Arc::clone(&runtime);
         let reg = Arc::clone(&registry);
         let auth = Arc::clone(&node_auth);
+        let tls_identity = grpc_tls_identity.clone();
         tokio::spawn(async move {
             let result = if node_auth_configured {
-                serve_grpc_health_with_auth(rt, reg, auth, addr).await
+                serve_grpc_health_with_auth_and_tls(rt, reg, auth, addr, tls_identity).await
             } else {
-                serve_grpc_health(rt, Some(reg), addr).await
+                serve_grpc_health_with_tls(rt, Some(reg), addr, tls_identity).await
             };
             if let Err(err) = result {
                 tracing::error!(%addr, error = %err, "gRPC health server exited");
@@ -118,16 +149,19 @@ async fn main() -> Result<()> {
     }
 
     if let Some(addr) = process.relay.parse_registry_grpc_bind()? {
+        let tls_identity = grpc_tls_identity.clone();
         let listener = TcpListener::bind(addr).await?;
-        let incoming = TcpListenerStream::new(listener);
-        let service =
-            RegistryRpcService::with_metrics(Arc::clone(&registry), Arc::clone(runtime.metrics()));
+        let service = RegistryRpcService::with_metrics_and_auth(
+            Arc::clone(&registry),
+            Arc::clone(runtime.metrics()),
+            Arc::clone(&node_auth),
+        );
         tokio::spawn(async move {
-            if let Err(err) = serve_registry_rpc(service, incoming).await {
+            if let Err(err) = serve_registry_rpc_with_tls(service, listener, tls_identity).await {
                 tracing::error!(%addr, error = %err, "registry gRPC server exited");
             }
         });
-        info!(%addr, "registry gRPC listening");
+        info!(%addr, tls = process.relay.registry_tls_cert_path.is_some(), "registry gRPC listening");
     }
 
     let mut swarm = build_relay_server_swarm(

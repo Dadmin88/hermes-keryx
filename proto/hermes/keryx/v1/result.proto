@@ -16,6 +16,12 @@ message ResultArtifact {
   string path = 1;
   string media_type = 2;
   map<string, string> metadata = 3;
+  ArtifactId artifact_id = 4;
+  string sha256 = 5;
+  uint64 byte_len = 6;
+  bytes content = 7;
+  // Distinguishes a descriptor-only artifact from a valid zero-byte payload.
+  bool content_present = 8;
 }
 
 message TaskResultEnvelope {

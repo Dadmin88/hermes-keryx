@@ -1,116 +1,261 @@
-# Current Hermes Keryx product surface
+# Current Hermes Keryx Product Surface
 
-This page is the repository-wide map of what is implemented today. Older RFCs and ADRs in this repository are design history; when they differ from this page, this page and the Rust/Python source are the current product contract.
+This page is the canonical repository-level map of the implemented Keryx runtime. RFCs and ADRs preserve design history; when historical documents differ from this page or the source, the implemented current contract wins.
 
 ## Components
 
 | Component | Implemented surface |
-|---|---|
-| `keryxd` | Local daemon runtime; SQLite store; gRPC `KeryxDaemon` service; lifecycle, durable task envelopes, artifacts, cancellation, deadline enforcement, routing, discovery hooks, health/readiness/status/doctor. |
-| `keryx-relay` | libp2p relay process; TCP + QUIC listen addresses; gRPC health; HTTP `/health`; task publication/mailbox delivery; in-memory skill registry with TTL cleanup and gossipsub sync; peer allowlist; node token auth primitives. |
-| `keryx-node` | Edge node binary from `keryx-relay`; verifies daemon readiness, dials bootstrap peers, registers skills, consumes relay task frames, and submits delivered envelopes into its local daemon. |
-| `keryx` | Operator CLI for `status`, `doctor`, `task`, `artifact`, `relay`, and `node` subcommands. |
-| Python SDK | Package/import name `keryx`; async `KeryxNode`; daemon lifecycle methods; relay registry helpers; AgentAnycast-compatible transition helpers. Remote handler dispatch and terminal result return are not complete yet. |
-| Ops scripts | `scripts/keryx-dual-run.sh` for one local daemon+relay pair; `scripts/migrate-to-keryx.sh` for Hermes config migration/revert. |
+| --- | --- |
+| `keryxd` | Local daemon, SQLite-backed lifecycle, durable envelopes, artifacts, cancellation, deadlines, routing, worker claims/leases, remote result ingestion, health, readiness, status, and doctor. |
+| `keryx-relay` | libp2p relay, authenticated task/result publication, relay acceptance receipts, recipient-owned frame acknowledgement, peer allowlisting, node-token authentication, skill registry, bounded offline mailboxes, TLS-capable control/registry endpoints, and typed authenticated control delivery. |
+| `keryx-node` | Edge process that connects a local daemon to the relay, advertises skills/capabilities, consumes relay frames, submits remote tasks locally, and handles closed typed control operations. |
+| `keryx` | Operator CLI for status, doctor, task lifecycle, artifacts, relay, and node operations. |
+| Python SDK | Async `KeryxNode`, daemon lifecycle methods, discovery, worker loop, durable remote task/result observation, task reattachment, fail-closed cancellation, artifact retrieval/download, and compatibility helpers. |
+| Ops scripts | Local daemon/relay dual-run, migration tooling, and authenticated two-node integration verification. |
 
 ## Canonical lifecycle
 
-The persisted lifecycle remains four-state:
+Keryx persists four task states:
 
 ```text
 pending -> running -> completed | failed
 ```
 
-Operational outcomes are metadata/events rather than extra task status values:
+Operational outcomes remain metadata/events around that lifecycle:
 
-- retry requeue: `running -> pending`, increments `retry_count`, appends `RecoveryAction`
-- dead-letter: `running -> failed`, sets `dead_lettered` and `dead_letter_reason`
-- cancel: `pending` or `running` -> `failed`, marks cancellation counters and reason metadata
-- deadline expiry: expired `deadline_ms` on `pending`/`running` -> `failed`
-- routing approval hold: `SendTask` can return `awaiting_approval` as a routing outcome; it is not a canonical persisted `TaskStatus`
+- retry can return interrupted work from `running` to `pending` while incrementing retry metadata;
+- dead-letter marks exhausted work failed with explicit dead-letter metadata;
+- cancellation persists a durable canceled outcome without inventing a fifth canonical task state;
+- deadline expiry uses the normal terminal outcome/event model;
+- routing approval can be reported as a routing outcome without becoming a persisted task status;
+- result delivery uses a separate durable outbox and claim lifecycle.
 
-## Daemon gRPC API
+## Daemon API
 
-`proto/hermes/keryx/v1/daemon.proto` implements:
+The `KeryxDaemon` gRPC service includes:
 
-- health/operator: `Status`, `Doctor`, `Liveness`, `Readiness`
-- worker lifecycle: `SubmitTask`, `ClaimTask`, `ClaimNextTask`, `Heartbeat`, `CompleteTask`, `FailTask`, `CancelTask`
-- artifacts: `PutArtifact`, `GetArtifact`, `ListArtifacts`, `DeleteArtifact`
-- routing/discovery: `SendTask`, `ListPeers`, `DiscoverSkills`
+### Health and operator surfaces
 
-Important defaults:
+- `Status`
+- `Doctor`
+- `Liveness`
+- `Readiness`
 
-| Setting | Default |
-|---|---:|
-| schema version | `6` |
-| lease TTL when omitted | `300_000 ms` |
-| lease recovery interval | `30_000 ms` |
-| deadline enforcement interval | `30_000 ms` |
-| health probe interval | `60_000 ms` |
-| shutdown drain timeout | `30_000 ms` |
-| pending task limit | `10_000` (`0` means unlimited) |
-| submit envelope limit | `4 MiB` (`0` means unlimited) |
-| retained submit envelope limit | `256 MiB` (`0` means unlimited) |
-| inline artifact threshold | `64 KiB` |
-| max artifact/blob size | `256 MiB` |
-| default local peer id | `node-local` |
-| default `SendTask` timeout | `30_000 ms` |
+### Task lifecycle
+
+- `SubmitTask`
+- `SubmitRemoteTask`
+- `ClaimTask`
+- `ClaimNextTask`
+- `Heartbeat`
+- `CompleteTask`
+- `FailTask`
+- `CancelTask`
+
+### Remote results
+
+- `GetTaskResult`
+- `ClaimNextResultDelivery`
+- `AckResultDelivery`
+- `FailResultDelivery`
+- `IngestRemoteResult`
+
+### Artifacts
+
+- `PutArtifact`
+- `GetArtifact`
+- `ListArtifacts`
+- `DeleteArtifact`
+
+### Routing and discovery
+
+- `SendTask`
+- `ListPeers`
+- `DiscoverSkills`
+
+Worker and result-delivery claims include lease/fencing data. Completion, failure, acknowledgement, and retry operations must match the active claim generation; stale or expired claims fail closed.
 
 ## Storage
 
-`keryx-store` provides `InMemoryStore` for tests and `SqliteStore` for runtime. The SQLite store owns:
+`keryx-store` provides in-memory test storage and SQLite runtime storage.
 
-- task snapshots and per-task event log
-- complete encoded `TaskEnvelope` records keyed by task ID
-- idempotency keys
-- active/inactive leases
-- retry/dead-letter metadata
-- artifact metadata plus inline bytes/blob references
-- deadline/cancellation fields
+Current SQLite state includes:
 
-Schema v6 adds `task_envelopes`. `SubmitTask` now persists the complete encoded protobuf envelope atomically with the pending lifecycle row, idempotency key, and accepted event. Nested messages, raw bytes, metadata maps, correlation IDs, and requested capability hints therefore survive daemon restart. The daemon enforces both a per-envelope submit limit and an aggregate retained-envelope byte limit before accepting durable envelopes.
+- task lifecycle snapshots;
+- per-task event history;
+- complete encoded task envelopes keyed by task ID;
+- idempotency keys;
+- active and inactive leases;
+- retry and dead-letter metadata;
+- artifact metadata and inline/blob content references;
+- deadline and cancellation fields;
+- authenticated remote transport context;
+- durable terminal results;
+- retryable result-delivery outbox records.
 
-The store intentionally treats the encoded envelope as opaque bytes and does not depend on `keryx-proto`; protobuf encoding and decoding remain daemon/SDK concerns. Idempotent retries must match both the lifecycle record and the stored envelope. Conflicting envelope bytes fail closed.
+The current schema version is `7`.
 
-Default local CLI/runtime data directory is `.keryx` when `HERMES_KERYX_DATA_DIR` is unset. Operator dual-run uses `~/.hermes/.keryx/data`.
+The complete protobuf envelope is persisted atomically with task acceptance, which means nested messages, raw bytes, metadata maps, correlation identifiers, and capability hints survive daemon restart. Idempotent retries must agree with the stored task and envelope; conflicting bytes fail closed.
 
-## Relay and registry
+Task admission enforces both a per-envelope encoded-size limit and an aggregate retained-envelope byte limit. The retained-envelope limit defaults to `256 MiB` and can be set to `0` only to opt into unlimited retained-envelope storage.
 
-`keryx-relay` supports both JSON and TOML process config:
+The store treats the encoded envelope as opaque transport data. Protobuf encoding and decoding remain daemon/SDK responsibilities rather than leaking protocol types into the persistence boundary.
 
-- JSON `RelayConfig` exposes direct fields such as `listen_addresses`, `health_grpc_bind`, `health_http_bind`, and `registry_grpc_bind`.
-- TOML config supports `[relay]`, `[security]`, and `[registry]` sections. TOML enables allowlist files, empty-allowlist policy, inline/external node tokens, and registry TTL/max-skills settings.
+## Cross-node task delivery
 
-Relay defaults in code are `0.0.0.0:4001` TCP/QUIC, `127.0.0.1:50052` gRPC health, `127.0.0.1:8081` HTTP health, and `127.0.0.1:50053` registry. The dual-run script intentionally overrides these to loopback non-conflicting ports.
-
-## Cross-node delivery boundary
-
-Keryx currently proves this one-way transport path:
+A remote task follows this path:
 
 ```text
-sender keryxd SendTask
-  -> relay PublishTask
-  -> destination keryx-node stream
-  -> destination keryxd SubmitTask
-  -> destination lifecycle row + durable full envelope
+origin keryxd SendTask
+  -> authenticated relay PublishTask
+  -> destination keryx-node
+  -> destination keryxd SubmitRemoteTask
+  -> durable remote task
+  -> worker claim / handler
+  -> durable terminal result outbox
+  -> authenticated relay PublishResult
+  -> origin keryxd IngestRemoteResult
 ```
 
-A complete Hermes Agency round trip is **not implemented yet**. The remaining Phase 17 work is tracked in [phase17-cross-node-agent-delivery.md](phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
+Incoming relay context is persisted with the remote task, including authenticated sender, local destination/executor, relay frame identity, and receive timestamp. Exact replay is idempotent; incompatible context conflicts.
 
-Phase 17.1 retains complete envelopes durably. Phase 17.2 adds atomic worker dequeue through `ClaimNextTask`. Phase 17.3 makes Python `serve_forever()` a real worker runtime: it claims matching tasks, invokes registered handlers, maintains leases with heartbeats, and persists local completion or failure.
+See [Cross-node delivery](cross-node-delivery.md) for the full contract.
 
-Missing today:
+## Relay acceptance and acknowledgement
 
-- transport-authenticated sender identity attached to the claimed envelope
-- authenticated terminal result/artifact routing back to the origin
-- a remotely updated `TaskHandle.wait()`
-- a repeatable two-daemon/two-edge-node Agency E2E
+Relay acceptance receipts bind:
 
-This boundary matters for product claims: relay publication, mailbox delivery, destination daemon submission, durable envelope retention, registry discovery, and local lifecycle are implemented; remote Agent execution plus the result round trip are not yet complete.
+- task ID;
+- authenticated source identity;
+- destination identity;
+- relay-issued frame ID;
+- delivery route;
+- acceptance timestamp.
+
+A receipt proves relay acceptance, not remote execution.
+
+The destination acknowledges a relay frame only after local durable ingestion succeeds. Terminal-result publication is settled only after the authenticated origin acknowledges its result frame after durable ingestion. Timeout or response loss before acknowledgement leaves delivery retryable.
+
+## Relay and registry security
+
+Task and result mutations require authenticated node credentials when relay authentication is configured. Missing, invalid, revoked, or identity-mismatched credentials fail closed.
+
+Registry registration/deregistration ownership is also derived from authenticated node metadata. Request-body identity cannot authorize mutation of another peer's registry entry.
+
+Read-only skill discovery remains separate from mutation authority.
+
+Plaintext authenticated control/registry RPCs are suitable only for loopback. Non-loopback deployments use TLS, and clients may be configured with a private CA where required.
+
+Task publication cannot create or refresh registry ownership for the destination. Registry mutation occurs only through the dedicated authenticated registration surfaces.
+
+## Registry and discovery
+
+The relay registry tracks peer cards, skills, TTL, and protocol capabilities in memory.
+
+Current behavior includes:
+
+- authenticated registration and deregistration;
+- read-only skill discovery;
+- TTL expiry;
+- capability advertisement;
+- discovery synchronization/gossip for non-authoritative metadata.
+
+Security-sensitive protocol capabilities are not inferred solely from gossip.
+
+Registry state is process-memory state and does not survive relay restart.
+
+## Protocol capability negotiation
+
+Features that materially change transport semantics are negotiated rather than assumed.
+
+Current examples include:
+
+- `absolute_deadlines_v1` for cross-node absolute deadlines;
+- `result_artifact_bytes_v1` for bounded byte-bearing terminal result artifacts;
+- `daemon_task_consumer_v1` for nodes backed by a daemon that can consume task and result frames;
+- `nodescale_identity_bind_v1` for the typed Nodescale identity-binding control path.
+
+Unknown or unsupported destinations fail explicitly when a requested feature cannot safely be downgraded.
+
+## Authenticated Nodescale identity binding
+
+Keryx exposes a dedicated typed non-execution operation for `nodescale.identity.bind.v1`.
+
+Properties of this path:
+
+- the request body contains no authoritative sender/peer identity field;
+- the relay derives the source only from authenticated node credentials;
+- the relay binds source and destination into relay-owned context;
+- delivery requires the destination to advertise `nodescale_identity_bind_v1`;
+- the destination invokes a closed Rust handler;
+- only the authenticated destination can complete the exact control frame;
+- semantic success is returned through the typed completion path;
+- generic task storage, daemon submission, Python workers, Hermes runs, and generic task/result counters are not used as fallback mechanisms.
+
+Timeout, cancellation, restart, missing handler, or handler failure cannot fabricate semantic success.
+
+This control path exists so higher-level identity systems can use Keryx runtime provenance without pretending a generic task body is authenticated identity.
+
+## Remote result artifacts
+
+Descriptor-only artifact results are the compatibility baseline.
+
+Byte-bearing result artifacts require the authenticated origin to advertise `result_artifact_bytes_v1`. The executor verifies that capability before accepting the terminal completion that contains bytes.
+
+At the origin:
+
+- artifact bytes are integrity-checked before persistence;
+- canonical local descriptors are assigned by the origin;
+- remote logical names remain display metadata;
+- download helpers require an explicit caller-selected destination path.
+
+## Deadlines
+
+Cross-node execution deadlines use an absolute signed 64-bit Unix epoch timestamp in the task envelope.
+
+The destination must advertise `absolute_deadlines_v1`. Unknown or incompatible peers are rejected before relay acceptance rather than receiving work whose deadline semantics were silently weakened.
+
+## Cancellation
+
+The local daemon supports durable cancellation.
+
+Cross-node cancellation remains intentionally conservative. An origin record cannot prove that a remote worker observed cancellation, so the origin-side remote cancellation surface fails closed instead of claiming the executor stopped.
+
+If the destination itself durably cancels remote-origin work, its normal terminal canceled result can be returned through the authenticated result path. Duplicate local cancellation reuses the durable outcome rather than creating duplicate result delivery.
+
+## Offline mailbox
+
+The relay supports bounded in-memory offline mailboxes.
+
+Frames can survive a peer disconnect and be delivered after the peer reconnects to the same relay process. They remain pending until the authenticated destination acknowledges the exact frame.
+
+Mailbox state and relay delivery-history state do not survive relay restart.
+
+## Python SDK
+
+The Python package is `keryx`.
+
+Core exports include:
+
+- `KeryxNode`, `KeryxConfig`, `load_config`;
+- `Task`, `IncomingTask`, `TaskHandle`, `TaskStatus`;
+- `TaskState`, `TaskResult`, `TaskArtifact`;
+- `AgentCard`, `Skill`;
+- peer identity and registration helpers.
+
+Native daemon methods include connection, status/doctor, discovery, submit, claim, heartbeat, complete, fail, and cancel.
+
+The worker loop can claim durable tasks, dispatch registered handlers, heartbeat active leases, and persist completion/failure.
+
+`TaskHandle.wait()` observes durable origin-side results. A handle can be reconstructed by task ID after controller restart for status/result observation. Historical terminal rows that predate durable result storage return an explicit unavailable error rather than fabricating data.
+
+Registry registration supports a one-shot primitive and an opt-in refresh lifecycle with bounded cleanup. Prolonged registry outage may still expire a registration lease, which remains visible through registration status.
+
+See [sdk/python/README.md](../sdk/python/README.md).
 
 ## Operator CLI
 
-Actual `keryx` CLI subcommands:
+Implemented command groups:
 
 ```text
 keryx status
@@ -121,81 +266,65 @@ keryx relay start|status|registry list
 keryx node start|status|discover
 ```
 
-Notes:
+`CancelTask` exists in the daemon/SDK even though the Rust CLI does not currently expose a `task cancel` subcommand.
 
-- `keryx task` currently has no `cancel` subcommand even though the daemon exposes `CancelTask`.
-- `status` and `doctor` run an embedded local runtime when `HERMES_KERYX_DAEMON_ENDPOINT` is unset, or query the daemon endpoint when set.
-- `artifact`, `task`, and `node status` require a daemon endpoint.
-- `relay status` defaults to `http://127.0.0.1:50052` unless `HERMES_KERYX_RELAY_HEALTH_ENDPOINT` is set.
-- `relay registry list` / `node discover` default to `http://127.0.0.1:50053` unless `HERMES_KERYX_RELAY_REGISTRY_ENDPOINT` is set.
+## Important defaults
 
-## Python SDK
+| Setting | Default |
+| --- | ---: |
+| schema version | `7` |
+| lease TTL when omitted | `300000 ms` |
+| lease recovery interval | `30000 ms` |
+| deadline enforcement interval | `30000 ms` |
+| health probe interval | `60000 ms` |
+| shutdown drain timeout | `30000 ms` |
+| pending task limit | `10000` (`0` = unlimited) |
+| submit envelope limit | `4 MiB` (`0` = unlimited) |
+| inline artifact threshold | `64 KiB` |
+| max artifact/blob size | `256 MiB` |
+| cross-node result artifact content | `4 MiB` aggregate per terminal result |
+| result transport frame ceiling | `5 MiB` |
+| default local peer ID | `node-local` |
+| default `SendTask` timeout | `30000 ms` |
 
-The Python package is `keryx` and exports:
+## Common environment variables
 
-- `KeryxNode`, `KeryxConfig`, `load_config`
-- `TaskState`, `TaskResult`, `TaskArtifact`
-- `AgentCard`, `Skill`
-- `Task`, `IncomingTask`, `TaskHandle`, `TaskStatus`
-- `peer_id_to_did_key`, `register_agent`, `deregister_agent`
+| Variable | Purpose |
+| --- | --- |
+| `HERMES_KERYX_DATA_DIR` | daemon/CLI SQLite data directory |
+| `HERMES_KERYX_DAEMON_ADDR` | daemon bind address |
+| `HERMES_KERYX_DAEMON_ENDPOINT` | daemon client endpoint |
+| `HERMES_KERYX_RELAY_CONFIG` | relay/edge configuration path |
+| `HERMES_KERYX_RELAY_ENDPOINT` | relay task/control endpoint |
+| `HERMES_KERYX_RELAY_HEALTH_ENDPOINT` | relay health endpoint |
+| `HERMES_KERYX_RELAY_REGISTRY_ENDPOINT` | relay registry endpoint |
+| `HERMES_KERYX_REGISTRY_ENDPOINT` | Python SDK registry endpoint alias |
+| `HERMES_KERYX_DAEMON_SKILLS` | daemon-advertised skills |
+| `HERMES_KERYX_NODE_SKILLS` | edge-advertised skills |
+| `HERMES_KERYX_WORKER_ID` | default Python SDK worker ID |
+| `HERMES_KERYX_NODE_TOKEN` | authenticated node credential metadata |
+| `HERMES_KERYX_REGISTRY_CA_CERT` | private CA for HTTPS registry/control endpoints |
 
-Native daemon lifecycle methods include `connect`, `status`, `doctor`, `peers`, `skills`, `submit`, `claim`, `claim_next`, `heartbeat`, `complete`, `fail`, and `cancel`. Compatibility helpers include `start`, `stop`, `discover`, `send_task`, `register_skills`, `deregister_skills`, and `serve_forever`.
+## Verification
 
-Current compatibility limits:
-
-- `serve_forever()` claims durable daemon tasks, dispatches them into registered handlers, and heartbeats until the `IncomingTask` completes, fails, or the worker stops.
-- `send_task()` can submit through a configured daemon/relay route, but its compatibility `TaskHandle` is not attached to a remote terminal-status/result stream.
-- `IncomingTask.complete()` / `.fail()` are not yet wired to a durable relay result route.
-
-The SDK default daemon endpoint is the current user's private `~/.hermes/keryx/run/keryx-daemon.sock`; repository integration examples may override it with `127.0.0.1:50051` / `http://127.0.0.1:50051`.
-
-## Dual-run defaults
-
-`scripts/keryx-dual-run.sh` starts one local daemon and one relay without colliding with common AgentAnycast ports:
-
-| Component | Default |
-|---|---|
-| daemon gRPC | `127.0.0.1:50051` |
-| relay gRPC health | `127.0.0.1:51052` |
-| relay HTTP health | `127.0.0.1:18081` |
-| relay registry gRPC | `127.0.0.1:51053` |
-| relay libp2p TCP | `/ip4/127.0.0.1/tcp/4101` |
-| relay libp2p QUIC | `/ip4/127.0.0.1/udp/4101/quic-v1` |
-| state root | `~/.hermes/.keryx` |
-
-Dual-run validates infrastructure health. It does not start two edge nodes or prove a remote Hermes Agency handler/result round trip.
-
-## Environment variables
-
-Common variables:
-
-| Variable | Used by | Purpose |
-|---|---|---|
-| `HERMES_KERYX_DATA_DIR` | daemon, CLI, dual-run | SQLite data directory |
-| `HERMES_KERYX_DAEMON_ADDR` | daemon, dual-run | daemon bind address (loopback-only in `keryxd`) |
-| `HERMES_KERYX_DAEMON_ENDPOINT` | CLI, SDK, node, scripts | daemon client endpoint |
-| `HERMES_KERYX_RELAY_CONFIG` | relay, node, scripts | relay JSON/TOML config path |
-| `HERMES_KERYX_RELAY_ENDPOINT` | daemon routing publisher, node stream | relay gRPC endpoint with scheme |
-| `HERMES_KERYX_RELAY_HEALTH_ENDPOINT` | CLI, daemon fallback alias, node fallback alias | relay health/control gRPC endpoint with scheme |
-| `HERMES_KERYX_RELAY_REGISTRY_ENDPOINT` | relay CLI, node CLI, daemon discovery, node binary | relay registry gRPC endpoint with scheme for clients |
-| `HERMES_KERYX_REGISTRY_ENDPOINT` | Python SDK, dual-run script | SDK/dual-run registry endpoint alias |
-| `HERMES_KERYX_DAEMON_SKILLS` | daemon discovery | comma-separated daemon skills to register |
-| `HERMES_KERYX_NODE_SKILLS` | `keryx-node` | comma-separated edge-node skills to register |
-| `HERMES_KERYX_WORKER_ID` | Python SDK | default worker id for claim/heartbeat/complete/fail |
-
-## Validation commands
+Run the normal repository gates on the exact revision under evaluation:
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --bins
 
-cd sdk/python
-python -m pip install -e ".[dev]"
-pytest
-
-bash -n scripts/migrate-to-keryx.sh
-bash -n scripts/keryx-dual-run.sh
-./scripts/migrate-to-keryx.sh --dry-run
-./scripts/keryx-dual-run.sh --status
+python -m pip install -e "sdk/python[dev]"
+python -m pytest sdk/python/tests -q
+python scripts/e2e_two_node.py --bin-dir target/debug
 ```
+
+A historical checkpoint or completed implementation phase is not proof for a changed tree.
+
+## Known limitations
+
+- relay mailbox and registry state are not relay-restart durable;
+- cross-node cancellation does not claim success without remote-observation evidence;
+- Python result observation is polling-based rather than a streaming subscription;
+- some AgentAnycast-era compatibility surfaces remain for migration of older consumers.

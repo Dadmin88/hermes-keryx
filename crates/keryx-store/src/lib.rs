@@ -16,7 +16,7 @@ use keryx_core::{
     is_valid_operational_legacy, normalize_legacy_transition, should_inline,
     validate_artifact_size, validate_cancel_transition, validate_transition, AgentId, ArtifactId,
     CanonicalTransition, Digest, IdempotencyKey, KeryxCoreError, KeryxEventType, LeaseId,
-    LegacyEventType, MediaType, RetryPolicy, TaskId, TaskStatus, ValidationError,
+    LegacyEventType, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus, ValidationError,
 };
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
@@ -34,6 +34,19 @@ pub enum StoreError {
     ArtifactTooLarge { byte_len: u64, limit_bytes: u64 },
     #[error("digest mismatch: expected {expected}, computed {actual}")]
     DigestMismatch { expected: String, actual: String },
+    #[error("artifact length mismatch: declared {declared}, actual {actual}")]
+    ArtifactLengthMismatch { declared: u64, actual: u64 },
+    #[error("origin result artifact id mismatch for task {task_id} ordinal {ordinal}")]
+    OriginResultArtifactIdMismatch { task_id: TaskId, ordinal: u32 },
+    #[error("origin result artifact ordinal mismatch: expected {expected}, got {actual}")]
+    OriginResultArtifactOrdinalMismatch { expected: u32, actual: u32 },
+    #[error("origin result artifact task mismatch: expected {task_id}, got {artifact_task_id}")]
+    OriginResultArtifactTaskMismatch {
+        task_id: TaskId,
+        artifact_task_id: TaskId,
+    },
+    #[error("origin result artifact conflict: {0}")]
+    OriginResultArtifactConflict(ArtifactId),
     #[error("idempotency key {key} already belongs to task {existing_task_id}")]
     IdempotencyConflict {
         key: IdempotencyKey,
@@ -52,6 +65,12 @@ pub enum StoreError {
     TransportContextNotFound(TaskId),
     #[error("transport context conflicts for task {0}")]
     TransportContextConflict(TaskId),
+    #[error("task {task_id} targets executor {expected}, not local peer {actual}")]
+    TaskExecutorMismatch {
+        task_id: TaskId,
+        expected: PeerId,
+        actual: PeerId,
+    },
     #[error("transport context task {context_task_id} does not match task {task_id}")]
     TransportContextTaskMismatch {
         task_id: TaskId,
@@ -78,6 +97,19 @@ pub enum StoreError {
         expected: keryx_core::PeerId,
         actual: keryx_core::PeerId,
     },
+    #[error("remote result for task {task_id} was settled against terminal reason {reason}")]
+    RemoteResultTerminallySettled {
+        task_id: TaskId,
+        reason: RemoteResultTerminalReason,
+    },
+
+    #[error(
+        "remote result for task {task_id} carries artifacts that cannot settle terminal reason {reason}"
+    )]
+    RemoteResultTerminalArtifactsRejected {
+        task_id: TaskId,
+        reason: RemoteResultTerminalReason,
+    },
 
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationError),
@@ -89,6 +121,14 @@ pub enum StoreError {
     LeaseNotFound(TaskId),
     #[error("task already has an active lease: {task_id}")]
     LeaseConflict { task_id: TaskId },
+    #[error(
+        "task deadline expired: task={task_id} deadline_ms={deadline_ms} attempted_lease_at_ms={attempted_lease_at_ms}"
+    )]
+    TaskDeadlineExpired {
+        task_id: TaskId,
+        deadline_ms: i64,
+        attempted_lease_at_ms: i64,
+    },
     #[error("lease {lease_id} does not own task {task_id}")]
     LeaseMismatch { task_id: TaskId, lease_id: LeaseId },
     #[error("worker {worker_id} does not own active lease for task {task_id}")]
@@ -513,8 +553,86 @@ impl InMemoryStore {
         Ok(pending)
     }
 
+    pub fn claimable_pending_task_envelopes(
+        &self,
+        local_peer_id: &PeerId,
+        limit: usize,
+    ) -> StoreResult<Vec<PendingTaskEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.lock()?;
+        let mut pending = state
+            .tasks
+            .values()
+            .filter(|task| task.status == TaskStatus::Pending)
+            .filter(|task| {
+                state
+                    .transport_contexts
+                    .get(task.task_id())
+                    .and_then(|context| context.expected_executor_peer_id.as_ref())
+                    .map(|expected| expected == local_peer_id)
+                    .unwrap_or(true)
+            })
+            .filter_map(|task| {
+                state
+                    .envelopes
+                    .get(task.task_id())
+                    .map(|envelope| PendingTaskEnvelope {
+                        task: task.clone(),
+                        envelope: envelope.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            left.envelope
+                .received_at_ms
+                .cmp(&right.envelope.received_at_ms)
+                .then_with(|| {
+                    left.task
+                        .task_id()
+                        .as_str()
+                        .cmp(right.task.task_id().as_str())
+                })
+        });
+        pending.truncate(limit);
+        Ok(pending)
+    }
+
     pub fn lease_task(&self, task_id: &TaskId, lease: LeaseRecord) -> StoreResult<TaskRecord> {
+        self.lease_task_with_peer_guard(task_id, lease, None)
+    }
+
+    pub fn lease_task_for_peer(
+        &self,
+        task_id: &TaskId,
+        lease: LeaseRecord,
+        local_peer_id: &PeerId,
+    ) -> StoreResult<TaskRecord> {
+        self.lease_task_with_peer_guard(task_id, lease, Some(local_peer_id))
+    }
+
+    fn lease_task_with_peer_guard(
+        &self,
+        task_id: &TaskId,
+        lease: LeaseRecord,
+        local_peer_id: Option<&PeerId>,
+    ) -> StoreResult<TaskRecord> {
         let mut state = self.lock()?;
+        if let Some(local_peer_id) = local_peer_id {
+            if let Some(expected) = state
+                .transport_contexts
+                .get(task_id)
+                .and_then(|context| context.expected_executor_peer_id.as_ref())
+                .filter(|expected| *expected != local_peer_id)
+            {
+                return Err(StoreError::TaskExecutorMismatch {
+                    task_id: task_id.clone(),
+                    expected: expected.clone(),
+                    actual: local_peer_id.clone(),
+                });
+            }
+        }
         ensure_matching_task_id(task_id, &lease)?;
         ensure_lease_has_owner(&lease)?;
         let task = state
@@ -525,6 +643,28 @@ impl InMemoryStore {
         if state.leases.contains_key(task_id) {
             return Err(StoreError::LeaseConflict {
                 task_id: task_id.clone(),
+            });
+        }
+        if let Some(deadline_ms) = task
+            .deadline_ms
+            .filter(|deadline_ms| *deadline_ms <= lease.leased_at_ms)
+        {
+            validate_deadline_transition(task.status)?;
+            let mut failed = task;
+            let from_status = failed.status;
+            failed.status = TaskStatus::Failed;
+            append_in_memory_event(
+                &mut state,
+                task_id,
+                KeryxEventType::TaskTimedOut,
+                Some(from_status),
+                TaskStatus::Failed,
+            );
+            state.tasks.insert(task_id.clone(), failed);
+            return Err(StoreError::TaskDeadlineExpired {
+                task_id: task_id.clone(),
+                deadline_ms,
+                attempted_lease_at_ms: lease.leased_at_ms,
             });
         }
         let transition = validate_transition(task.status, TaskStatus::Running)?;
@@ -1640,6 +1780,30 @@ impl SqliteStore {
         rows.into_iter().map(row_to_pending_task_envelope).collect()
     }
 
+    pub async fn claimable_pending_task_envelopes(
+        &self,
+        local_peer_id: &PeerId,
+        limit: usize,
+    ) -> StoreResult<Vec<PendingTaskEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT t.task_id, t.status, t.idempotency_key, t.retry_count, t.dead_lettered, t.dead_letter_reason, t.deadline_ms, e.encoded_envelope, e.received_at_ms \
+             FROM tasks t \
+             INNER JOIN task_envelopes e ON e.task_id = t.task_id \
+             LEFT JOIN task_transport_context c ON c.task_id = t.task_id \
+             WHERE t.status = 'pending' \
+               AND (c.expected_executor_peer_id IS NULL OR c.expected_executor_peer_id = ?) \
+             ORDER BY e.received_at_ms ASC, t.task_id ASC LIMIT ?",
+        )
+        .bind(local_peer_id.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_pending_task_envelope).collect()
+    }
+
     pub async fn accept_task(&self, task: TaskRecord) -> StoreResult<TaskRecord> {
         validate_accepted_task_status(&task)?;
         let mut tx = self.pool.begin().await?;
@@ -1830,6 +1994,26 @@ impl SqliteStore {
         task_id: &TaskId,
         lease: LeaseRecord,
     ) -> StoreResult<TaskRecord> {
+        self.lease_task_with_peer_guard(task_id, lease, None).await
+    }
+
+    #[instrument(skip(self, lease), fields(task_id = %task_id.as_str(), worker_id = tracing::field::Empty))]
+    pub async fn lease_task_for_peer(
+        &self,
+        task_id: &TaskId,
+        lease: LeaseRecord,
+        local_peer_id: &PeerId,
+    ) -> StoreResult<TaskRecord> {
+        self.lease_task_with_peer_guard(task_id, lease, Some(local_peer_id))
+            .await
+    }
+
+    async fn lease_task_with_peer_guard(
+        &self,
+        task_id: &TaskId,
+        lease: LeaseRecord,
+        local_peer_id: Option<&PeerId>,
+    ) -> StoreResult<TaskRecord> {
         if let Some(worker_id) = lease.worker_id.as_ref() {
             tracing::Span::current()
                 .record("worker_id", tracing::field::display(worker_id.as_str()));
@@ -1837,6 +2021,25 @@ impl SqliteStore {
         let mut tx = self.pool.begin().await?;
         ensure_matching_task_id(task_id, &lease)?;
         ensure_lease_has_owner(&lease)?;
+        if let Some(local_peer_id) = local_peer_id {
+            if let Some(row) = sqlx::query(
+                "SELECT expected_executor_peer_id FROM task_transport_context WHERE task_id = ?",
+            )
+            .bind(task_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                if let Some(expected) = row.get::<Option<String>, _>("expected_executor_peer_id") {
+                    if expected != local_peer_id.as_str() {
+                        return Err(StoreError::TaskExecutorMismatch {
+                            task_id: task_id.clone(),
+                            expected: PeerId::new(expected)?,
+                            actual: local_peer_id.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let task = fetch_task_with_executor(&mut tx, task_id).await?;
         if fetch_active_lease_with_executor(&mut tx, task_id)
             .await?
@@ -1844,6 +2047,29 @@ impl SqliteStore {
         {
             return Err(StoreError::LeaseConflict {
                 task_id: task_id.clone(),
+            });
+        }
+        if let Some(deadline_ms) = task
+            .deadline_ms
+            .filter(|deadline_ms| *deadline_ms <= lease.leased_at_ms)
+        {
+            validate_deadline_transition(task.status)?;
+            let sequence = next_sequence_with_executor(&mut tx, task_id).await?;
+            update_task_status_with_executor(&mut tx, task_id, TaskStatus::Failed).await?;
+            insert_event(
+                &mut tx,
+                task_id,
+                sequence,
+                KeryxEventType::TaskTimedOut,
+                Some(task.status),
+                TaskStatus::Failed,
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(StoreError::TaskDeadlineExpired {
+                task_id: task_id.clone(),
+                deadline_ms,
+                attempted_lease_at_ms: lease.leased_at_ms,
             });
         }
         let transition = validate_transition(task.status, TaskStatus::Running)?;

@@ -1,13 +1,13 @@
-# keryx (Python SDK)
+# keryx Python SDK
 
-Python SDK for [Hermes Keryx](https://github.com/DeployFaith/hermes-keryx).
+Python SDK for [Hermes Keryx](https://github.com/Dadmin88/hermes-keryx).
 
 - **Package name:** `keryx`
 - **Import name:** `keryx`
 - **Python:** 3.11+
-- Replaces the former `agentanycast` Python package for Hermes Agency node lifecycle when `agency.transport_backend: keryx`.
+- **License:** Apache-2.0
 
-Hermes Agency may vendor this SDK under `Hermes_Agency/src/keryx/` for packaging. Prefer developing protocol/SDK changes here and syncing into Agency when cutting an integration slice.
+The SDK is a client and worker interface to `keryxd` plus supported relay/registry surfaces. It can be used by Hermes Fleet, other Hermes integrations, or standalone applications without depending on a specific higher-level product.
 
 ## Install
 
@@ -16,7 +16,7 @@ cd sdk/python
 python -m pip install -e ".[dev]"
 ```
 
-Regenerate protobuf stubs after proto changes:
+After protobuf changes, regenerate Python stubs from the repository definitions:
 
 ```bash
 python -m grpc_tools.protoc \
@@ -26,7 +26,7 @@ python -m grpc_tools.protoc \
   ../../proto/hermes/keryx/v1/*.proto
 ```
 
-## Quick start: native daemon API
+## Local daemon quickstart
 
 ```python
 import asyncio
@@ -47,7 +47,6 @@ async def main() -> None:
     )
     await node.connect()
     try:
-        print(await node.status())
         state = await node.submit(message="hello", metadata={"skill": "echo"})
         lease = await node.claim(state.task_id)
         await node.heartbeat(state.task_id, lease.lease_id)
@@ -63,52 +62,131 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-This quickstart exercises a local daemon lifecycle. It is not a remote Agent-to-Agent execution example.
+This example exercises the local durable daemon lifecycle. For the authenticated remote round trip, see [Cross-node delivery](../../docs/cross-node-delivery.md) and `scripts/e2e_two_node.py`.
 
-Native `KeryxNode` daemon methods:
+## Core API
 
-- connection/status: `connect()`, `close()`, async context manager, `status()`, `doctor()`
-- discovery: `peers()`, `skills(skill_id="", tags=None, limit=10)`
-- lifecycle: `submit()`, `claim()`, `heartbeat()`, `complete()`, `fail()`, `cancel()`
-- aliases: `submit_task()`, `claim_task()`, `heartbeat_task()`, `complete_task()`, `fail_task()`, `cancel_task()`
+Native `KeryxNode` methods include:
+
+- connection/status: `connect()`, `close()`, async context manager, `status()`, `doctor()`;
+- discovery: `peers()`, `skills(...)`;
+- lifecycle: `submit()`, `claim()`, `claim_next()`, `heartbeat()`, `complete()`, `fail()`, `cancel()`;
+- task observation/reattachment through durable task handles;
+- artifact retrieval and explicit-path download;
+- registry registration helpers.
 
 Public exports include:
 
-- `KeryxNode`, `KeryxConfig`, `load_config`
-- `AgentCard`, `Skill`
-- `Task`, `TaskHandle`, `IncomingTask`, `TaskStatus`
-- `TaskState`, `TaskResult`, `TaskArtifact`
-- `peer_id_to_did_key`, `register_agent`, `deregister_agent`
+- `KeryxNode`, `KeryxConfig`, `load_config`;
+- `Task`, `TaskHandle`, `IncomingTask`, `TaskStatus`;
+- `TaskState`, `TaskResult`, `TaskArtifact`;
+- `AgentCard`, `Skill`;
+- identity and registration helpers;
+- `TaskResultUnavailableError` for historical terminal rows that do not contain durable result data.
 
-## AgentAnycast-compatible transition helpers
+## Remote worker loop
 
-The SDK keeps transition helpers so older Hermes Agency call sites can migrate incrementally:
+The SDK can run a durable worker with registered handlers.
 
-```python
-async with KeryxNode(card=card, daemon_endpoint="127.0.0.1:50051", registry_endpoint="127.0.0.1:51053") as node:
-    await node.start()
-    await node.register_skills(ttl_seconds=300)
-    agents = await node.discover("echo", limit=1)
-    handle = await node.send_task({"parts": [{"text": "hello"}]}, peer_id=agents[0]["peer_id"])
-    print(handle.task_id)
-    await node.deregister_skills()
-    await node.stop()
-```
+A worker:
 
-Compatibility notes:
+1. claims the next compatible daemon task;
+2. invokes the registered handler;
+3. heartbeats the active lease;
+4. persists completion or failure;
+5. participates in the authenticated result-delivery path for remote-origin work.
 
-- `send_task(..., skill="...")` resolves the first registry match.
-- `send_task(..., url="...")` is not implemented.
-- The returned compatibility `TaskHandle` currently represents submission only. It is not attached to a remote terminal-status/result stream, so `wait()` cannot yet receive remote completion or artifacts.
-- `serve_forever()` is currently a lightweight keepalive loop. It does not claim daemon tasks or invoke registered `on_task()` handlers.
-- Relay publication and destination-daemon submission exist, but complete daemon-to-Agent dispatch plus result return is tracked in [Phase 17](../../docs/phase17-cross-node-agent-delivery.md) and [issue #10](https://github.com/DeployFaith/hermes-keryx/issues/10).
-- `agentanycast` and `keryx.compat.agentanycast` modules emit a deprecation warning and re-export the Keryx-backed surface.
+The worker relies on daemon claim/lease fencing. It does not treat in-process handler ownership as the durable source of truth.
+
+## Remote submission and task handles
+
+`send_task()` submits through the local daemon and returns a `TaskHandle` containing the daemon's actual submission receipt.
+
+The receipt preserves transport facts such as:
+
+- task ID;
+- accepted status;
+- routed peer;
+- delivery route;
+- relay acceptance information when available.
+
+A relay-accepted receipt proves relay acceptance, not remote execution.
+
+`TaskHandle.wait()` observes the origin daemon's durable result record. `node.task_handle(task_id)` can reopen status/result observation after the controller process restarts.
+
+Historical terminal rows that predate durable result storage raise `TaskResultUnavailableError` rather than fabricating a terminal result.
+
+## Deadlines
+
+`send_task(..., deadline_ms=...)` accepts `0` for no execution deadline or a positive signed 64-bit absolute Unix epoch timestamp.
+
+The execution deadline is separate from the client's transport/request timeout. Cross-node deadlines require destination support for `absolute_deadlines_v1`; unknown or unsupported destinations fail explicitly rather than silently dropping the deadline.
+
+## Cancellation
+
+Local daemon cancellation is supported.
+
+Cross-node cancellation remains deliberately fail-closed where the origin cannot prove that the destination worker observed cancellation and stopped active work. A local origin record is not sufficient evidence of remote termination.
+
+A reattached task handle is an observation surface and does not acquire a transferable cancellation authority simply from knowing a task ID.
+
+## Artifacts
+
+Task handles return canonical artifact descriptors with terminal results.
+
+Bounded byte-bearing result artifacts traverse the authenticated result route only when the origin advertises `result_artifact_bytes_v1`.
+
+Use SDK retrieval helpers to fetch verified bytes. File download requires an explicit caller-selected destination path; remote logical artifact names are metadata and do not select local filesystem paths.
+
+## Registry authentication
+
+Registration and deregistration are authenticated mutations.
+
+The SDK supplies the local peer identity and node token as gRPC metadata. The relay rejects missing, invalid, revoked, or body/metadata-mismatched credentials.
+
+For non-loopback registry endpoints:
+
+- use `https://`;
+- use normal certificate verification;
+- set `HERMES_KERYX_REGISTRY_CA_CERT` when a private CA is required.
+
+Read-only skill discovery is separate from registry mutation authority.
+
+## Registration lifecycle
+
+`register_skills()` is a one-shot registration primitive.
+
+`start_registration()` adds an opt-in refresh lifecycle:
+
+- registers immediately;
+- refreshes before TTL expiry;
+- retries after rejection or transient registry errors;
+- exposes health/cleanup state through `registration_status()`;
+- uses finite registry RPC deadlines;
+- preserves refresh-before-deregister ordering during shutdown.
+
+A prolonged registry outage can still allow the registry lease to expire. The lifecycle reports that condition rather than claiming permanent registration.
+
+## Compatibility helpers
+
+The SDK retains AgentAnycast-era compatibility helpers so older consumers can migrate incrementally. These are transition surfaces, not a separate transport implementation.
+
+Examples include:
+
+- `start()` / `stop()`;
+- `discover()`;
+- `send_task()`;
+- `register_skills()` / `deregister_skills()`;
+- `serve_forever()`;
+- deprecated `agentanycast` compatibility modules that re-export the Keryx-backed surface.
+
+New integrations should prefer the native Keryx API and current product contracts rather than copying assumptions from an older AgentAnycast integration.
 
 ## Configuration
 
-`load_config()` reads a TOML file from an explicit path, `HERMES_KERYX_CONFIG`, or `KERYX_CONFIG`, then applies environment overrides.
+`load_config()` reads TOML from an explicit path, `HERMES_KERYX_CONFIG`, or `KERYX_CONFIG`, then applies environment overrides.
 
-Supported TOML forms:
+Example:
 
 ```toml
 daemon_endpoint = "127.0.0.1:50051"
@@ -123,31 +201,23 @@ endpoint = "127.0.0.1:50051"
 [registry]
 endpoint = "127.0.0.1:51053"
 
-[relay]
-endpoint = "127.0.0.1:51053"
-
 [worker]
 id = "worker-a"
-default_lease_duration_ms = 120000
-
-[defaults]
-request_timeout_ms = 30000
-lease_duration_ms = 120000
 ```
 
-Environment variables:
+Common environment variables:
 
-| Variable | Default / typical | Purpose |
-|----------|-------------------|---------|
-| `HERMES_KERYX_CONFIG` / `KERYX_CONFIG` | unset | SDK TOML config path |
-| `HERMES_KERYX_DAEMON_ENDPOINT` / `KERYX_DAEMON_ENDPOINT` | SDK default `unix://~/.hermes/keryx/run/keryx-daemon.sock`; repo examples use `127.0.0.1:50051` | `keryxd` gRPC endpoint |
-| `HERMES_KERYX_REGISTRY_ENDPOINT` / `KERYX_REGISTRY_ENDPOINT` | dual-run: `127.0.0.1:51053` | relay skill registry endpoint |
-| `HERMES_KERYX_RELAY_ENDPOINT` / `KERYX_RELAY_ENDPOINT` | unset | compatibility relay endpoint alias |
-| `HERMES_KERYX_WORKER_ID` / `KERYX_WORKER_ID` | unset | default worker id for claim/heartbeat/complete/fail |
-| `HERMES_KERYX_DEFAULT_LEASE_DURATION_MS` / `KERYX_DEFAULT_LEASE_DURATION_MS` | `0` (daemon default) | claim/heartbeat lease duration |
-| `HERMES_KERYX_REQUEST_TIMEOUT_MS` / `KERYX_REQUEST_TIMEOUT_MS` | unset | caller-managed request timeout hint |
-
-`grpc_target()` strips `http://`, `https://`, and `tcp://` for Python gRPC channels; `unix://` endpoints are passed through.
+| Variable | Purpose |
+| --- | --- |
+| `HERMES_KERYX_CONFIG` / `KERYX_CONFIG` | SDK config path |
+| `HERMES_KERYX_DAEMON_ENDPOINT` / `KERYX_DAEMON_ENDPOINT` | daemon gRPC endpoint |
+| `HERMES_KERYX_REGISTRY_ENDPOINT` / `KERYX_REGISTRY_ENDPOINT` | relay registry endpoint |
+| `HERMES_KERYX_NODE_TOKEN` | authenticated registry/relay mutation credential |
+| `HERMES_KERYX_REGISTRY_CA_CERT` | optional PEM CA for HTTPS registry/control endpoints |
+| `HERMES_KERYX_RELAY_ENDPOINT` / `KERYX_RELAY_ENDPOINT` | relay endpoint alias |
+| `HERMES_KERYX_WORKER_ID` / `KERYX_WORKER_ID` | default worker ID |
+| `HERMES_KERYX_DEFAULT_LEASE_DURATION_MS` / `KERYX_DEFAULT_LEASE_DURATION_MS` | default claim/heartbeat lease duration |
+| `HERMES_KERYX_REQUEST_TIMEOUT_MS` / `KERYX_REQUEST_TIMEOUT_MS` | caller request timeout |
 
 ## Tests
 
@@ -157,10 +227,4 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-## Notes for Agency integration
-
-- Agency config field: `agency.transport_backend: keryx`
-- Agency imports should be direct: `from keryx import KeryxNode, AgentCard, Skill`
-- Prefer lazy imports inside Hermes plugin load paths so Hermes can still start if optional runtime pieces are missing
-- Keep card/task APIs stable unless Agency is updated in the same integration pass
-- Do not claim a completed remote Agency round trip until the Phase 17 cross-process E2E passes
+For cross-process transport changes, also run the repository's authenticated two-node integration test from the repository root.

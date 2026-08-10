@@ -31,6 +31,7 @@ fn envelope(task_id: &str, skill: &str) -> TaskEnvelope {
             metadata: HashMap::new(),
         }],
         metadata: HashMap::from([("skill".to_string(), skill.to_string())]),
+        deadline_ms: 0,
     }
 }
 

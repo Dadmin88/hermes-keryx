@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use keryx_daemon::grpc_transport::{ca_cert_path_from_env, secure_grpc_endpoint};
 use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
 use keryx_proto::v1::{DiscoverBySkillRequest, HealthRequest};
@@ -162,17 +163,21 @@ fn registry_endpoint() -> Option<String> {
 async fn connect_relay_health(
     endpoint: &str,
 ) -> Result<KeryxRelayClient<tonic::transport::Channel>> {
-    KeryxRelayClient::connect(endpoint.to_string())
+    let channel = secure_grpc_endpoint(endpoint, ca_cert_path_from_env().as_deref())?
+        .connect()
         .await
-        .with_context(|| format!("keryx relay status: relay unavailable at {endpoint}"))
+        .with_context(|| format!("keryx relay status: relay unavailable at {endpoint}"))?;
+    Ok(KeryxRelayClient::new(channel))
 }
 
 async fn connect_registry(
     endpoint: &str,
 ) -> Result<RegistryServiceClient<tonic::transport::Channel>> {
-    RegistryServiceClient::connect(endpoint.to_string())
+    let channel = secure_grpc_endpoint(endpoint, ca_cert_path_from_env().as_deref())?
+        .connect()
         .await
-        .with_context(|| format!("keryx relay registry: registry unavailable at {endpoint}"))
+        .with_context(|| format!("keryx relay registry: registry unavailable at {endpoint}"))?;
+    Ok(RegistryServiceClient::new(channel))
 }
 
 pub fn resolve_sibling_binary(default_name: &str, override_env: &str) -> PathBuf {

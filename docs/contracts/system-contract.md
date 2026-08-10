@@ -8,7 +8,7 @@
 - Duplicate dispatch with the same idempotency key returns the original task when compatible or a defined conflict when incompatible.
 - Duplicate completion is safe.
 - Daemon restart does not silently lose accepted queued work.
-- Relay restart does not silently lose stored mailbox work.
+- Relay mailbox and acknowledgement state is process-local and may be lost on relay restart; durable guarantees begin at daemon persistence boundaries.
 
 ## DispatchTask success
 
@@ -29,10 +29,10 @@ Keryx uses at-least-once delivery. Handlers must tolerate duplicate delivery. Ta
 ## Restart behavior
 
 - Daemon restart: preserve terminal tasks, expire stale leases, requeue recoverable work, emit recovery events.
-- Relay restart: preserve mailbox items and terminal relay events, resume node sessions from fresh authentication.
+- Relay restart: discard process-local mailbox/acknowledgement state and resume node sessions from fresh authentication; daemons retain their durable task/result/outbox state for retry.
 - Agent crash: leases eventually expire and recoverable work returns to queue or dead-letter according to retry policy.
 - Client disconnect: accepted work continues unless an explicit task deadline or cancellation policy applies.
 
 ## Never silently lost
 
-Accepted tasks, terminal states, mailbox items, and recovery decisions must never be silently discarded. If Keryx cannot prove state, it must surface a doctor warning/failure or a typed recovery event.
+Daemon-accepted tasks, terminal states, durable outbox items, and recovery decisions must never be silently discarded. Relay acceptance alone is not a durable destination acknowledgement. If Keryx cannot prove durable daemon state, it must surface a doctor warning/failure or a typed recovery event.
