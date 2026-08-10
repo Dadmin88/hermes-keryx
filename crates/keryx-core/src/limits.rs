@@ -10,6 +10,9 @@ pub const DEFAULT_MAX_PENDING_TASKS: u64 = 10_000;
 /// Default maximum bytes for a SubmitTask envelope (task payload).
 pub const DEFAULT_MAX_ENVELOPE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 
+/// Default maximum retained bytes for durable SubmitTask envelopes.
+pub const DEFAULT_MAX_RETAINED_ENVELOPE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
 /// Identifies which limit was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +21,8 @@ pub enum LimitKind {
     PendingTasks,
     /// Submit envelope byte size exceeds `max_envelope_bytes`.
     EnvelopeBytes,
+    /// Retained Submit envelope bytes would exceed `max_retained_envelope_bytes`.
+    RetainedEnvelopeBytes,
 }
 
 impl LimitKind {
@@ -26,6 +31,7 @@ impl LimitKind {
         match self {
             Self::PendingTasks => "pending_tasks",
             Self::EnvelopeBytes => "envelope_bytes",
+            Self::RetainedEnvelopeBytes => "retained_envelope_bytes",
         }
     }
 }
@@ -43,6 +49,8 @@ pub struct LimitsConfig {
     pub max_pending_tasks: u64,
     /// Maximum byte size for a SubmitTask envelope. 0 = unlimited.
     pub max_envelope_bytes: u64,
+    /// Maximum total bytes retained in durable SubmitTask envelopes. 0 = unlimited.
+    pub max_retained_envelope_bytes: u64,
 }
 
 impl Default for LimitsConfig {
@@ -50,6 +58,7 @@ impl Default for LimitsConfig {
         Self {
             max_pending_tasks: DEFAULT_MAX_PENDING_TASKS,
             max_envelope_bytes: DEFAULT_MAX_ENVELOPE_BYTES,
+            max_retained_envelope_bytes: DEFAULT_MAX_RETAINED_ENVELOPE_BYTES,
         }
     }
 }
@@ -61,6 +70,7 @@ impl LimitsConfig {
         Self {
             max_pending_tasks: 0,
             max_envelope_bytes: 0,
+            max_retained_envelope_bytes: 0,
         }
     }
 
@@ -84,6 +94,24 @@ impl LimitsConfig {
                 kind: LimitKind::EnvelopeBytes,
                 current: byte_len,
                 max: self.max_envelope_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Check whether accepting an envelope would exceed retained envelope byte capacity.
+    pub const fn check_retained_envelope_bytes(
+        &self,
+        current: u64,
+        incoming: u64,
+    ) -> Result<(), LimitExceeded> {
+        let after_accept = current.saturating_add(incoming);
+        if self.max_retained_envelope_bytes > 0 && after_accept > self.max_retained_envelope_bytes {
+            Err(LimitExceeded {
+                kind: LimitKind::RetainedEnvelopeBytes,
+                current: after_accept,
+                max: self.max_retained_envelope_bytes,
             })
         } else {
             Ok(())
@@ -131,6 +159,7 @@ mod tests {
 
         assert_eq!(limits.max_pending_tasks, 10_000);
         assert_eq!(limits.max_envelope_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.max_retained_envelope_bytes, 256 * 1024 * 1024);
     }
 
     #[test]
@@ -139,6 +168,9 @@ mod tests {
 
         assert!(limits.check_pending_tasks(u64::MAX).is_ok());
         assert!(limits.check_envelope_bytes(u64::MAX).is_ok());
+        assert!(limits
+            .check_retained_envelope_bytes(u64::MAX, u64::MAX)
+            .is_ok());
     }
 
     #[test]
@@ -146,6 +178,7 @@ mod tests {
         let limits = LimitsConfig {
             max_pending_tasks: 2,
             max_envelope_bytes: 0,
+            max_retained_envelope_bytes: 0,
         };
 
         assert_eq!(limits.check_pending_tasks(0), Ok(()));
@@ -165,6 +198,7 @@ mod tests {
         let limits = LimitsConfig {
             max_pending_tasks: 0,
             max_envelope_bytes: 4,
+            max_retained_envelope_bytes: 0,
         };
 
         assert_eq!(limits.check_envelope_bytes(4), Ok(()));
@@ -174,6 +208,25 @@ mod tests {
                 kind: LimitKind::EnvelopeBytes,
                 current: 5,
                 max: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn retained_envelope_limit_rejects_when_accept_would_exceed_capacity() {
+        let limits = LimitsConfig {
+            max_pending_tasks: 0,
+            max_envelope_bytes: 0,
+            max_retained_envelope_bytes: 10,
+        };
+
+        assert_eq!(limits.check_retained_envelope_bytes(4, 6), Ok(()));
+        assert_eq!(
+            limits.check_retained_envelope_bytes(4, 7),
+            Err(LimitExceeded {
+                kind: LimitKind::RetainedEnvelopeBytes,
+                current: 11,
+                max: 10,
             })
         );
     }

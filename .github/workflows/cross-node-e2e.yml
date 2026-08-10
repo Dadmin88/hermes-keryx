@@ -1,4 +1,4 @@
-name: Phase 17 Two-Node E2E
+name: Cross-Node Two-Node E2E
 
 on:
   pull_request:
@@ -8,7 +8,7 @@ on:
       - "proto/**"
       - "sdk/python/**"
       - "scripts/e2e_two_node.py"
-      - ".github/workflows/phase17-e2e.yml"
+      - ".github/workflows/cross-node-e2e.yml"
   push:
     branches: [main]
     paths:
@@ -16,13 +16,13 @@ on:
       - "proto/**"
       - "sdk/python/**"
       - "scripts/e2e_two_node.py"
-      - ".github/workflows/phase17-e2e.yml"
+      - ".github/workflows/cross-node-e2e.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: phase17-e2e-${{ github.ref }}
+  group: cross-node-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,9 +41,9 @@ jobs:
       - name: Build committed runtime binaries
         shell: bash
         run: |
-          mkdir -p .tmp/phase17-e2e
+          mkdir -p .tmp/cross-node-e2e
           set -o pipefail
-          cargo build --workspace --bins 2>&1 | tee .tmp/phase17-e2e/cargo-build.log
+          cargo build --workspace --bins 2>&1 | tee .tmp/cross-node-e2e/cargo-build.log
 
       - name: Install Python SDK
         run: python -m pip install -e 'sdk/python[dev]'
@@ -52,12 +52,12 @@ jobs:
         run: |
           python scripts/e2e_two_node.py \
             --bin-dir target/debug \
-            --work-dir .tmp/phase17-e2e
+            --work-dir .tmp/cross-node-e2e
 
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: phase17-two-node-failure
-          path: .tmp/phase17-e2e
+          name: cross-node-two-node-failure
+          path: .tmp/cross-node-e2e
           if-no-files-found: warn

@@ -207,3 +207,21 @@ async def test_serve_forever_requires_handler() -> None:
     with pytest.raises(RuntimeError, match="at least one on_task handler"):
         await node.serve_forever()
     await node.close()
+
+
+@pytest.mark.asyncio
+async def test_serve_forever_requires_card_with_skills() -> None:
+    for card in (None, AgentCard(name="unskilled-agent", skills=[])):
+        stub = Stub([])
+        node = KeryxNode(card, daemon_stub=stub, worker_id="worker-runtime")
+        node._client = SimpleNamespace(close=AsyncMock())
+        node._running = True
+
+        @node.on_task
+        async def handler(task) -> None:
+            await task.complete()
+
+        with pytest.raises(RuntimeError, match="AgentCard with at least one skill"):
+            await node.serve_forever()
+        assert stub.ClaimNextTask.await_count == 0
+        await node.close()

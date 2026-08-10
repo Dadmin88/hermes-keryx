@@ -127,7 +127,7 @@ Relay offline mailboxes, frame ownership, and the recent acknowledgement/task-re
 
 ### Typed Nodescale identity-binding control
 
-`nodescale.identity.bind.v1` is control traffic, not task traffic. A control-capable edge installs the public typed `NodescaleIdentityBindHandler` and advertises the `nodescale_identity_bind_v1` protocol feature. The edge can run this handler with a relay endpoint and no daemon endpoint; task or result frames still fail closed when no daemon is present.
+`nodescale.identity.bind.v1` is control traffic, not task traffic. A control-capable edge installs the public typed `NodescaleIdentityBindHandler` and advertises the `nodescale_identity_bind_v1` protocol feature. The edge can run this handler with a relay endpoint and no daemon endpoint. Only daemon-backed nodes advertise `daemon_task_consumer_v1`; the relay rejects task and result publications to destinations without that capability so unsupported frames cannot block their direct-control mailbox.
 
 Operational invariants:
 
@@ -364,9 +364,9 @@ Triggered by SIGINT (`Ctrl+C`) in `keryxd` when the RPC listener is active.
 
 ### SubmitTask rejected by limits
 
-**Cause:** pending task count is at/above `max_pending_tasks` or envelope bytes exceed `max_envelope_bytes`.
+**Cause:** pending task count is at/above `max_pending_tasks`, envelope bytes exceed `max_envelope_bytes`, or retained durable envelope bytes would exceed the aggregate retained-envelope limit.
 
-**Action:** claim/drain pending work, increase limits in embedded config, or use `LimitsConfig::unlimited()` in tests. The current binary uses default limits until external config wiring is added.
+**Action:** claim/drain pending work, prune/recreate local test stores when retained completed envelopes are intentionally disposable, increase limits in embedded config, or use `LimitsConfig::unlimited()` in tests. The current binary uses default limits until external config wiring is added.
 
 ### Artifact upload rejected
 

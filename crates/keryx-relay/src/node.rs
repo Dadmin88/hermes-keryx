@@ -487,6 +487,7 @@ pub async fn run_edge_node_with_direct_control_handlers(
 
     register_node_skills(
         &registry_peer_id,
+        daemon_endpoint().is_some(),
         direct_control_handlers.has_nodescale_identity_bind_handler(),
         direct_control_handlers.has_nodescale_identity_challenge_handler(),
     )
@@ -932,6 +933,7 @@ fn bootstrap_peers_from_env() -> Result<Vec<Multiaddr>> {
 
 async fn register_node_skills(
     registry_peer_id: &str,
+    daemon_task_consumer_enabled: bool,
     nodescale_identity_bind_enabled: bool,
     nodescale_identity_challenge_enabled: bool,
 ) -> Result<()> {
@@ -943,6 +945,9 @@ async fn register_node_skills(
         "absolute_deadlines_v1".to_string(),
         "result_artifact_bytes_v1".to_string(),
     ];
+    if daemon_task_consumer_enabled {
+        protocol_features.push("daemon_task_consumer_v1".to_string());
+    }
     if nodescale_identity_bind_enabled {
         protocol_features.push("nodescale_identity_bind_v1".to_string());
     }
