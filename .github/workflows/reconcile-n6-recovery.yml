@@ -1,0 +1,38 @@
+name: N6 recovery reconciliation probe
+
+on:
+  push:
+    branches: [feat/n6-authenticated-challenge]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Probe merge with current main
+        shell: bash
+        run: |
+          set -uo pipefail
+          git config user.name "Keryx N6 Reconciliation Probe"
+          git config user.email "keryx-n6-reconciliation@users.noreply.github.com"
+          git fetch origin main
+          set +e
+          git merge --no-commit --no-ff origin/main
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo MERGE_PROBE_CLEAN
+            git merge --abort || true
+            exit 0
+          fi
+          echo MERGE_PROBE_CONFLICTS
+          git diff --name-only --diff-filter=U
+          echo '--- combined diff ---'
+          git diff --cc
+          git merge --abort || true
+          exit 1
