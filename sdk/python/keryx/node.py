@@ -329,15 +329,20 @@ class KeryxNode:
         *,
         reason: str = "",
         metadata: Mapping[str, str] | None = None,
+        lease_id: str | None = None,
+        worker_id: str | None = None,
     ) -> TaskResult:
         daemon = await self._daemon()
-        response = await daemon.CancelTask(
-            daemon_pb2.CancelTaskRequest(
-                task_id=common_pb2.TaskId(value=task_id),
-                reason=reason,
-                metadata=dict(metadata or {}),
-            )
+        request = daemon_pb2.CancelTaskRequest(
+            task_id=common_pb2.TaskId(value=task_id),
+            reason=reason,
+            metadata=dict(metadata or {}),
         )
+        if lease_id:
+            request.lease_id.value = lease_id
+        if worker_id:
+            request.worker_id.value = worker_id
+        response = await daemon.CancelTask(request)
         return TaskResult.from_cancel(response)
 
     async def cancel_task(self, *args: Any, **kwargs: Any) -> TaskResult:

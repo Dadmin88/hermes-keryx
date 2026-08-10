@@ -155,6 +155,10 @@ message CancelTaskRequest {
   TaskId task_id = 1;
   string reason = 2;
   map<string, string> metadata = 3;
+  // Required when canceling a running task; proves ownership of the active lease.
+  LeaseId lease_id = 4;
+  // Required when canceling a running task; must match the active lease owner.
+  AgentId worker_id = 5;
 }
 
 message CancelTaskResponse {

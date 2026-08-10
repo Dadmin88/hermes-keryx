@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keryx_core::{
-    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, KeryxEventType,
-    LeaseId, LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
+    should_inline, AgentId, ArtifactId, ArtifactMeta, Digest, IdempotencyKey, LeaseId,
+    LimitExceeded, LimitsConfig, MediaType, PeerId, RetryPolicy, TaskId, TaskStatus,
     ValidationError, MAX_BLOB_BYTES,
 };
 use keryx_observe::{KeryxMetrics, MetricsSnapshot};
@@ -1195,7 +1195,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
     #[instrument(
         name = "keryx::rpc::cancel_task",
         skip(self, request),
-        fields(task_id = tracing::field::Empty, reason = tracing::field::Empty)
+        fields(task_id = tracing::field::Empty, lease_id = tracing::field::Empty, worker_id = tracing::field::Empty, reason = tracing::field::Empty)
     )]
     async fn cancel_task(
         &self,
@@ -1205,13 +1205,28 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         let reason = normalized_cancel_reason(&inner.reason);
+        let lease_id = parse_optional_lease_id(inner.lease_id.as_ref())?;
+        let worker_id = parse_optional_agent_id(inner.worker_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
+        if let Some(lease_id) = lease_id.as_ref() {
+            tracing::Span::current().record("lease_id", tracing::field::display(lease_id.as_str()));
+        }
+        if let Some(worker_id) = worker_id.as_ref() {
+            tracing::Span::current()
+                .record("worker_id", tracing::field::display(worker_id.as_str()));
+        }
         tracing::Span::current().record("reason", tracing::field::display(&reason));
         self.runtime.cancellation().increment_cancel_requests();
         let task = self
             .runtime
             .store()
-            .accept_legacy_event(&task_id, KeryxEventType::TaskCanceled)
+            .cancel_task(
+                &task_id,
+                lease_id.as_ref(),
+                worker_id.as_ref(),
+                &reason,
+                unix_ms_now(),
+            )
             .await
             .map_err(store_error_to_status)?;
         self.runtime.cancellation().increment_tasks_canceled();
@@ -1567,6 +1582,14 @@ fn parse_required_lease_id(id: Option<&ProtoLeaseId>) -> Result<LeaseId, Status>
         })
         .ok_or_else(|| Status::invalid_argument("lease_id is required"))?;
     LeaseId::new(value).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn parse_optional_agent_id(id: Option<&ProtoAgentId>) -> Result<Option<AgentId>, Status> {
+    id.map(|id| parse_required_agent_id(Some(id))).transpose()
+}
+
+fn parse_optional_lease_id(id: Option<&ProtoLeaseId>) -> Result<Option<LeaseId>, Status> {
+    id.map(|id| parse_required_lease_id(Some(id))).transpose()
 }
 
 fn parse_optional_idempotency_key(

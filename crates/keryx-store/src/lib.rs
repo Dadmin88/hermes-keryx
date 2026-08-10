@@ -506,6 +506,8 @@ impl InMemoryStore {
     pub fn cancel_task(
         &self,
         task_id: &TaskId,
+        lease_id: Option<&LeaseId>,
+        worker_id: Option<&AgentId>,
         _reason: &str,
         now_ms: i64,
     ) -> StoreResult<TaskRecord> {
@@ -524,6 +526,13 @@ impl InMemoryStore {
                 .get(task_id)
                 .cloned()
                 .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            let lease_id = lease_id.ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            let worker_id = worker_id.ok_or_else(|| StoreError::LeaseOwnerMismatch {
+                task_id: task_id.clone(),
+                worker_id: AgentId::new("missing-worker").expect("valid static worker id"),
+            })?;
+            ensure_matching_lease_id(task_id, &active, lease_id)?;
+            ensure_matching_worker_id(task_id, &active, worker_id)?;
             ensure_active_lease_unexpired(&active, now_ms)?;
         }
         let transition = validate_cancel_transition(task.status)?;
@@ -1683,6 +1692,8 @@ impl SqliteStore {
     pub async fn cancel_task(
         &self,
         task_id: &TaskId,
+        lease_id: Option<&LeaseId>,
+        worker_id: Option<&AgentId>,
         _reason: &str,
         now_ms: i64,
     ) -> StoreResult<TaskRecord> {
@@ -1696,6 +1707,13 @@ impl SqliteStore {
             let active = fetch_active_lease_with_executor(&mut tx, task_id)
                 .await?
                 .ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            let lease_id = lease_id.ok_or_else(|| StoreError::LeaseNotFound(task_id.clone()))?;
+            let worker_id = worker_id.ok_or_else(|| StoreError::LeaseOwnerMismatch {
+                task_id: task_id.clone(),
+                worker_id: AgentId::new("missing-worker").expect("valid static worker id"),
+            })?;
+            ensure_matching_lease_id(task_id, &active, lease_id)?;
+            ensure_matching_worker_id(task_id, &active, worker_id)?;
             ensure_active_lease_unexpired(&active, now_ms)?;
         }
         let transition = validate_cancel_transition(task.status)?;

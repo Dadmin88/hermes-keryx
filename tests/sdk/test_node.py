@@ -242,7 +242,13 @@ async def test_task_lifecycle_methods_build_expected_grpc_requests(
     assert failed.retry_count == 2
     assert failed.dead_lettered is True
 
-    canceled = await node.cancel("task-1", reason="user requested", metadata={"actor": "test"})
+    canceled = await node.cancel(
+        "task-1",
+        reason="user requested",
+        metadata={"actor": "test"},
+        lease_id="lease-1",
+        worker_id="worker-1",
+    )
     assert canceled.task_id == "task-1"
     assert canceled.status == "canceled"
     assert canceled.canceled is True
@@ -250,6 +256,8 @@ async def test_task_lifecycle_methods_build_expected_grpc_requests(
     assert isinstance(cancel_request, daemon_pb2.CancelTaskRequest)
     assert cancel_request.reason == "user requested"
     assert cancel_request.metadata["actor"] == "test"
+    assert cancel_request.lease_id.value == "lease-1"
+    assert cancel_request.worker_id.value == "worker-1"
 
 
 @pytest.mark.asyncio
