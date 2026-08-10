@@ -1,38 +1,71 @@
-name: Retained envelope reconciliation probe
+name: Retained envelope reconciliation
 
 on:
   push:
     branches: [codex/fix-memory-and-disk-exhaustion-vulnerability]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  reconcile:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Probe merge with current main
+      - name: Merge current main with guarded documentation resolution
         shell: bash
         run: |
-          set -uo pipefail
-          git config user.name "Keryx Reconciliation Probe"
+          set -euo pipefail
+          git config user.name "Keryx Reconciliation"
           git config user.email "keryx-reconciliation@users.noreply.github.com"
           git fetch origin main
+
           set +e
           git merge --no-commit --no-ff origin/main
           status=$?
           set -e
-          if [ "$status" -eq 0 ]; then
-            echo MERGE_PROBE_CLEAN
-            git merge --abort || true
-            exit 0
+
+          if [ "$status" -ne 0 ]; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            test "$conflicts" = "docs/current-product.md" || {
+              echo "Unexpected conflict set:" >&2
+              printf '%s\n' "$conflicts" >&2
+              exit 1
+            }
+            git checkout --theirs -- docs/current-product.md
+            python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('docs/current-product.md')
+          text = path.read_text()
+          needle = (
+              'The complete protobuf envelope is persisted atomically with task acceptance, which means nested messages, raw bytes, metadata maps, correlation identifiers, and capability hints survive daemon restart. Idempotent retries must agree with the stored task and envelope; conflicting bytes fail closed.\n'
+          )
+          addition = (
+              needle
+              + '\nTask admission enforces both a per-envelope encoded-size limit and an aggregate retained-envelope byte limit. The retained-envelope limit defaults to `256 MiB` and can be set to `0` only to opt into unlimited retained-envelope storage.\n'
+          )
+          if text.count(needle) != 1:
+              raise SystemExit('Unexpected current-product storage contract shape')
+          path.write_text(text.replace(needle, addition, 1))
+          PY
+            git add docs/current-product.md
           fi
-          echo MERGE_PROBE_CONFLICTS
-          git diff --name-only --diff-filter=U
-          echo '--- combined diff ---'
-          git diff --cc
-          git merge --abort || true
-          exit 1
+
+          test -z "$(git diff --name-only --diff-filter=U)" || {
+            echo "Unresolved conflicts remain" >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          }
+
+          cargo fmt --all --check
+          cargo check --workspace --all-targets --locked
+          cargo test -p keryx-core -p keryx-store -p keryx-daemon --locked
+          git rm .github/workflows/reconcile-retained-envelope.yml
+          git add -A
+          git diff --cached --check
+          git commit -m "merge: reconcile retained-envelope limit with current main"
+          git push origin HEAD:codex/fix-memory-and-disk-exhaustion-vulnerability
