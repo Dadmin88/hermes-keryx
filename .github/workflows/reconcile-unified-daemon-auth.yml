@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/reconcile_unified_daemon_auth.py
-          sdk/python/scripts/generate_protos.sh
+          bash sdk/python/scripts/generate_protos.sh
           cargo fmt --all
 
       - name: Validate Rust workspace
