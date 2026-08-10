@@ -50,15 +50,25 @@ if common.count(old) != 1:
     raise SystemExit(f"expected one test interceptor declaration, found {common.count(old)}")
 common_path.write_text(common.replace(old, new, 1), encoding="utf-8")
 
-# This cancellation fixture represents a PENDING remote-origin task, not a
-# RUNNING leased task, so no ownership proof is required. Keep the test's
-# semantics explicit while adapting to the new six-argument store API.
+# These cancellation fixtures represent PENDING remote-origin tasks, not
+# RUNNING leased tasks, so no lease ownership proof is required. Keep that
+# explicit while adapting to the six-argument result-preserving cancel API.
 store_test_path = Path("crates/keryx-store/tests/result_artifact_ingest.rs")
 store_test = store_test_path.read_text(encoding="utf-8")
 old_call = '.cancel_task_with_result(&task_id, "owner canceled", 15, canceled.clone())'
 new_call = '.cancel_task_with_result(&task_id, None, None, "owner canceled", 15, canceled.clone())'
 if store_test.count(old_call) != 1:
-    raise SystemExit(f"expected one pending cancellation fixture, found {store_test.count(old_call)}")
+    raise SystemExit(f"expected one pending store cancellation fixture, found {store_test.count(old_call)}")
 store_test_path.write_text(store_test.replace(old_call, new_call, 1), encoding="utf-8")
+
+transport_path = Path("crates/keryx-daemon/tests/result_artifact_transport.rs")
+transport = transport_path.read_text(encoding="utf-8")
+old_transport = "        .cancel_task_with_result(\n            &core_id,\n            \"owner canceled\",\n"
+new_transport = "        .cancel_task_with_result(\n            &core_id,\n            None,\n            None,\n            \"owner canceled\",\n"
+if transport.count(old_transport) != 2:
+    raise SystemExit(
+        f"expected two pending daemon transport cancellation fixtures, found {transport.count(old_transport)}"
+    )
+transport_path.write_text(transport.replace(old_transport, new_transport), encoding="utf-8")
 
 print("generated unified-auth integration fixtures repaired")
