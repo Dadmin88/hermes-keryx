@@ -51,6 +51,7 @@ const TARGET_NODE_METADATA_KEYS: &[&str] = &[
 
 const ABSOLUTE_DEADLINES_FEATURE: &str = "absolute_deadlines_v1";
 const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
+const DAEMON_TASK_CONSUMER_FEATURE: &str = "daemon_task_consumer_v1";
 const NODESCALE_IDENTITY_BIND_FEATURE: &str = "nodescale_identity_bind_v1";
 const MAX_DIRECT_CONTROL_ID_BYTES: usize = 256;
 const MAX_DIRECT_CONTROL_NONCE_BYTES: usize = 512;
@@ -150,6 +151,29 @@ async fn await_nodescale_identity_bind_completion(
 }
 
 impl RelayHealthService {
+    async fn reject_direct_control_only_destination(
+        &self,
+        destination_node_id: &str,
+    ) -> Result<(), Status> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Ok(());
+        };
+        let peer_id = parse_registry_peer_id(destination_node_id)?;
+        let features = registry.protocol_features(&peer_id).await;
+        if features
+            .iter()
+            .any(|feature| feature == NODESCALE_IDENTITY_BIND_FEATURE)
+            && !features
+                .iter()
+                .any(|feature| feature == DAEMON_TASK_CONSUMER_FEATURE)
+        {
+            return Err(Status::failed_precondition(format!(
+                "destination {destination_node_id} does not advertise protocol feature {DAEMON_TASK_CONSUMER_FEATURE}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn require_destination_feature(
         &self,
         destination_node_id: &str,
@@ -359,6 +383,8 @@ impl KeryxRelay for RelayHealthService {
             inner.target_node_id.trim().to_string()
         };
         let source_node_id = authenticated_source;
+        self.reject_direct_control_only_destination(&target_node_id)
+            .await?;
         if task.deadline_ms > 0 {
             self.require_destination_feature(&target_node_id, ABSOLUTE_DEADLINES_FEATURE)
                 .await?;
@@ -448,6 +474,8 @@ impl KeryxRelay for RelayHealthService {
             .ok_or_else(|| Status::invalid_argument("PublishResult requires result"))?;
         let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
         let source_node_id = authenticated_source;
+        self.reject_direct_control_only_destination(&target_node_id)
+            .await?;
         if result
             .output_artifacts
             .iter()
@@ -1114,6 +1142,55 @@ mod tests {
         })
         .await
         .expect("direct-control frame must reach completion-wait state")
+    }
+
+    #[tokio::test]
+    async fn publish_task_rejects_direct_control_only_destination_without_mailboxing() {
+        let runtime = RelayRuntime::new("direct-control-only-task-rejection-test");
+        let registry = Arc::new(SkillRegistry::new());
+        registry
+            .register_with_features(
+                PeerId::new(DESTINATION_NODE_ID).unwrap(),
+                Vec::new(),
+                DESTINATION_NODE_ID.to_string(),
+                String::new(),
+                vec![NODESCALE_IDENTITY_BIND_FEATURE.to_string()],
+                None,
+            )
+            .await;
+        let service = direct_service(Arc::clone(&runtime), registry, HashSet::new());
+        let mut request = Request::new(PublishTaskRequest {
+            task: Some(TaskEnvelope {
+                task_id: Some(TaskId {
+                    value: "unsupported-task".to_string(),
+                }),
+                correlation_id: None,
+                idempotency_key: None,
+                status: 0,
+                messages: Vec::new(),
+                metadata: HashMap::new(),
+                deadline_ms: 0,
+            }),
+            target_node_id: DESTINATION_NODE_ID.to_string(),
+            source_node_id: SOURCE_NODE_ID.to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+
+        let error = KeryxRelay::publish_task(service.as_ref(), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains(DAEMON_TASK_CONSUMER_FEATURE));
+        assert_eq!(
+            runtime.test_pending_frame_counts(DESTINATION_NODE_ID),
+            (0, 0, 0)
+        );
     }
 
     #[tokio::test]

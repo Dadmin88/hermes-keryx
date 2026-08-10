@@ -170,6 +170,7 @@ Current examples include:
 
 - `absolute_deadlines_v1` for cross-node absolute deadlines;
 - `result_artifact_bytes_v1` for bounded byte-bearing terminal result artifacts;
+- `daemon_task_consumer_v1` for nodes backed by a daemon that can consume task and result frames;
 - `nodescale_identity_bind_v1` for the typed Nodescale identity-binding control path.
 
 Unknown or unsupported destinations fail explicitly when a requested feature cannot safely be downgraded.
