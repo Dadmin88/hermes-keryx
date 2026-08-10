@@ -6,6 +6,10 @@ mod incoming;
 mod lease_recovery_loop;
 mod routing;
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -166,6 +170,7 @@ pub struct KeryxDaemonConfig {
     local_peer_id: PeerId,
     send_task_timeout_ms: u64,
     discovery: Option<DiscoverySettings>,
+    artifact_rpc_token: String,
 }
 
 impl KeryxDaemonConfig {
@@ -184,6 +189,7 @@ impl KeryxDaemonConfig {
             local_peer_id: PeerId::new(DEFAULT_LOCAL_PEER_ID).expect("static local peer id"),
             send_task_timeout_ms: DEFAULT_SEND_TASK_TIMEOUT_MS,
             discovery: None,
+            artifact_rpc_token: String::new(),
         }
     }
 
@@ -200,6 +206,14 @@ impl KeryxDaemonConfig {
     }
 
     #[must_use]
+    pub fn artifact_rpc_token(&self) -> &str {
+        &self.artifact_rpc_token
+    }
+
+    pub fn artifact_rpc_token_path(&self) -> PathBuf {
+        self.data_dir.join("artifact-rpc-token")
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -426,6 +440,8 @@ impl KeryxDaemonRuntime {
     pub async fn startup(config: KeryxDaemonConfig) -> StoreResult<Self> {
         let startup_recovery_started_at = std::time::Instant::now();
         std::fs::create_dir_all(config.data_dir())?;
+        let mut config = config;
+        config.artifact_rpc_token = load_or_create_artifact_rpc_token(&config)?;
         let db_path = config.db_path();
         let store = SqliteStore::connect(&db_path).await?;
         store.migrate().await?;
@@ -1006,6 +1022,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<PutArtifactRequest>,
     ) -> Result<Response<PutArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        require_artifact_rpc_token(&request, &self.runtime)?;
         let inner = request.into_inner();
         let task_id = parse_required_task_id(inner.task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
@@ -1051,6 +1068,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<GetArtifactRequest>,
     ) -> Result<Response<GetArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        require_artifact_rpc_token(&request, &self.runtime)?;
         let inner = request.into_inner();
         let artifact_id = parse_required_artifact_id(inner.artifact_id.as_ref())?;
         tracing::Span::current()
@@ -1087,6 +1105,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<ListArtifactsRequest>,
     ) -> Result<Response<ListArtifactsResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        require_artifact_rpc_token(&request, &self.runtime)?;
         let task_id = parse_required_task_id(request.into_inner().task_id.as_ref())?;
         tracing::Span::current().record("task_id", tracing::field::display(task_id.as_str()));
         let artifacts = self
@@ -1111,6 +1130,7 @@ impl KeryxDaemon for KeryxDaemonRpcService {
         request: Request<DeleteArtifactRequest>,
     ) -> Result<Response<DeleteArtifactResponse>, Status> {
         let _rpc = RpcInFlightGuard::enter(&self.runtime)?;
+        require_artifact_rpc_token(&request, &self.runtime)?;
         let artifact_id = parse_required_artifact_id(request.into_inner().artifact_id.as_ref())?;
         tracing::Span::current()
             .record("artifact_id", tracing::field::display(artifact_id.as_str()));
@@ -1224,6 +1244,48 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Running => "running",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
+    }
+}
+
+const ARTIFACT_RPC_TOKEN_METADATA: &str = "x-keryx-artifact-token";
+
+fn load_or_create_artifact_rpc_token(config: &KeryxDaemonConfig) -> StoreResult<String> {
+    let path = config.artifact_rpc_token_path();
+    match OpenOptions::new().read(true).open(&path) {
+        Ok(mut file) => {
+            let mut token = String::new();
+            file.read_to_string(&mut token)?;
+            Ok(token.trim().to_string())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&path)?;
+            writeln!(file, "{token}")?;
+            Ok(token)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn require_artifact_rpc_token<T>(
+    request: &Request<T>,
+    runtime: &KeryxDaemonRuntime,
+) -> Result<(), Status> {
+    let expected = runtime.config().artifact_rpc_token();
+    let supplied = request
+        .metadata()
+        .get(ARTIFACT_RPC_TOKEN_METADATA)
+        .and_then(|value| value.to_str().ok());
+    if supplied == Some(expected) && !expected.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated(
+            "artifact RPC requires daemon-local authorization token",
+        ))
     }
 }
 

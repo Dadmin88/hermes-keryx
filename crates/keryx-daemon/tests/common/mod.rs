@@ -13,12 +13,41 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::metadata::MetadataValue;
+use tonic::service::Interceptor;
+use tonic::transport::Channel;
+use tonic::{Request, Status};
+
+#[derive(Clone)]
+pub struct ArtifactTokenInterceptor {
+    token: MetadataValue<tonic::metadata::Ascii>,
+}
+
+impl ArtifactTokenInterceptor {
+    pub fn new(token: &str) -> Self {
+        Self {
+            token: MetadataValue::try_from(token).unwrap(),
+        }
+    }
+}
+
+impl Interceptor for ArtifactTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request
+            .metadata_mut()
+            .insert("x-keryx-artifact-token", self.token.clone());
+        Ok(request)
+    }
+}
 
 #[allow(dead_code)]
 pub struct RpcTestHarness {
     pub _dir: TempDir,
     pub runtime: Arc<KeryxDaemonRuntime>,
-    pub client: KeryxDaemonClient<tonic::transport::Channel>,
+    pub client: KeryxDaemonClient<
+        tonic::service::interceptor::InterceptedService<Channel, ArtifactTokenInterceptor>,
+    >,
+    pub endpoint: String,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
@@ -44,13 +73,20 @@ impl RpcTestHarness {
             runtime.as_ref().clone(),
             TcpListenerStream::new(listener),
         ));
-        let client = KeryxDaemonClient::connect(format!("http://{addr}"))
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let client = KeryxDaemonClient::with_interceptor(
+            channel,
+            ArtifactTokenInterceptor::new(runtime.config().artifact_rpc_token()),
+        );
         Self {
             _dir: dir,
             runtime,
             client,
+            endpoint: format!("http://{addr}"),
             server,
         }
     }
@@ -67,14 +103,21 @@ impl RpcTestHarness {
             TcpListenerStream::new(listener),
         ));
 
-        let client = KeryxDaemonClient::connect(format!("http://{addr}"))
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let client = KeryxDaemonClient::with_interceptor(
+            channel,
+            ArtifactTokenInterceptor::new(runtime.config().artifact_rpc_token()),
+        );
 
         Self {
             _dir: dir,
             runtime,
             client,
+            endpoint: format!("http://{addr}"),
             server,
         }
     }

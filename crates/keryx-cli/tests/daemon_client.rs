@@ -12,11 +12,22 @@ fn run_keryx(command: &str, endpoint: String) -> std::process::Output {
 }
 
 fn run_keryx_args(args: &[&str], endpoint: String) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_keryx"))
+    run_keryx_args_with_data_dir(args, endpoint, None)
+}
+
+fn run_keryx_args_with_data_dir(
+    args: &[&str],
+    endpoint: String,
+    data_dir: Option<&std::path::Path>,
+) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_keryx"));
+    command
         .args(args)
-        .env("HERMES_KERYX_DAEMON_ENDPOINT", endpoint)
-        .output()
-        .unwrap()
+        .env("HERMES_KERYX_DAEMON_ENDPOINT", endpoint);
+    if let Some(data_dir) = data_dir {
+        command.env("HERMES_KERYX_DATA_DIR", data_dir);
+    }
+    command.output().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -102,12 +113,10 @@ async fn cli_doctor_reports_unavailable_daemon_when_endpoint_cannot_connect() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
     let dir = tempdir().unwrap();
-    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(
-        dir.path().join("cli-artifact-rpc-keryx-home"),
-        123,
-    ))
-    .await
-    .unwrap();
+    let data_dir = dir.path().join("cli-artifact-rpc-keryx-home");
+    let runtime = KeryxDaemonRuntime::startup(KeryxDaemonConfig::new(data_dir.clone(), 123))
+        .await
+        .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_daemon_rpc(runtime, TcpListenerStream::new(listener)));
@@ -127,8 +136,9 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
     let put_output = tokio::task::spawn_blocking({
         let endpoint = endpoint.clone();
         let put_file = put_file.clone();
+        let data_dir = data_dir.clone();
         move || {
-            run_keryx_args(
+            run_keryx_args_with_data_dir(
                 &[
                     "artifact",
                     "put",
@@ -140,6 +150,7 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
                     "text/plain",
                 ],
                 endpoint,
+                Some(&data_dir),
             )
         }
     })
@@ -151,7 +162,14 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
 
     let ls_output = tokio::task::spawn_blocking({
         let endpoint = endpoint.clone();
-        move || run_keryx_args(&["artifact", "ls", "cli-artifact-task"], endpoint)
+        let data_dir = data_dir.clone();
+        move || {
+            run_keryx_args_with_data_dir(
+                &["artifact", "ls", "cli-artifact-task"],
+                endpoint,
+                Some(&data_dir),
+            )
+        }
     })
     .await
     .unwrap();
@@ -164,8 +182,9 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
     let get_output = tokio::task::spawn_blocking({
         let endpoint = endpoint.clone();
         let get_output_path = get_output_path.clone();
+        let data_dir = data_dir.clone();
         move || {
-            run_keryx_args(
+            run_keryx_args_with_data_dir(
                 &[
                     "artifact",
                     "get",
@@ -174,6 +193,7 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
                     get_output_path.to_str().unwrap(),
                 ],
                 endpoint,
+                Some(&data_dir),
             )
         }
     })
@@ -187,7 +207,13 @@ async fn cli_artifact_commands_round_trip_file_content_against_daemon() {
 
     let rm_output = tokio::task::spawn_blocking({
         let endpoint = endpoint.clone();
-        move || run_keryx_args(&["artifact", "rm", "cli-artifact-1"], endpoint)
+        move || {
+            run_keryx_args_with_data_dir(
+                &["artifact", "rm", "cli-artifact-1"],
+                endpoint,
+                Some(&data_dir),
+            )
+        }
     })
     .await
     .unwrap();

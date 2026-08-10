@@ -120,6 +120,35 @@ async fn artifact_rpc_round_trips_inline_content_and_lists_then_deletes() {
 }
 
 #[tokio::test]
+async fn artifact_rpc_rejects_missing_authorization_token() {
+    let mut harness = RpcTestHarness::start().await;
+    let endpoint = harness.endpoint.clone();
+    let task_id = TaskId {
+        value: "artifact-rpc-unauth".to_string(),
+    };
+    submit_pending_task(&mut harness, &task_id).await;
+
+    let channel = tonic::transport::Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut unauthenticated = keryx_proto::v1::keryx_daemon_client::KeryxDaemonClient::new(channel);
+    let error = unauthenticated
+        .put_artifact(PutArtifactRequest {
+            task_id: Some(task_id),
+            artifact_id: Some(ArtifactId {
+                value: "artifact-rpc-unauth-1".to_string(),
+            }),
+            media_type: "text/plain".to_string(),
+            content: b"should not store".to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
 async fn artifact_rpc_put_rejects_oversize_uploads_with_resource_exhausted() {
     let mut harness = RpcTestHarness::start().await;
     let task_id = TaskId {

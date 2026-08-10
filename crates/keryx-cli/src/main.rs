@@ -14,6 +14,8 @@ use keryx_proto::v1::{
 };
 use node::NodeCommand;
 use relay::RelayCommand;
+use tonic::metadata::MetadataValue;
+use tonic::service::Interceptor;
 
 const DAEMON_ENDPOINT_ENV: &str = "HERMES_KERYX_DAEMON_ENDPOINT";
 const ARTIFACT_RPC_MAX_BYTES: usize = MAX_BLOB_BYTES + (1024 * 1024);
@@ -264,10 +266,58 @@ fn require_daemon_endpoint() -> Result<String> {
     })
 }
 
+#[derive(Clone)]
+struct ArtifactTokenInterceptor {
+    token: Option<MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl ArtifactTokenInterceptor {
+    fn new(token: Option<String>) -> Self {
+        Self {
+            token: token.and_then(|token| MetadataValue::try_from(token).ok()),
+        }
+    }
+}
+
+impl Interceptor for ArtifactTokenInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(token) = &self.token {
+            request
+                .metadata_mut()
+                .insert("x-keryx-artifact-token", token.clone());
+        }
+        Ok(request)
+    }
+}
+
+fn artifact_rpc_token() -> Result<Option<String>> {
+    let path = default_config().artifact_rpc_token_path();
+    match std::fs::read_to_string(&path) {
+        Ok(token) => Ok(Some(token.trim().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "keryx daemon client: failed to read artifact RPC token from {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 async fn connect_daemon(
     endpoint: &str,
     operation: &str,
-) -> Result<KeryxDaemonClient<tonic::transport::Channel>> {
+) -> Result<
+    KeryxDaemonClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            ArtifactTokenInterceptor,
+        >,
+    >,
+> {
     let endpoint_url = endpoint.to_string();
     let endpoint = tonic::transport::Endpoint::from_shared(endpoint_url.clone())
         .with_context(|| format!("{operation}: invalid daemon endpoint {endpoint_url}"))?;
@@ -275,9 +325,12 @@ async fn connect_daemon(
         .connect()
         .await
         .with_context(|| format!("{operation}: daemon unavailable at {endpoint_url}"))?;
-    Ok(KeryxDaemonClient::new(channel)
-        .max_decoding_message_size(ARTIFACT_RPC_MAX_BYTES)
-        .max_encoding_message_size(ARTIFACT_RPC_MAX_BYTES))
+    let token = artifact_rpc_token()?;
+    Ok(
+        KeryxDaemonClient::with_interceptor(channel, ArtifactTokenInterceptor::new(token))
+            .max_decoding_message_size(ARTIFACT_RPC_MAX_BYTES)
+            .max_encoding_message_size(ARTIFACT_RPC_MAX_BYTES),
+    )
 }
 
 async fn run_status() -> Result<()> {
