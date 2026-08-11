@@ -18,12 +18,14 @@ service KeryxRelay {
   rpc PublishResult(PublishResultRequest) returns (PublishResultResponse);
   // Typed non-execution relay-to-edge control. Source identity is metadata-only.
   rpc PublishNodescaleIdentityBind(PublishNodescaleIdentityBindRequest) returns (PublishNodescaleIdentityBindResponse);
+  rpc PublishNodescaleIdentityBindV2(PublishNodescaleIdentityBindV2Request) returns (PublishNodescaleIdentityBindResponse);
   // Destination-only typed completion for a relay-issued control frame.
   rpc CompleteNodescaleIdentityBind(CompleteNodescaleIdentityBindRequest) returns (CompleteNodescaleIdentityBindResponse);
   // Typed non-execution challenge issuance. Source identity is metadata-only. This is
   // authenticated at-least-once transport: the installed Nodescale handler, not Keryx,
   // must durably deduplicate `(authenticated_sender_peer_id, operation_id)`.
   rpc PublishNodescaleIdentityChallenge(PublishNodescaleIdentityChallengeRequest) returns (PublishNodescaleIdentityChallengeResponse);
+  rpc PublishNodescaleIdentityChallengeV2(PublishNodescaleIdentityChallengeV2Request) returns (PublishNodescaleIdentityChallengeResponse);
   // Destination-only typed challenge completion for a relay-issued control frame.
   rpc CompleteNodescaleIdentityChallenge(CompleteNodescaleIdentityChallengeRequest) returns (CompleteNodescaleIdentityChallengeResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
@@ -57,6 +59,8 @@ message RelayFrame {
   string destination_node_id = 5;
   NodescaleIdentityBindV1 nodescale_identity_bind_v1 = 6;
   NodescaleIdentityChallengeV1 nodescale_identity_challenge_v1 = 7;
+  NodescaleIdentityBindV2 nodescale_identity_bind_v2 = 8;
+  NodescaleIdentityChallengeV2 nodescale_identity_challenge_v2 = 9;
 }
 message RegisterNodeRequest { NodeId node_id = 1; string token = 2; }
 message RegisterNodeResponse { bool accepted = 1; }
@@ -89,6 +93,10 @@ message PublishNodescaleIdentityBindRequest {
   NodescaleIdentityBindV1 operation = 1;
   string target_node_id = 2;
 }
+message PublishNodescaleIdentityBindV2Request {
+  NodescaleIdentityBindV2 operation = 1;
+  string target_node_id = 2;
+}
 message PublishNodescaleIdentityBindResponse {
   string frame_id = 1;
   string destination_node_id = 2;
@@ -101,6 +109,10 @@ message CompleteNodescaleIdentityBindRequest {
 message CompleteNodescaleIdentityBindResponse { bool accepted = 1; }
 message PublishNodescaleIdentityChallengeRequest {
   NodescaleIdentityChallengeV1 operation = 1;
+  string target_node_id = 2;
+}
+message PublishNodescaleIdentityChallengeV2Request {
+  NodescaleIdentityChallengeV2 operation = 1;
   string target_node_id = 2;
 }
 message PublishNodescaleIdentityChallengeResponse {

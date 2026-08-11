@@ -218,6 +218,112 @@ impl NodescaleIdentityChallengeHandler for RecordingChallengeHandler {
     }
 }
 
+#[derive(Default)]
+struct RecordingChallengeV2Handler {
+    calls: Mutex<Vec<keryx_proto::v1::NodescaleIdentityChallengeV2>>,
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityChallengeV2Handler for RecordingChallengeV2Handler {
+    async fn handle_nodescale_identity_challenge_v2(
+        &self,
+        _context: AuthenticatedDirectContext,
+        operation: keryx_proto::v1::NodescaleIdentityChallengeV2,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityChallengeResult> {
+        self.calls.lock().unwrap().push(operation);
+        Ok(keryx_proto::v1::NodescaleIdentityChallengeResult {
+            disposition: keryx_proto::v1::NodescaleIdentityChallengeDisposition::Issued as i32,
+            accepted: true,
+            challenge_id: "challenge-v2".to_string(),
+            challenge_secret: "test-only-secret".to_string(),
+            binding_generation: 1,
+            expires_at_unix_ms: 1,
+            reason: String::new(),
+            code: String::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingBindV2Handler {
+    calls: Mutex<Vec<keryx_proto::v1::NodescaleIdentityBindV2>>,
+}
+
+#[tonic::async_trait]
+impl NodescaleIdentityBindV2Handler for RecordingBindV2Handler {
+    async fn handle_nodescale_identity_bind_v2(
+        &self,
+        _context: AuthenticatedDirectContext,
+        operation: keryx_proto::v1::NodescaleIdentityBindV2,
+    ) -> anyhow::Result<keryx_proto::v1::NodescaleIdentityBindResult> {
+        self.calls.lock().unwrap().push(operation);
+        Ok(keryx_proto::v1::NodescaleIdentityBindResult {
+            disposition: keryx_proto::v1::NodescaleIdentityBindDisposition::Active as i32,
+            accepted: true,
+            binding_id: "binding-v2".to_string(),
+            generation: 1,
+            revision: 1,
+            reason: String::new(),
+            code: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn v2_frames_dispatch_provider_binding_id_without_v1_reinterpretation() {
+    let challenge_handler = Arc::new(RecordingChallengeV2Handler::default());
+    let bind_handler = Arc::new(RecordingBindV2Handler::default());
+    let handlers = DirectControlHandlers {
+        nodescale_identity_challenge_v2: Some(challenge_handler.clone()),
+        nodescale_identity_bind_v2: Some(bind_handler.clone()),
+        ..DirectControlHandlers::default()
+    };
+    let challenge = keryx_proto::v1::NodescaleIdentityChallengeV2 {
+        operation_id: "challenge-operation-v2".to_string(),
+        network_id: "network".to_string(),
+        device_id: "device".to_string(),
+        provider_binding_id: "provider-binding".to_string(),
+        agent_version: "nodescale-agent:9.0.0".to_string(),
+    };
+    let challenge_frame = RelayFrame {
+        frame_id: "challenge-frame-v2".to_string(),
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        nodescale_identity_challenge_v2: Some(challenge.clone()),
+        ..RelayFrame::default()
+    };
+    assert!(matches!(
+        dispatch_relay_typed_control_for_local(&handlers, "destination", &challenge_frame).await,
+        Ok(Some(LocalTypedControlDispatch::Challenge(result))) if result.accepted
+    ));
+    assert_eq!(
+        challenge_handler.calls.lock().unwrap().as_slice(),
+        &[challenge]
+    );
+
+    let bind = keryx_proto::v1::NodescaleIdentityBindV2 {
+        operation_id: "bind-operation-v2".to_string(),
+        network_id: "network".to_string(),
+        device_id: "device".to_string(),
+        provider_binding_id: "provider-binding".to_string(),
+        binding_nonce: "nonce".to_string(),
+        binding_generation: 1,
+        agent_version: "nodescale-agent:9.0.0".to_string(),
+    };
+    let bind_frame = RelayFrame {
+        frame_id: "bind-frame-v2".to_string(),
+        authenticated_source_node_id: "source".to_string(),
+        destination_node_id: "destination".to_string(),
+        nodescale_identity_bind_v2: Some(bind.clone()),
+        ..RelayFrame::default()
+    };
+    assert!(matches!(
+        dispatch_relay_typed_control_for_local(&handlers, "destination", &bind_frame).await,
+        Ok(Some(LocalTypedControlDispatch::Bind(result))) if result.accepted
+    ));
+    assert_eq!(bind_handler.calls.lock().unwrap().as_slice(), &[bind]);
+}
+
 #[tonic::async_trait]
 impl NodescaleIdentityChallengeHandler for FailingChallengeHandler {
     async fn handle_nodescale_identity_challenge(
@@ -259,6 +365,7 @@ async fn typed_direct_handler_receives_exact_context_and_is_deterministic_withou
     let handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: Some(handler.clone()),
         nodescale_identity_challenge_v1: None,
+        ..DirectControlHandlers::default()
     };
     let context = AuthenticatedDirectContext::from_authenticated_relay_frame(&RelayFrame {
         frame_id: "frame".to_string(),
@@ -268,6 +375,7 @@ async fn typed_direct_handler_receives_exact_context_and_is_deterministic_withou
         destination_node_id: "destination".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     });
     let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
         operation_id: "operation".to_string(),
@@ -319,6 +427,7 @@ async fn typed_direct_handler_absence_or_failure_returns_error_without_task_fall
         destination_node_id: "destination".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     });
     let operation = keryx_proto::v1::NodescaleIdentityBindV1 {
         operation_id: "operation".to_string(),
@@ -340,6 +449,7 @@ async fn typed_direct_handler_absence_or_failure_returns_error_without_task_fall
         &DirectControlHandlers {
             nodescale_identity_bind_v1: Some(Arc::new(FailingDirectHandler)),
             nodescale_identity_challenge_v1: None,
+            ..DirectControlHandlers::default()
         },
         context,
         operation,
@@ -357,6 +467,7 @@ async fn challenge_handler_receives_authenticated_context_without_task_routing()
     let handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: Some(typed_handler),
+        ..DirectControlHandlers::default()
     };
     let context = AuthenticatedDirectContext::from_authenticated_relay_frame(&RelayFrame {
         frame_id: "challenge-frame".to_string(),
@@ -366,6 +477,7 @@ async fn challenge_handler_receives_authenticated_context_without_task_routing()
         destination_node_id: "destination".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     });
     let operation = keryx_proto::v1::NodescaleIdentityChallengeV1 {
         operation_id: "challenge-operation".to_string(),
@@ -411,6 +523,7 @@ async fn failed_or_hung_challenge_handler_returns_secret_free_rejection_and_allo
                 join_session_id: "session".to_string(),
                 agent_version: "v1".to_string(),
             }),
+            ..RelayFrame::default()
         }
     }
 
@@ -427,6 +540,7 @@ async fn failed_or_hung_challenge_handler_returns_secret_free_rejection_and_allo
         let handlers = DirectControlHandlers {
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: Some(handler),
+            ..DirectControlHandlers::default()
         };
         let dispatch = dispatch_relay_typed_control_for_local_bounded(
             &handlers,
@@ -457,6 +571,7 @@ async fn failed_or_hung_challenge_handler_returns_secret_free_rejection_and_allo
         destination_node_id: "destination".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     };
     assert!(dispatch_relay_typed_control_for_local_bounded(
         &DirectControlHandlers::default(),
@@ -510,6 +625,7 @@ fn node_rejects_a_malformed_frame_with_both_control_payloads() {
             join_session_id: "session".to_string(),
             agent_version: "v1".to_string(),
         }),
+        ..RelayFrame::default()
     };
 
     assert!(validate_relay_frame_exactly_one_payload(&frame).is_err());
@@ -526,6 +642,7 @@ async fn edge_rejects_zero_and_multi_payload_frames_before_task_result_or_contro
         destination_node_id: "registered-local".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     };
     task_and_result.result = Some(keryx_proto::v1::TaskResultEnvelope::default());
     let zero_payload = RelayFrame {
@@ -536,6 +653,7 @@ async fn edge_rejects_zero_and_multi_payload_frames_before_task_result_or_contro
         destination_node_id: "registered-local".to_string(),
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     };
 
     for frame in [task_and_result, zero_payload] {
@@ -563,6 +681,7 @@ async fn edge_fails_closed_when_exact_destination_challenge_handler_is_absent() 
             join_session_id: "session".to_string(),
             agent_version: "v1".to_string(),
         }),
+        ..RelayFrame::default()
     };
 
     let error = match dispatch_relay_typed_control_for_local(
@@ -589,6 +708,7 @@ async fn edge_rejects_typed_direct_destination_mismatch_before_handlers_issue_re
     let bind_handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: Some(bind_handler.clone()),
         nodescale_identity_challenge_v1: None,
+        ..DirectControlHandlers::default()
     };
     let bind_frame = RelayFrame {
         frame_id: "wrong-bind-destination".to_string(),
@@ -606,6 +726,7 @@ async fn edge_rejects_typed_direct_destination_mismatch_before_handlers_issue_re
             agent_version: "v1".to_string(),
         }),
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     };
     let outcome =
         dispatch_relay_typed_control_for_local(&bind_handlers, "registered-local", &bind_frame)
@@ -619,6 +740,7 @@ async fn edge_rejects_typed_direct_destination_mismatch_before_handlers_issue_re
     let challenge_handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: None,
         nodescale_identity_challenge_v1: Some(challenge_handler.clone()),
+        ..DirectControlHandlers::default()
     };
     let challenge_frame = RelayFrame {
         frame_id: "wrong-challenge-destination".to_string(),
@@ -634,6 +756,7 @@ async fn edge_rejects_typed_direct_destination_mismatch_before_handlers_issue_re
             join_session_id: "session".to_string(),
             agent_version: "v1".to_string(),
         }),
+        ..RelayFrame::default()
     };
     let outcome = dispatch_relay_typed_control_for_local(
         &challenge_handlers,
@@ -655,6 +778,7 @@ async fn edge_dispatches_typed_direct_control_only_for_its_exact_registered_dest
     let handlers = DirectControlHandlers {
         nodescale_identity_bind_v1: Some(handler.clone()),
         nodescale_identity_challenge_v1: None,
+        ..DirectControlHandlers::default()
     };
     let frame = RelayFrame {
         frame_id: "local-bind-destination".to_string(),
@@ -672,6 +796,7 @@ async fn edge_dispatches_typed_direct_control_only_for_its_exact_registered_dest
             agent_version: "v1".to_string(),
         }),
         nodescale_identity_challenge_v1: None,
+        ..RelayFrame::default()
     };
 
     assert!(matches!(
@@ -809,6 +934,7 @@ async fn exhausted_transient_result_delivery_retries_dead_letter_without_losing_
                 destination_node_id: ORIGIN.to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
         );
     }

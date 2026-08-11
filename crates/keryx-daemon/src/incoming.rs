@@ -412,6 +412,7 @@ mod tests {
                 destination_node_id: "node-local".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
         )
         .expect("a generic task frame must remain extractable");
@@ -429,6 +430,7 @@ mod tests {
             destination_node_id: "node-local".to_string(),
             nodescale_identity_bind_v1: Some(keryx_proto::v1::NodescaleIdentityBindV1::default()),
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         };
         assert!(
             IncomingRelayTask::from_relay_frame("node-remote", bind_with_task.clone()).is_err()
@@ -449,6 +451,7 @@ mod tests {
                 destination_node_id: "node-local".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
             RelayFrame {
                 frame_id: "zero-payload".to_string(),
@@ -458,6 +461,7 @@ mod tests {
                 destination_node_id: "node-local".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
             RelayFrame {
                 frame_id: "task-and-result".to_string(),
@@ -467,6 +471,7 @@ mod tests {
                 destination_node_id: "node-local".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
         ] {
             assert!(IncomingRelayTask::from_relay_frame("node-remote", frame).is_err());

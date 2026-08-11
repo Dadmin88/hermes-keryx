@@ -17,8 +17,9 @@ use keryx_proto::v1::{
     CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityChallengeRequest,
     FailResultDeliveryRequest, IngestRemoteResultRequest, NodeFrame,
     NodescaleIdentityBindDisposition, NodescaleIdentityBindResult, NodescaleIdentityBindV1,
-    NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
-    NodescaleIdentityChallengeV1, PublishResultRequest, SubmitRemoteTaskRequest,
+    NodescaleIdentityBindV2, NodescaleIdentityChallengeDisposition,
+    NodescaleIdentityChallengeResult, NodescaleIdentityChallengeV1, NodescaleIdentityChallengeV2,
+    PublishResultRequest, SubmitRemoteTaskRequest,
 };
 use keryx_proto::v1::{RegisterSkillsRequest, SkillInfo};
 use libp2p::swarm::SwarmEvent;
@@ -249,6 +250,16 @@ pub trait NodescaleIdentityBindHandler: Send + Sync {
     ) -> Result<NodescaleIdentityBindResult>;
 }
 
+/// V2 typed-provenance bind seam. Field 4 is an exact N5 provider binding.
+#[tonic::async_trait]
+pub trait NodescaleIdentityBindV2Handler: Send + Sync {
+    async fn handle_nodescale_identity_bind_v2(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: NodescaleIdentityBindV2,
+    ) -> Result<NodescaleIdentityBindResult>;
+}
+
 /// Closed typed challenge-control seam. It cannot receive a daemon or task envelope.
 ///
 /// The installed Nodescale handler, not Keryx, owns challenge issuance. It MUST use
@@ -266,10 +277,22 @@ pub trait NodescaleIdentityChallengeHandler: Send + Sync {
     ) -> Result<NodescaleIdentityChallengeResult>;
 }
 
+/// V2 typed-provenance challenge seam. Field 4 is an exact N5 provider binding.
+#[tonic::async_trait]
+pub trait NodescaleIdentityChallengeV2Handler: Send + Sync {
+    async fn handle_nodescale_identity_challenge_v2(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: NodescaleIdentityChallengeV2,
+    ) -> Result<NodescaleIdentityChallengeResult>;
+}
+
 #[derive(Clone, Default)]
 pub struct DirectControlHandlers {
     pub nodescale_identity_bind_v1: Option<Arc<dyn NodescaleIdentityBindHandler>>,
+    pub nodescale_identity_bind_v2: Option<Arc<dyn NodescaleIdentityBindV2Handler>>,
     pub nodescale_identity_challenge_v1: Option<Arc<dyn NodescaleIdentityChallengeHandler>>,
+    pub nodescale_identity_challenge_v2: Option<Arc<dyn NodescaleIdentityChallengeV2Handler>>,
 }
 
 impl DirectControlHandlers {
@@ -306,6 +329,29 @@ pub(crate) async fn dispatch_nodescale_identity_bind_v1(
         .await
 }
 
+/// Dispatch a V2 typed-provenance bind without interpreting V1 fields.
+pub(crate) async fn dispatch_nodescale_identity_bind_v2(
+    handlers: &DirectControlHandlers,
+    context: AuthenticatedDirectContext,
+    operation: NodescaleIdentityBindV2,
+) -> Result<NodescaleIdentityBindResult> {
+    anyhow::ensure!(
+        !context.authenticated_source_node_id.trim().is_empty()
+            && !context.destination_node_id.trim().is_empty()
+            && !context.relay_frame_id.trim().is_empty()
+            && !operation.operation_id.trim().is_empty()
+            && !operation.provider_binding_id.trim().is_empty(),
+        "direct control frame provenance, operation id, and provider binding id are required"
+    );
+    let handler = handlers
+        .nodescale_identity_bind_v2
+        .as_ref()
+        .context("nodescale identity bind V2 handler is not installed")?;
+    handler
+        .handle_nodescale_identity_bind_v2(context, operation)
+        .await
+}
+
 /// Dispatch a typed challenge control operation without any daemon/task dependency.
 pub(crate) async fn dispatch_nodescale_identity_challenge_v1(
     handlers: &DirectControlHandlers,
@@ -328,6 +374,29 @@ pub(crate) async fn dispatch_nodescale_identity_challenge_v1(
         .await
 }
 
+/// Dispatch a V2 typed-provenance challenge without interpreting V1 fields.
+pub(crate) async fn dispatch_nodescale_identity_challenge_v2(
+    handlers: &DirectControlHandlers,
+    context: AuthenticatedDirectContext,
+    operation: NodescaleIdentityChallengeV2,
+) -> Result<NodescaleIdentityChallengeResult> {
+    anyhow::ensure!(
+        !context.authenticated_source_node_id.trim().is_empty()
+            && !context.destination_node_id.trim().is_empty()
+            && !context.relay_frame_id.trim().is_empty()
+            && !operation.operation_id.trim().is_empty()
+            && !operation.provider_binding_id.trim().is_empty(),
+        "direct control frame provenance, operation id, and provider binding id are required"
+    );
+    let handler = handlers
+        .nodescale_identity_challenge_v2
+        .as_ref()
+        .context("nodescale identity challenge V2 handler is not installed")?;
+    handler
+        .handle_nodescale_identity_challenge_v2(context, operation)
+        .await
+}
+
 pub(crate) enum LocalTypedControlDispatch {
     Bind(NodescaleIdentityBindResult),
     Challenge(NodescaleIdentityChallengeResult),
@@ -339,7 +408,10 @@ pub(crate) async fn dispatch_relay_typed_control_for_local(
     frame: &keryx_proto::v1::RelayFrame,
 ) -> Result<Option<LocalTypedControlDispatch>> {
     validate_relay_frame_exactly_one_payload(frame)?;
-    if frame.nodescale_identity_bind_v1.is_none() && frame.nodescale_identity_challenge_v1.is_none()
+    if frame.nodescale_identity_bind_v1.is_none()
+        && frame.nodescale_identity_challenge_v1.is_none()
+        && frame.nodescale_identity_bind_v2.is_none()
+        && frame.nodescale_identity_challenge_v2.is_none()
     {
         return Ok(None);
     }
@@ -348,13 +420,16 @@ pub(crate) async fn dispatch_relay_typed_control_for_local(
         "typed direct control frame destination does not match the registered local node"
     );
 
+    if let Some(operation) = frame.nodescale_identity_challenge_v2.clone() {
+        return dispatch_nodescale_identity_challenge_v2(
+            handlers,
+            AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
+            operation,
+        )
+        .await
+        .map(|result| Some(LocalTypedControlDispatch::Challenge(result)));
+    }
     if let Some(operation) = frame.nodescale_identity_challenge_v1.clone() {
-        anyhow::ensure!(
-            frame.task.is_none()
-                && frame.result.is_none()
-                && frame.nodescale_identity_bind_v1.is_none(),
-            "direct challenge frame must carry only one control payload"
-        );
         return dispatch_nodescale_identity_challenge_v1(
             handlers,
             AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
@@ -364,20 +439,22 @@ pub(crate) async fn dispatch_relay_typed_control_for_local(
         .map(|result| Some(LocalTypedControlDispatch::Challenge(result)));
     }
 
-    let operation = frame
-        .nodescale_identity_bind_v1
-        .clone()
-        .expect("typed bind frame was checked above");
-    anyhow::ensure!(
-        frame.task.is_none()
-            && frame.result.is_none()
-            && frame.nodescale_identity_challenge_v1.is_none(),
-        "direct control frame must carry only one control payload"
-    );
+    if let Some(operation) = frame.nodescale_identity_bind_v2.clone() {
+        return dispatch_nodescale_identity_bind_v2(
+            handlers,
+            AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
+            operation,
+        )
+        .await
+        .map(|result| Some(LocalTypedControlDispatch::Bind(result)));
+    }
     dispatch_nodescale_identity_bind_v1(
         handlers,
         AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
-        operation,
+        frame
+            .nodescale_identity_bind_v1
+            .clone()
+            .expect("typed bind frame was checked above"),
     )
     .await
     .map(|result| Some(LocalTypedControlDispatch::Bind(result)))
@@ -390,8 +467,10 @@ async fn dispatch_relay_typed_control_for_local_bounded(
     handler_timeout: Duration,
 ) -> Result<Option<LocalTypedControlDispatch>> {
     validate_relay_frame_exactly_one_payload(frame)?;
-    let is_challenge = frame.nodescale_identity_challenge_v1.is_some();
-    let is_bind = frame.nodescale_identity_bind_v1.is_some();
+    let is_challenge = frame.nodescale_identity_challenge_v1.is_some()
+        || frame.nodescale_identity_challenge_v2.is_some();
+    let is_bind =
+        frame.nodescale_identity_bind_v1.is_some() || frame.nodescale_identity_bind_v2.is_some();
     if !is_challenge && !is_bind {
         return Ok(None);
     }
@@ -543,8 +622,14 @@ pub async fn run_edge_node_with_direct_control_handlers(
     register_node_skills(
         &registry_peer_id,
         daemon_endpoint().is_some(),
-        direct_control_handlers.has_nodescale_identity_bind_handler(),
-        direct_control_handlers.has_nodescale_identity_challenge_handler(),
+        direct_control_handlers.nodescale_identity_bind_v1.is_some(),
+        direct_control_handlers
+            .nodescale_identity_challenge_v1
+            .is_some(),
+        direct_control_handlers.nodescale_identity_bind_v2.is_some(),
+        direct_control_handlers
+            .nodescale_identity_challenge_v2
+            .is_some(),
     )
     .await?;
 
@@ -931,7 +1016,9 @@ fn validate_relay_frame_exactly_one_payload(frame: &keryx_proto::v1::RelayFrame)
     let payload_count = usize::from(frame.task.is_some())
         + usize::from(frame.result.is_some())
         + usize::from(frame.nodescale_identity_bind_v1.is_some())
-        + usize::from(frame.nodescale_identity_challenge_v1.is_some());
+        + usize::from(frame.nodescale_identity_challenge_v1.is_some())
+        + usize::from(frame.nodescale_identity_bind_v2.is_some())
+        + usize::from(frame.nodescale_identity_challenge_v2.is_some());
     anyhow::ensure!(
         payload_count == 1,
         "relay frame must carry exactly one payload kind"
@@ -986,8 +1073,10 @@ fn bootstrap_peers_from_env() -> Result<Vec<Multiaddr>> {
 async fn register_node_skills(
     registry_peer_id: &str,
     daemon_task_consumer_enabled: bool,
-    nodescale_identity_bind_enabled: bool,
-    nodescale_identity_challenge_enabled: bool,
+    nodescale_identity_bind_v1_enabled: bool,
+    nodescale_identity_challenge_v1_enabled: bool,
+    nodescale_identity_bind_v2_enabled: bool,
+    nodescale_identity_challenge_v2_enabled: bool,
 ) -> Result<()> {
     let Some(endpoint) = registry_endpoint() else {
         return Ok(());
@@ -1000,11 +1089,17 @@ async fn register_node_skills(
     if daemon_task_consumer_enabled {
         protocol_features.push("daemon_task_consumer_v1".to_string());
     }
-    if nodescale_identity_bind_enabled {
+    if nodescale_identity_bind_v1_enabled {
         protocol_features.push("nodescale_identity_bind_v1".to_string());
     }
-    if nodescale_identity_challenge_enabled {
+    if nodescale_identity_challenge_v1_enabled {
         protocol_features.push(NODESCALE_IDENTITY_CHALLENGE_FEATURE.to_string());
+    }
+    if nodescale_identity_bind_v2_enabled {
+        protocol_features.push("nodescale_identity_bind_v2".to_string());
+    }
+    if nodescale_identity_challenge_v2_enabled {
+        protocol_features.push("nodescale.identity.challenge.v2".to_string());
     }
 
     let mut client = connect_registry_client(&endpoint).await?;

@@ -14,6 +14,18 @@ message NodescaleIdentityBindV1 {
   string agent_version = 7;
 }
 
+// Additive typed-provenance bind. Field 4 is deliberately a provider binding
+// identifier and MUST NOT be populated from a V1 join-session value.
+message NodescaleIdentityBindV2 {
+  string operation_id = 1;
+  string network_id = 2;
+  string device_id = 3;
+  string provider_binding_id = 4;
+  string binding_nonce = 5;
+  uint64 binding_generation = 6;
+  string agent_version = 7;
+}
+
 enum NodescaleIdentityBindDisposition {
   NODESCALE_IDENTITY_BIND_DISPOSITION_UNSPECIFIED = 0;
   NODESCALE_IDENTITY_BIND_DISPOSITION_ACTIVE = 1;
@@ -42,6 +54,16 @@ message NodescaleIdentityChallengeV1 {
   string network_id = 2;
   string device_id = 3;
   string join_session_id = 4;
+  string agent_version = 5;
+}
+
+// Additive typed-provenance challenge. Field 4 is deliberately a provider
+// binding identifier and MUST NOT be populated from a V1 join-session value.
+message NodescaleIdentityChallengeV2 {
+  string operation_id = 1;
+  string network_id = 2;
+  string device_id = 3;
+  string provider_binding_id = 4;
   string agent_version = 5;
 }
 

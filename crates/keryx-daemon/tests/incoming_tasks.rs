@@ -173,6 +173,7 @@ async fn invalid_relay_payload_frames_cannot_reach_daemon_storage_or_metrics() {
             destination_node_id: "node-local".to_string(),
             nodescale_identity_bind_v1: Some(NodescaleIdentityBindV1::default()),
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         },
         RelayFrame {
             frame_id: "task-result-frame".to_string(),
@@ -182,6 +183,7 @@ async fn invalid_relay_payload_frames_cannot_reach_daemon_storage_or_metrics() {
             destination_node_id: "node-local".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         },
         RelayFrame {
             frame_id: "zero-payload-frame".to_string(),
@@ -191,6 +193,7 @@ async fn invalid_relay_payload_frames_cannot_reach_daemon_storage_or_metrics() {
             destination_node_id: "node-local".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         },
     ];
 

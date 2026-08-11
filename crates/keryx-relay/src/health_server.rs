@@ -11,10 +11,12 @@ use keryx_proto::v1::{
     CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityBindResponse,
     CompleteNodescaleIdentityChallengeRequest, CompleteNodescaleIdentityChallengeResponse,
     HealthRequest, HealthResponse, NodeFrame, NodescaleIdentityBindDisposition,
-    NodescaleIdentityBindResult, NodescaleIdentityBindV1, NodescaleIdentityChallengeDisposition,
-    NodescaleIdentityChallengeResult, NodescaleIdentityChallengeV1,
+    NodescaleIdentityBindResult, NodescaleIdentityBindV1, NodescaleIdentityBindV2,
+    NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
+    NodescaleIdentityChallengeV1, NodescaleIdentityChallengeV2,
     PublishNodescaleIdentityBindRequest, PublishNodescaleIdentityBindResponse,
-    PublishNodescaleIdentityChallengeRequest, PublishNodescaleIdentityChallengeResponse,
+    PublishNodescaleIdentityBindV2Request, PublishNodescaleIdentityChallengeRequest,
+    PublishNodescaleIdentityChallengeResponse, PublishNodescaleIdentityChallengeV2Request,
     PublishResultRequest, PublishResultResponse, PublishTaskRequest, PublishTaskResponse,
     RegisterNodeRequest, RegisterNodeResponse, RelayFrame, TaskEnvelope,
 };
@@ -57,6 +59,8 @@ const RESULT_ARTIFACT_BYTES_FEATURE: &str = "result_artifact_bytes_v1";
 const DAEMON_TASK_CONSUMER_FEATURE: &str = "daemon_task_consumer_v1";
 const NODESCALE_IDENTITY_BIND_FEATURE: &str = "nodescale_identity_bind_v1";
 const NODESCALE_IDENTITY_CHALLENGE_FEATURE: &str = "nodescale.identity.challenge.v1";
+const NODESCALE_IDENTITY_BIND_V2_FEATURE: &str = "nodescale_identity_bind_v2";
+const NODESCALE_IDENTITY_CHALLENGE_V2_FEATURE: &str = "nodescale.identity.challenge.v2";
 const MAX_DIRECT_CONTROL_ID_BYTES: usize = 256;
 const MAX_DIRECT_CONTROL_NONCE_BYTES: usize = 512;
 const MAX_DIRECT_CONTROL_SECRET_BYTES: usize = 512;
@@ -456,6 +460,8 @@ impl KeryxRelay for RelayHealthService {
             destination_node_id: target_node_id.clone(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            nodescale_identity_bind_v2: None,
+            nodescale_identity_challenge_v2: None,
         };
         let receipt = match self.runtime.publish_task_frame(
             &source_node_id,
@@ -538,6 +544,8 @@ impl KeryxRelay for RelayHealthService {
                 destination_node_id: target_node_id.clone(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                nodescale_identity_bind_v2: None,
+                nodescale_identity_challenge_v2: None,
             },
         );
         ensure_frame_routed(delivery)?;
@@ -583,6 +591,57 @@ impl KeryxRelay for RelayHealthService {
                     destination_node_id: target_node_id.clone(),
                     nodescale_identity_bind_v1: Some(operation),
                     nodescale_identity_challenge_v1: None,
+                    nodescale_identity_bind_v2: None,
+                    nodescale_identity_challenge_v2: None,
+                },
+            );
+        ensure_frame_routed(delivery)?;
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&self.runtime),
+            target_node_id.clone(),
+            frame_id.clone(),
+        );
+        let completion = completion.ok_or_else(|| {
+            Status::internal("accepted direct control frame lacks completion state")
+        })?;
+        let result = await_nodescale_identity_bind_completion(
+            completion,
+            &mut pending_frame,
+            Duration::from_secs(25),
+        )
+        .await?;
+        Ok(Response::new(PublishNodescaleIdentityBindResponse {
+            frame_id,
+            destination_node_id: target_node_id,
+            result: Some(result),
+        }))
+    }
+
+    async fn publish_nodescale_identity_bind_v2(
+        &self,
+        request: Request<PublishNodescaleIdentityBindV2Request>,
+    ) -> Result<Response<PublishNodescaleIdentityBindResponse>, Status> {
+        let authenticated_source = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
+        let operation = inner
+            .operation
+            .ok_or_else(|| Status::invalid_argument("operation is required"))?;
+        validate_nodescale_identity_bind_v2(&operation)?;
+        self.require_destination_feature(&target_node_id, NODESCALE_IDENTITY_BIND_V2_FEATURE)
+            .await?;
+
+        let frame_id = new_relay_frame_id();
+        let (delivery, completion) = self
+            .runtime
+            .route_nodescale_identity_bind_waiting_for_completion(
+                target_node_id.clone(),
+                RelayFrame {
+                    frame_id: frame_id.clone(),
+                    authenticated_source_node_id: authenticated_source,
+                    destination_node_id: target_node_id.clone(),
+                    nodescale_identity_bind_v2: Some(operation),
+                    ..RelayFrame::default()
                 },
             );
         ensure_frame_routed(delivery)?;
@@ -666,6 +725,57 @@ impl KeryxRelay for RelayHealthService {
                     destination_node_id: target_node_id.clone(),
                     nodescale_identity_bind_v1: None,
                     nodescale_identity_challenge_v1: Some(operation),
+                    nodescale_identity_bind_v2: None,
+                    nodescale_identity_challenge_v2: None,
+                },
+            );
+        ensure_frame_routed(delivery)?;
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&self.runtime),
+            target_node_id.clone(),
+            frame_id.clone(),
+        );
+        let completion = completion.ok_or_else(|| {
+            Status::internal("accepted challenge control frame lacks completion state")
+        })?;
+        let result = await_nodescale_identity_challenge_completion(
+            completion,
+            &mut pending_frame,
+            Duration::from_secs(25),
+        )
+        .await?;
+        Ok(Response::new(PublishNodescaleIdentityChallengeResponse {
+            frame_id,
+            destination_node_id: target_node_id,
+            result: Some(result),
+        }))
+    }
+
+    async fn publish_nodescale_identity_challenge_v2(
+        &self,
+        request: Request<PublishNodescaleIdentityChallengeV2Request>,
+    ) -> Result<Response<PublishNodescaleIdentityChallengeResponse>, Status> {
+        let authenticated_source = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
+        let operation = inner
+            .operation
+            .ok_or_else(|| Status::invalid_argument("operation is required"))?;
+        validate_nodescale_identity_challenge_v2(&operation)?;
+        self.require_destination_feature(&target_node_id, NODESCALE_IDENTITY_CHALLENGE_V2_FEATURE)
+            .await?;
+
+        let frame_id = new_relay_frame_id();
+        let (delivery, completion) = self
+            .runtime
+            .route_nodescale_identity_challenge_waiting_for_completion(
+                target_node_id.clone(),
+                RelayFrame {
+                    frame_id: frame_id.clone(),
+                    authenticated_source_node_id: authenticated_source,
+                    destination_node_id: target_node_id.clone(),
+                    nodescale_identity_challenge_v2: Some(operation),
+                    ..RelayFrame::default()
                 },
             );
         ensure_frame_routed(delivery)?;
@@ -839,6 +949,28 @@ fn validate_nodescale_identity_challenge(
     Ok(())
 }
 
+fn validate_nodescale_identity_challenge_v2(
+    operation: &NodescaleIdentityChallengeV2,
+) -> Result<(), Status> {
+    for (name, value) in [
+        ("operation_id", operation.operation_id.as_str()),
+        ("network_id", operation.network_id.as_str()),
+        ("device_id", operation.device_id.as_str()),
+        (
+            "provider_binding_id",
+            operation.provider_binding_id.as_str(),
+        ),
+        ("agent_version", operation.agent_version.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_DIRECT_CONTROL_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be non-empty and at most {MAX_DIRECT_CONTROL_ID_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_nodescale_identity_challenge_result(
     result: &NodescaleIdentityChallengeResult,
 ) -> Result<(), Status> {
@@ -946,6 +1078,53 @@ fn validate_nodescale_identity_bind(operation: &NodescaleIdentityBindV1) -> Resu
     ] {
         let trimmed = value.trim();
         if trimmed.is_empty() || value.len() > maximum {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be non-empty and at most {maximum} bytes"
+            )));
+        }
+    }
+    if operation.binding_generation == 0 {
+        return Err(Status::invalid_argument(
+            "binding_generation must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nodescale_identity_bind_v2(operation: &NodescaleIdentityBindV2) -> Result<(), Status> {
+    for (name, value, maximum) in [
+        (
+            "operation_id",
+            operation.operation_id.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+        (
+            "network_id",
+            operation.network_id.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+        (
+            "device_id",
+            operation.device_id.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+        (
+            "provider_binding_id",
+            operation.provider_binding_id.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+        (
+            "binding_nonce",
+            operation.binding_nonce.as_str(),
+            MAX_DIRECT_CONTROL_NONCE_BYTES,
+        ),
+        (
+            "agent_version",
+            operation.agent_version.as_str(),
+            MAX_DIRECT_CONTROL_ID_BYTES,
+        ),
+    ] {
+        if value.trim().is_empty() || value.len() > maximum {
             return Err(Status::invalid_argument(format!(
                 "{name} must be non-empty and at most {maximum} bytes"
             )));
@@ -1825,6 +2004,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_bind_v2_publishes_only_v2_frame_and_settles_at_destination() {
+        let runtime = RelayRuntime::new("typed-direct-v2-projection-test");
+        let registry = Arc::new(SkillRegistry::new());
+        registry
+            .register_with_features(
+                DESTINATION_NODE_ID.parse().unwrap(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                vec![NODESCALE_IDENTITY_BIND_V2_FEATURE.to_string()],
+                None,
+            )
+            .await;
+        let service = direct_service(Arc::clone(&runtime), registry, HashSet::new());
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(runtime.connect_node(DESTINATION_NODE_ID, sender), 0);
+
+        let operation = NodescaleIdentityBindV2 {
+            operation_id: "bind-operation-v2".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+            provider_binding_id: "provider-binding".to_string(),
+            binding_nonce: "nonce-not-for-diagnostics".to_string(),
+            binding_generation: 1,
+            agent_version: "v2".to_string(),
+        };
+        let mut request = Request::new(PublishNodescaleIdentityBindV2Request {
+            operation: Some(operation.clone()),
+            target_node_id: DESTINATION_NODE_ID.to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+        let publish_service = Arc::clone(&service);
+        let publish = tokio::spawn(async move {
+            KeryxRelay::publish_nodescale_identity_bind_v2(publish_service.as_ref(), request).await
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.nodescale_identity_bind_v2, Some(operation));
+        assert!(frame.nodescale_identity_bind_v1.is_none());
+        assert!(frame.nodescale_identity_challenge_v1.is_none());
+        assert!(frame.nodescale_identity_challenge_v2.is_none());
+
+        let mut completion = Request::new(CompleteNodescaleIdentityBindRequest {
+            frame_id: frame.frame_id.clone(),
+            result: Some(valid_nodescale_identity_bind_result(
+                NodescaleIdentityBindDisposition::Active,
+            )),
+        });
+        completion
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, DESTINATION_NODE_ID.parse().unwrap());
+        completion.metadata_mut().insert(
+            NODE_TOKEN_METADATA_KEY,
+            "destination-token".parse().unwrap(),
+        );
+        assert!(
+            KeryxRelay::complete_nodescale_identity_bind(service.as_ref(), completion)
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
+        let published = publish.await.unwrap().unwrap().into_inner();
+        assert_eq!(published.frame_id, frame.frame_id);
+        assert_eq!(published.destination_node_id, DESTINATION_NODE_ID);
+        assert_eq!(published.result.unwrap().binding_id, "binding");
+    }
+
+    #[tokio::test]
     async fn authenticated_challenge_rpc_projects_frame_completes_at_destination_and_delegates_dedupe(
     ) {
         let runtime = RelayRuntime::new("challenge-rpc-integration-test");
@@ -1868,6 +2125,7 @@ mod tests {
         let handlers = DirectControlHandlers {
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: Some(harness.clone()),
+            ..DirectControlHandlers::default()
         };
 
         let publish_service = Arc::clone(&service);
@@ -2027,6 +2285,7 @@ mod tests {
                     destination_node_id: DESTINATION_NODE_ID.to_string(),
                     nodescale_identity_bind_v1: None,
                     nodescale_identity_challenge_v1: Some(challenge_operation()),
+                    ..RelayFrame::default()
                 },
             );
         assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
@@ -2139,6 +2398,7 @@ mod tests {
             destination_node_id: DESTINATION_NODE_ID.to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         }
     }
 
@@ -2411,6 +2671,7 @@ mod tests {
                 destination_node_id: DESTINATION_NODE_ID.to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
         );
         assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
@@ -2457,6 +2718,7 @@ mod tests {
                 destination_node_id: DESTINATION_NODE_ID.to_string(),
                 nodescale_identity_bind_v1: Some(direct_operation()),
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
         );
         assert_eq!(delivery, crate::runtime::FrameDelivery::Mailboxed);
@@ -2493,6 +2755,7 @@ mod tests {
                     destination_node_id: DESTINATION_NODE_ID.to_string(),
                     nodescale_identity_bind_v1: Some(direct_operation()),
                     nodescale_identity_challenge_v1: None,
+                    ..RelayFrame::default()
                 },
             );
         assert_eq!(reuse_delivery, crate::runtime::FrameDelivery::Mailboxed);
