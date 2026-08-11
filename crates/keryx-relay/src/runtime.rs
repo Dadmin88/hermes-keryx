@@ -365,8 +365,11 @@ impl RelayRuntime {
             return (FrameDelivery::RejectedInvalid, None);
         }
         let frame_id = frame.frame_id.trim().to_string();
-        if frame.nodescale_identity_bind_v1.is_none()
+        if usize::from(frame.nodescale_identity_bind_v1.is_some())
+            + usize::from(frame.nodescale_identity_bind_v2.is_some())
+            != 1
             || frame.nodescale_identity_challenge_v1.is_some()
+            || frame.nodescale_identity_challenge_v2.is_some()
             || frame.task.is_some()
             || frame.result.is_some()
         {
@@ -440,8 +443,11 @@ impl RelayRuntime {
             return (FrameDelivery::RejectedInvalid, None);
         }
         let frame_id = frame.frame_id.trim().to_string();
-        if frame.nodescale_identity_challenge_v1.is_none()
+        if usize::from(frame.nodescale_identity_challenge_v1.is_some())
+            + usize::from(frame.nodescale_identity_challenge_v2.is_some())
+            != 1
             || frame.nodescale_identity_bind_v1.is_some()
+            || frame.nodescale_identity_bind_v2.is_some()
             || frame.task.is_some()
             || frame.result.is_some()
         {
@@ -944,7 +950,9 @@ fn has_exactly_one_relay_payload(frame: &RelayFrame) -> bool {
     let payload_count = usize::from(frame.task.is_some())
         + usize::from(frame.result.is_some())
         + usize::from(frame.nodescale_identity_bind_v1.is_some())
-        + usize::from(frame.nodescale_identity_challenge_v1.is_some());
+        + usize::from(frame.nodescale_identity_challenge_v1.is_some())
+        + usize::from(frame.nodescale_identity_bind_v2.is_some())
+        + usize::from(frame.nodescale_identity_challenge_v2.is_some());
     payload_count == 1
 }
 
@@ -989,6 +997,7 @@ mod tests {
             destination_node_id: "destination".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         }
     }
 
@@ -1009,6 +1018,7 @@ mod tests {
                 agent_version: "v1".to_string(),
             }),
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         }
     }
 
@@ -1027,6 +1037,7 @@ mod tests {
                 join_session_id: "session".to_string(),
                 agent_version: "v1".to_string(),
             }),
+            ..RelayFrame::default()
         }
     }
 
@@ -1121,6 +1132,7 @@ mod tests {
             destination_node_id: "destination".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         };
 
         for frame in [task_and_result, zero_payload] {
@@ -1194,6 +1206,7 @@ mod tests {
             destination_node_id: "destination".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         };
         let mismatched_envelope = RelayFrame {
             frame_id: "published-mismatched-task".to_string(),
@@ -1203,6 +1216,7 @@ mod tests {
             destination_node_id: "destination".to_string(),
             nodescale_identity_bind_v1: None,
             nodescale_identity_challenge_v1: None,
+            ..RelayFrame::default()
         };
 
         for (index, frame) in [task_and_result, result_only, mismatched_envelope]
@@ -1280,6 +1294,7 @@ mod tests {
                 destination_node_id: "destination".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
             original_receipt.clone(),
         );
@@ -1298,6 +1313,7 @@ mod tests {
                 destination_node_id: "destination".to_string(),
                 nodescale_identity_bind_v1: None,
                 nodescale_identity_challenge_v1: None,
+                ..RelayFrame::default()
             },
             PublishedTaskReceipt {
                 frame_id: "ignored-retry-frame".to_string(),
@@ -1440,6 +1456,7 @@ mod tests {
                         destination_node_id: "destination".to_string(),
                         nodescale_identity_bind_v1: None,
                         nodescale_identity_challenge_v1: None,
+                        ..RelayFrame::default()
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -1500,6 +1517,7 @@ mod tests {
                     destination_node_id: "destination".to_string(),
                     nodescale_identity_bind_v1: None,
                     nodescale_identity_challenge_v1: None,
+                    ..RelayFrame::default()
                 },
             ),
             FrameDelivery::Mailboxed
@@ -1536,6 +1554,7 @@ mod tests {
                     destination_node_id: "destination".to_string(),
                     nodescale_identity_bind_v1: None,
                     nodescale_identity_challenge_v1: None,
+                    ..RelayFrame::default()
                 },
             ),
             FrameDelivery::Mailboxed
@@ -1586,6 +1605,7 @@ mod tests {
                         destination_node_id: "destination".into(),
                         nodescale_identity_bind_v1: None,
                         nodescale_identity_challenge_v1: None,
+                        ..RelayFrame::default()
                     },
                 ),
                 FrameDelivery::Mailboxed
@@ -1621,6 +1641,7 @@ mod tests {
                     destination_node_id: "destination".into(),
                     nodescale_identity_bind_v1: None,
                     nodescale_identity_challenge_v1: None,
+                    ..RelayFrame::default()
                 },
                 overflow_receipt,
             ),

@@ -173,14 +173,14 @@ Current examples include:
 - `absolute_deadlines_v1` for cross-node absolute deadlines;
 - `result_artifact_bytes_v1` for bounded byte-bearing terminal result artifacts;
 - `daemon_task_consumer_v1` for nodes backed by a daemon that can consume task and result frames;
-- `nodescale_identity_bind_v1` for the typed Nodescale identity-binding control path.
-- `nodescale_identity_challenge_v1` for the typed authenticated Nodescale challenge control path.
+- `nodescale_identity_bind_v1` and `nodescale_identity_bind_v2` for the versioned typed Nodescale identity-binding control paths;
+- `nodescale.identity.challenge.v1` and `nodescale.identity.challenge.v2` for the versioned authenticated Nodescale challenge control paths.
 
 Unknown or unsupported destinations fail explicitly when a requested feature cannot safely be downgraded.
 
 ## Authenticated Nodescale identity binding
 
-Keryx exposes a dedicated typed non-execution operation for `nodescale.identity.bind.v1`.
+Keryx exposes dedicated typed non-execution operations for `nodescale.identity.bind.v1` and `nodescale.identity.bind.v2`. V1 retains its historical `join_session_id` field at protobuf tag 4. V2 instead carries `provider_binding_id` at tag 4; callers and handlers must select the matching typed message and must never reinterpret a V1 join-session value as a provider-binding value.
 
 Properties of this path:
 
@@ -199,9 +199,9 @@ This control path exists so higher-level identity systems can use Keryx runtime 
 
 ## Authenticated Nodescale identity challenge
 
-Keryx also exposes the typed non-execution operation `nodescale.identity.challenge.v1`.
+Keryx also exposes versioned typed non-execution challenge operations. V1 carries `join_session_id`; V2 carries `provider_binding_id` without changing the remaining field numbers or result semantics.
 
-The challenge request carries no authoritative sender, peer, or nonce identity. The relay derives the source from authenticated node credentials, requires the destination to advertise `nodescale_identity_challenge_v1`, and returns a bounded typed result only through the authenticated destination completion path.
+The challenge request carries no authoritative sender, peer, or nonce identity. The relay derives the source from authenticated node credentials, requires the destination to advertise the matching V1 or V2 challenge feature, and returns a bounded typed result only through the authenticated destination completion path.
 
 Keryx provides authenticated at-least-once transport for this operation, not durable challenge issuance authority. The installed destination handler is responsible for durable serialization and deduplication of `(authenticated_sender_peer_id, operation_id)` across duplicate, concurrent, and restart retries. Keryx does not persist challenge secrets, route them through generic task/result storage, or expose this control path to Python task handlers.
 
