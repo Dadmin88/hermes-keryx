@@ -161,13 +161,17 @@ impl FleetObservationPublishHandler for FleetObservationUdsBridge {
                     .context("authority epoch is required")?;
                 let observation: Value = serde_json::from_slice(&publish.observation_json)
                     .context("observation JSON is invalid")?;
-                json!({"schema":SCHEMA,"kind":"publish","selector":{
-                    "source":selector.source,"network_id":selector.network_id,"device_id":selector.device_id
-                },"authenticated_sender":context.authenticated_source_node_id(),
-                "authority_epoch":{
-                    "binding_id":epoch.binding_id,"authenticated_peer_id":epoch.authenticated_peer_id,
-                    "binding_generation":epoch.binding_generation,"projection_generation":epoch.projection_generation
-                },"observation":observation})
+                json!({
+                    "authenticated_context": {
+                        "sender_peer_id": context.authenticated_source_node_id()
+                    },
+                    "request": {"schema":SCHEMA,"kind":"publish","selector":{
+                        "source":selector.source,"network_id":selector.network_id,"device_id":selector.device_id
+                    },"authority_epoch":{
+                        "binding_id":epoch.binding_id,"authenticated_peer_id":epoch.authenticated_peer_id,
+                        "binding_generation":epoch.binding_generation,"projection_generation":epoch.projection_generation
+                    },"observation":observation}
+                })
             }
         };
         let response: BridgeResponse = serde_json::from_value(self.transact(request).await?)?;
@@ -342,8 +346,14 @@ mod tests {
             let mut payload = vec![0_u8; u32::from_be_bytes(header) as usize];
             stream.read_exact(&mut payload).await.unwrap();
             let request: Value = serde_json::from_slice(&payload).unwrap();
-            assert_eq!(request["authenticated_sender"], "peer-authenticated");
-            assert!(request["observation"].get("authenticated_sender").is_none());
+            assert_eq!(
+                request["authenticated_context"]["sender_peer_id"],
+                "peer-authenticated"
+            );
+            assert!(request["request"].get("authenticated_sender").is_none());
+            assert!(request["request"]["observation"]
+                .get("authenticated_sender")
+                .is_none());
             let response = serde_json::to_vec(&json!({
                 "schema": SCHEMA,
                 "kind": "publish",
