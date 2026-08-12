@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use keryx_observe::RelayMetrics;
 use keryx_proto::v1::{
-    NodescaleIdentityBindResult, NodescaleIdentityChallengeResult, RelayFrame, TaskEnvelope,
+    FleetObservationPublishResultV1, NodescaleIdentityBindResult, NodescaleIdentityChallengeResult,
+    RelayFrame, TaskEnvelope,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -115,6 +116,7 @@ struct PeerState {
     frame_ack_waiters: HashMap<FrameKey, oneshot::Sender<()>>,
     direct_control_waiters: HashMap<FrameKey, oneshot::Sender<NodescaleIdentityBindResult>>,
     challenge_control_waiters: HashMap<FrameKey, oneshot::Sender<NodescaleIdentityChallengeResult>>,
+    fleet_observation_waiters: HashMap<FrameKey, oneshot::Sender<FleetObservationPublishResultV1>>,
 }
 
 pub const MAX_TRACKED_FRAMES: usize = 8_192;
@@ -240,7 +242,9 @@ impl RelayRuntime {
     /// Mark a node stream disconnected. A reconnect with the same node id replaces this state.
     pub fn disconnect_node(&self, node_id: &str) {
         let mut guard = self.lock_peers();
-        guard.connected_nodes.remove(node_id);
+        if guard.connected_nodes.remove(node_id).is_some() {
+            abandon_fleet_observation_destination(&mut guard, node_id);
+        }
         self.sync_connected_peer_metric(&guard);
     }
 
@@ -253,6 +257,7 @@ impl RelayRuntime {
             .is_some_and(|connected| connected.generation == generation)
         {
             guard.connected_nodes.remove(node_id);
+            abandon_fleet_observation_destination(&mut guard, node_id);
         }
         self.sync_connected_peer_metric(&guard);
     }
@@ -262,6 +267,9 @@ impl RelayRuntime {
         let connected = {
             let mut guard = self.lock_peers();
             let connected = guard.connected_nodes.remove(node_id);
+            if connected.is_some() {
+                abandon_fleet_observation_destination(&mut guard, node_id);
+            }
             self.sync_connected_peer_metric(&guard);
             connected
         };
@@ -281,7 +289,9 @@ impl RelayRuntime {
             let mut guard = self.lock_peers();
             let connected = match guard.connected_nodes.get(node_id) {
                 Some(connected) if connected.generation == generation => {
-                    guard.connected_nodes.remove(node_id)
+                    let connected = guard.connected_nodes.remove(node_id);
+                    abandon_fleet_observation_destination(&mut guard, node_id);
+                    connected
                 }
                 _ => None,
             };
@@ -507,6 +517,82 @@ impl RelayRuntime {
         DirectControlCompletion::Accepted
     }
 
+    /// Atomically route a typed Fleet observation control frame and install its
+    /// destination-only result waiter. This path never enters task accounting.
+    pub(crate) fn route_fleet_observation_waiting_for_completion(
+        &self,
+        target_node_id: impl Into<String>,
+        frame: RelayFrame,
+    ) -> (
+        FrameDelivery,
+        Option<oneshot::Receiver<FleetObservationPublishResultV1>>,
+    ) {
+        let target_node_id = target_node_id.into();
+        if !typed_direct_control_target_matches_frame_destination(&target_node_id, &frame)
+            || usize::from(frame.fleet_observation_publish_v1.is_some()) != 1
+            || frame.task.is_some()
+            || frame.result.is_some()
+            || frame.nodescale_identity_bind_v1.is_some()
+            || frame.nodescale_identity_challenge_v1.is_some()
+            || frame.nodescale_identity_bind_v2.is_some()
+            || frame.nodescale_identity_challenge_v2.is_some()
+        {
+            return (FrameDelivery::RejectedInvalid, None);
+        }
+        let frame_id = frame.frame_id.trim().to_string();
+        let mut guard = self.lock_peers();
+        let delivery = route_frame_locked(&mut guard, target_node_id.clone(), frame);
+        let receiver = if matches!(
+            delivery,
+            FrameDelivery::Delivered | FrameDelivery::Mailboxed
+        ) {
+            let (sender, receiver) = oneshot::channel();
+            guard
+                .fleet_observation_waiters
+                .insert((target_node_id, frame_id), sender);
+            Some(receiver)
+        } else {
+            None
+        };
+        self.sync_connected_peer_metric(&guard);
+        (delivery, receiver)
+    }
+
+    /// Complete a typed Fleet observation control frame exactly once.
+    pub(crate) fn complete_fleet_observation(
+        &self,
+        destination_node_id: &str,
+        frame_id: &str,
+        result: FleetObservationPublishResultV1,
+    ) -> DirectControlCompletion {
+        let destination_node_id = destination_node_id.trim();
+        let frame_id = frame_id.trim();
+        if destination_node_id.is_empty() || frame_id.is_empty() {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        let key = (destination_node_id.to_string(), frame_id.to_string());
+        let mut guard = self.lock_peers();
+        let Some(waiter) = guard.fleet_observation_waiters.remove(&key) else {
+            return if guard
+                .fleet_observation_waiters
+                .keys()
+                .any(|(_, known)| known == frame_id)
+            {
+                DirectControlCompletion::WrongDestination
+            } else {
+                DirectControlCompletion::UnknownFrame
+            };
+        };
+        if !guard.frame_destinations.remove(&key) {
+            return DirectControlCompletion::UnknownFrame;
+        }
+        if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+            mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
+        }
+        let _ = waiter.send(result);
+        DirectControlCompletion::Accepted
+    }
+
     /// Abandon a timed-out result frame generation while leaving any already-delivered copy
     /// harmlessly idempotent at the destination.
     pub fn abandon_frame(&self, destination_node_id: &str, frame_id: &str) {
@@ -515,6 +601,7 @@ impl RelayRuntime {
         guard.frame_ack_waiters.remove(&key);
         guard.direct_control_waiters.remove(&key);
         guard.challenge_control_waiters.remove(&key);
+        guard.fleet_observation_waiters.remove(&key);
         guard.frame_destinations.remove(&key);
         if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
             mailbox.retain(|frame| frame.frame_id.trim() != frame_id);
@@ -534,6 +621,7 @@ impl RelayRuntime {
         // Generic ACKs must never consume their ownership or settle their waiters.
         if guard.direct_control_waiters.contains_key(&key)
             || guard.challenge_control_waiters.contains_key(&key)
+            || guard.fleet_observation_waiters.contains_key(&key)
         {
             return FrameAcknowledgement::UnknownFrame;
         }
@@ -577,6 +665,22 @@ impl RelayRuntime {
             .mailboxes
             .get(node_id)
             .map_or(0, VecDeque::len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_fleet_observation_state(&self, node_id: &str) -> (usize, usize) {
+        let guard = self.lock_peers();
+        (
+            guard
+                .fleet_observation_waiters
+                .keys()
+                .filter(|(destination_node_id, _)| destination_node_id == node_id)
+                .count(),
+            guard
+                .mailboxes
+                .get(node_id)
+                .map_or(0, std::collections::VecDeque::len),
+        )
     }
 
     #[cfg(test)]
@@ -946,13 +1050,30 @@ fn route_frame_locked(
     FrameDelivery::Mailboxed
 }
 
+fn abandon_fleet_observation_destination(guard: &mut PeerState, destination_node_id: &str) {
+    let keys = guard
+        .fleet_observation_waiters
+        .keys()
+        .filter(|(destination, _)| destination == destination_node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        guard.fleet_observation_waiters.remove(&key);
+        guard.frame_destinations.remove(&key);
+    }
+    if let Some(mailbox) = guard.mailboxes.get_mut(destination_node_id) {
+        mailbox.retain(|frame| frame.fleet_observation_publish_v1.is_none());
+    }
+}
+
 fn has_exactly_one_relay_payload(frame: &RelayFrame) -> bool {
     let payload_count = usize::from(frame.task.is_some())
         + usize::from(frame.result.is_some())
         + usize::from(frame.nodescale_identity_bind_v1.is_some())
         + usize::from(frame.nodescale_identity_challenge_v1.is_some())
         + usize::from(frame.nodescale_identity_bind_v2.is_some())
-        + usize::from(frame.nodescale_identity_challenge_v2.is_some());
+        + usize::from(frame.nodescale_identity_challenge_v2.is_some())
+        + usize::from(frame.fleet_observation_publish_v1.is_some());
     payload_count == 1
 }
 
@@ -1693,6 +1814,130 @@ mod tests {
         assert_eq!(
             guard.acknowledged_frame_order.len(),
             MAX_RECENT_ACKNOWLEDGEMENTS
+        );
+    }
+
+    fn fleet_observation_frame(frame_id: impl Into<String>) -> RelayFrame {
+        RelayFrame {
+            frame_id: frame_id.into(),
+            authenticated_source_node_id: "source".to_string(),
+            destination_node_id: "destination".to_string(),
+            fleet_observation_publish_v1: Some(keryx_proto::v1::FleetObservationPublishV1 {
+                request: Some(
+                    keryx_proto::v1::fleet_observation_publish_v1::Request::Acquire(
+                        keryx_proto::v1::FleetObservationAcquireV1 {
+                            selector: Some(keryx_proto::v1::FleetObservationSelectorV1 {
+                                source: "nodescale".to_string(),
+                                network_id: "network".to_string(),
+                                device_id: "device".to_string(),
+                            }),
+                        },
+                    ),
+                ),
+            }),
+            ..RelayFrame::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_observation_control_is_exact_destination_non_task_and_kind_settled() {
+        let runtime = RelayRuntime::new("relay");
+        let before = runtime.metrics().snapshot().tasks_routed;
+        let mut wrong_destination = fleet_observation_frame("wrong-destination");
+        wrong_destination.destination_node_id = "other".to_string();
+        assert_eq!(
+            runtime
+                .route_fleet_observation_waiting_for_completion("destination", wrong_destination)
+                .0,
+            FrameDelivery::RejectedInvalid
+        );
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (0, 0)
+        );
+
+        let (delivery, completion) = runtime.route_fleet_observation_waiting_for_completion(
+            "destination",
+            fleet_observation_frame("fleet-frame"),
+        );
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        assert_eq!(runtime.metrics().snapshot().tasks_routed, before);
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (1, 1)
+        );
+        assert_eq!(
+            runtime.ack_frame("destination", "fleet-frame"),
+            FrameAcknowledgement::UnknownFrame
+        );
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (1, 1)
+        );
+        let result = FleetObservationPublishResultV1 {
+            disposition: keryx_proto::v1::FleetObservationPublishDisposition::Rejected as i32,
+            accepted: false,
+            reason: "test".to_string(),
+            code: "test".to_string(),
+            ..FleetObservationPublishResultV1::default()
+        };
+        assert_eq!(
+            runtime.complete_fleet_observation("other", "fleet-frame", result.clone()),
+            DirectControlCompletion::WrongDestination
+        );
+        assert_eq!(
+            runtime.complete_fleet_observation("destination", "fleet-frame", result.clone()),
+            DirectControlCompletion::Accepted
+        );
+        assert_eq!(completion.unwrap().await.unwrap(), result);
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (0, 0)
+        );
+        assert_eq!(
+            runtime.complete_fleet_observation("destination", "fleet-frame", result),
+            DirectControlCompletion::UnknownFrame
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_observation_disconnect_cleans_only_fleet_transport_ownership() {
+        let runtime = RelayRuntime::new("relay");
+        let (sender, _receiver) = mpsc::channel(4);
+        runtime.connect_node("destination", sender);
+        let (delivery, completion) = runtime.route_fleet_observation_waiting_for_completion(
+            "destination",
+            fleet_observation_frame("fleet-disconnect"),
+        );
+        assert_eq!(delivery, FrameDelivery::Delivered);
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (1, 1)
+        );
+        runtime.disconnect_node("destination");
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (0, 0)
+        );
+        assert!(completion.unwrap().await.is_err());
+    }
+
+    #[test]
+    fn fleet_observation_abandon_cleans_waiter_and_mailbox() {
+        let runtime = RelayRuntime::new("relay");
+        let (delivery, _completion) = runtime.route_fleet_observation_waiting_for_completion(
+            "destination",
+            fleet_observation_frame("fleet-timeout"),
+        );
+        assert_eq!(delivery, FrameDelivery::Mailboxed);
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (1, 1)
+        );
+        runtime.abandon_frame("destination", "fleet-timeout");
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state("destination"),
+            (0, 0)
         );
     }
 

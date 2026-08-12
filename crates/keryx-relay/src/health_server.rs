@@ -8,18 +8,22 @@ use futures::StreamExt;
 use keryx_proto::v1::keryx_relay_server::{KeryxRelay, KeryxRelayServer};
 use keryx_proto::v1::{
     AckFrameRequest, AckFrameResponse, AckTaskRequest, AckTaskResponse,
+    CompleteFleetObservationRequest, CompleteFleetObservationResponse,
     CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityBindResponse,
     CompleteNodescaleIdentityChallengeRequest, CompleteNodescaleIdentityChallengeResponse,
-    HealthRequest, HealthResponse, NodeFrame, NodescaleIdentityBindDisposition,
-    NodescaleIdentityBindResult, NodescaleIdentityBindV1, NodescaleIdentityBindV2,
-    NodescaleIdentityChallengeDisposition, NodescaleIdentityChallengeResult,
-    NodescaleIdentityChallengeV1, NodescaleIdentityChallengeV2,
+    FleetObservationPublishDisposition, FleetObservationPublishResultV1, FleetObservationPublishV1,
+    FleetObservationSelectorV1, HealthRequest, HealthResponse, NodeFrame,
+    NodescaleIdentityBindDisposition, NodescaleIdentityBindResult, NodescaleIdentityBindV1,
+    NodescaleIdentityBindV2, NodescaleIdentityChallengeDisposition,
+    NodescaleIdentityChallengeResult, NodescaleIdentityChallengeV1, NodescaleIdentityChallengeV2,
+    PublishFleetObservationRequest, PublishFleetObservationResponse,
     PublishNodescaleIdentityBindRequest, PublishNodescaleIdentityBindResponse,
     PublishNodescaleIdentityBindV2Request, PublishNodescaleIdentityChallengeRequest,
     PublishNodescaleIdentityChallengeResponse, PublishNodescaleIdentityChallengeV2Request,
     PublishResultRequest, PublishResultResponse, PublishTaskRequest, PublishTaskResponse,
     RegisterNodeRequest, RegisterNodeResponse, RelayFrame, TaskEnvelope,
 };
+use prost::Message;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -29,6 +33,9 @@ use tonic::transport::{Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::fleet_observation_bridge::{
+    MAX_FLEET_OBSERVATION_BRIDGE_FRAME_BYTES, MAX_FLEET_OBSERVATION_JSON_BYTES,
+};
 use crate::health::RelayHealthReport;
 use crate::registry::SkillRegistry;
 use crate::runtime::{
@@ -61,10 +68,13 @@ const NODESCALE_IDENTITY_BIND_FEATURE: &str = "nodescale_identity_bind_v1";
 const NODESCALE_IDENTITY_CHALLENGE_FEATURE: &str = "nodescale.identity.challenge.v1";
 const NODESCALE_IDENTITY_BIND_V2_FEATURE: &str = "nodescale_identity_bind_v2";
 const NODESCALE_IDENTITY_CHALLENGE_V2_FEATURE: &str = "nodescale.identity.challenge.v2";
+const FLEET_OBSERVATION_PUBLISH_FEATURE: &str = "fleet.observation.publish.v1";
 const MAX_DIRECT_CONTROL_ID_BYTES: usize = 256;
 const MAX_DIRECT_CONTROL_NONCE_BYTES: usize = 512;
 const MAX_DIRECT_CONTROL_SECRET_BYTES: usize = 512;
 const MAX_DIRECT_CONTROL_REASON_BYTES: usize = 512;
+const MAX_FLEET_OBSERVATION_CONTROL_BYTES: usize = MAX_FLEET_OBSERVATION_BRIDGE_FRAME_BYTES;
+const MAX_FLEET_OBSERVATION_DEADLINE_MS: i64 = 30_000;
 const AUTHENTICATED_SOURCE_FEATURES_METADATA_KEY: &str =
     "keryx.authenticated_source_protocol_features";
 
@@ -179,6 +189,31 @@ async fn await_nodescale_identity_challenge_completion(
             pending_frame.abandon();
             Err(Status::deadline_exceeded(
                 "destination did not complete challenge control before retry deadline",
+            ))
+        }
+    }
+}
+
+async fn await_fleet_observation_completion(
+    completion: tokio::sync::oneshot::Receiver<FleetObservationPublishResultV1>,
+    pending_frame: &mut PendingFrameOwnership,
+    timeout: Duration,
+) -> Result<FleetObservationPublishResultV1, Status> {
+    match tokio::time::timeout(timeout, completion).await {
+        Ok(Ok(result)) => {
+            pending_frame.disarm();
+            Ok(result)
+        }
+        Ok(Err(_)) => {
+            pending_frame.abandon();
+            Err(Status::unavailable(
+                "relay restarted before destination completed Fleet observation control",
+            ))
+        }
+        Err(_) => {
+            pending_frame.abandon();
+            Err(Status::deadline_exceeded(
+                "destination did not complete Fleet observation control before deadline",
             ))
         }
     }
@@ -462,6 +497,7 @@ impl KeryxRelay for RelayHealthService {
             nodescale_identity_challenge_v1: None,
             nodescale_identity_bind_v2: None,
             nodescale_identity_challenge_v2: None,
+            fleet_observation_publish_v1: None,
         };
         let receipt = match self.runtime.publish_task_frame(
             &source_node_id,
@@ -546,6 +582,7 @@ impl KeryxRelay for RelayHealthService {
                 nodescale_identity_challenge_v1: None,
                 nodescale_identity_bind_v2: None,
                 nodescale_identity_challenge_v2: None,
+                fleet_observation_publish_v1: None,
             },
         );
         ensure_frame_routed(delivery)?;
@@ -593,6 +630,7 @@ impl KeryxRelay for RelayHealthService {
                     nodescale_identity_challenge_v1: None,
                     nodescale_identity_bind_v2: None,
                     nodescale_identity_challenge_v2: None,
+                    fleet_observation_publish_v1: None,
                 },
             );
         ensure_frame_routed(delivery)?;
@@ -727,6 +765,7 @@ impl KeryxRelay for RelayHealthService {
                     nodescale_identity_challenge_v1: Some(operation),
                     nodescale_identity_bind_v2: None,
                     nodescale_identity_challenge_v2: None,
+                    fleet_observation_publish_v1: None,
                 },
             );
         ensure_frame_routed(delivery)?;
@@ -834,6 +873,82 @@ impl KeryxRelay for RelayHealthService {
         }
     }
 
+    async fn publish_fleet_observation(
+        &self,
+        request: Request<PublishFleetObservationRequest>,
+    ) -> Result<Response<PublishFleetObservationResponse>, Status> {
+        let authenticated_source = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let target_node_id = required_node_value(&inner.target_node_id, "target_node_id")?;
+        let operation = inner
+            .operation
+            .ok_or_else(|| Status::invalid_argument("operation is required"))?;
+        validate_fleet_observation_publish(&operation)?;
+        let timeout = validate_fleet_observation_deadline(inner.deadline_ms)?;
+        self.require_destination_feature(&target_node_id, FLEET_OBSERVATION_PUBLISH_FEATURE)
+            .await?;
+        let frame_id = new_relay_frame_id();
+        let (delivery, completion) = self.runtime.route_fleet_observation_waiting_for_completion(
+            target_node_id.clone(),
+            RelayFrame {
+                frame_id: frame_id.clone(),
+                authenticated_source_node_id: authenticated_source,
+                destination_node_id: target_node_id.clone(),
+                fleet_observation_publish_v1: Some(operation),
+                ..RelayFrame::default()
+            },
+        );
+        ensure_frame_routed(delivery)?;
+        let mut pending_frame = PendingFrameOwnership::new(
+            Arc::clone(&self.runtime),
+            target_node_id.clone(),
+            frame_id.clone(),
+        );
+        let completion = completion.ok_or_else(|| {
+            Status::internal("accepted Fleet observation frame lacks completion state")
+        })?;
+        let result =
+            await_fleet_observation_completion(completion, &mut pending_frame, timeout).await?;
+        Ok(Response::new(PublishFleetObservationResponse {
+            frame_id,
+            destination_node_id: target_node_id,
+            result: Some(result),
+        }))
+    }
+
+    async fn complete_fleet_observation(
+        &self,
+        request: Request<CompleteFleetObservationRequest>,
+    ) -> Result<Response<CompleteFleetObservationResponse>, Status> {
+        let authenticated_destination = self.authenticate_metadata_only(&request)?;
+        let inner = request.into_inner();
+        let frame_id = required_node_value(&inner.frame_id, "frame_id")?;
+        let result = inner
+            .result
+            .ok_or_else(|| Status::invalid_argument("result is required"))?;
+        validate_fleet_observation_result(&result)?;
+        match self
+            .runtime
+            .complete_fleet_observation(&authenticated_destination, &frame_id, result)
+        {
+            crate::runtime::DirectControlCompletion::Accepted => {
+                Ok(Response::new(CompleteFleetObservationResponse {
+                    accepted: true,
+                }))
+            }
+            crate::runtime::DirectControlCompletion::WrongDestination => {
+                Err(Status::permission_denied(
+                    "authenticated node does not own the Fleet observation frame",
+                ))
+            }
+            crate::runtime::DirectControlCompletion::UnknownFrame => {
+                Err(Status::failed_precondition(
+                    "Fleet observation frame is unknown or already completed",
+                ))
+            }
+        }
+    }
+
     async fn ack_frame(
         &self,
         request: Request<AckFrameRequest>,
@@ -914,6 +1029,161 @@ fn required_node_value(value: &str, field: &str) -> Result<String, Status> {
     } else {
         Ok(value.to_string())
     }
+}
+
+fn validate_fleet_observation_selector(
+    selector: &FleetObservationSelectorV1,
+) -> Result<(), Status> {
+    for (name, value) in [
+        ("source", selector.source.as_str()),
+        ("network_id", selector.network_id.as_str()),
+        ("device_id", selector.device_id.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_DIRECT_CONTROL_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be non-empty and at most {MAX_DIRECT_CONTROL_ID_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fleet_observation_authority_epoch(
+    epoch: &keryx_proto::v1::FleetObservationAuthorityEpochV1,
+) -> Result<(), Status> {
+    for (name, value) in [
+        ("binding_id", epoch.binding_id.as_str()),
+        (
+            "authenticated_peer_id",
+            epoch.authenticated_peer_id.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_DIRECT_CONTROL_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be non-empty and at most {MAX_DIRECT_CONTROL_ID_BYTES} bytes"
+            )));
+        }
+    }
+    if epoch.binding_generation == 0 || epoch.projection_generation == 0 {
+        return Err(Status::invalid_argument(
+            "authority epoch generations must be positive",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(deprecated)]
+fn validate_fleet_observation_publish(operation: &FleetObservationPublishV1) -> Result<(), Status> {
+    if operation.encoded_len() > MAX_FLEET_OBSERVATION_CONTROL_BYTES {
+        return Err(Status::resource_exhausted(
+            "Fleet observation control exceeds the bounded payload limit",
+        ));
+    }
+    match operation.request.as_ref() {
+        Some(keryx_proto::v1::fleet_observation_publish_v1::Request::Acquire(acquire)) => {
+            validate_fleet_observation_selector(
+                acquire
+                    .selector
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("acquire selector is required"))?,
+            )
+        }
+        Some(keryx_proto::v1::fleet_observation_publish_v1::Request::Publish(publish)) => {
+            validate_fleet_observation_selector(
+                publish
+                    .selector
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("publish selector is required"))?,
+            )?;
+            let epoch = publish
+                .authority_epoch
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("publish authority_epoch is required"))?;
+            validate_fleet_observation_authority_epoch(epoch)?;
+            if publish.observation_json.is_empty()
+                || publish.observation_json.len() > MAX_FLEET_OBSERVATION_JSON_BYTES
+                || !publish.sample_bytes.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "observation_json must be non-empty and opaque sample_bytes are unsupported",
+                ));
+            }
+            Ok(())
+        }
+        None => Err(Status::invalid_argument(
+            "Fleet observation request variant is required",
+        )),
+    }
+}
+
+fn validate_fleet_observation_deadline(deadline_ms: i64) -> Result<Duration, Status> {
+    let remaining = deadline_ms.checked_sub(unix_ms_now()).ok_or_else(|| {
+        Status::invalid_argument("Fleet observation deadline is outside the supported range")
+    })?;
+    if remaining <= 0 {
+        return Err(Status::deadline_exceeded(
+            "Fleet observation deadline has expired",
+        ));
+    }
+    if remaining > MAX_FLEET_OBSERVATION_DEADLINE_MS {
+        return Err(Status::invalid_argument(
+            "Fleet observation deadline exceeds the bounded control window",
+        ));
+    }
+    Ok(Duration::from_millis(remaining as u64))
+}
+
+fn validate_fleet_observation_result(
+    result: &FleetObservationPublishResultV1,
+) -> Result<(), Status> {
+    if result.encoded_len() > MAX_FLEET_OBSERVATION_CONTROL_BYTES {
+        return Err(Status::resource_exhausted(
+            "Fleet observation result exceeds the bounded payload limit",
+        ));
+    }
+    let disposition = FleetObservationPublishDisposition::try_from(result.disposition)
+        .map_err(|_| Status::invalid_argument("invalid Fleet observation disposition"))?;
+    if disposition == FleetObservationPublishDisposition::Unspecified {
+        return Err(Status::invalid_argument(
+            "Fleet observation disposition is required",
+        ));
+    }
+    if result.reason.len() > MAX_DIRECT_CONTROL_REASON_BYTES
+        || result.code.len() > MAX_DIRECT_CONTROL_REASON_BYTES
+    {
+        return Err(Status::invalid_argument(
+            "Fleet observation result details exceed bounds",
+        ));
+    }
+    match disposition {
+        FleetObservationPublishDisposition::Acquired => {
+            if !result.accepted {
+                return Err(Status::invalid_argument("acquired result must be accepted"));
+            }
+            validate_fleet_observation_authority_epoch(
+                result.authority_epoch.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("acquired result requires an authority epoch")
+                })?,
+            )?;
+        }
+        FleetObservationPublishDisposition::Published
+        | FleetObservationPublishDisposition::AlreadyRecorded => {
+            if !result.accepted {
+                return Err(Status::invalid_argument(
+                    "successful publication disposition must be accepted",
+                ));
+            }
+        }
+        FleetObservationPublishDisposition::Rejected => {
+            if result.accepted {
+                return Err(Status::invalid_argument(
+                    "rejected publication cannot be accepted",
+                ));
+            }
+        }
+        FleetObservationPublishDisposition::Unspecified => unreachable!(),
+    }
+    Ok(())
 }
 
 fn canonical_task_publication_identity(task: &TaskEnvelope) -> TaskEnvelope {
@@ -1368,6 +1638,121 @@ mod tests {
     const SOURCE_NODE_ID: &str = "executor-node";
     const DESTINATION_NODE_ID: &str = "origin-node";
     const SOURCE_TOKEN: &str = "test-token";
+
+    #[test]
+    #[allow(deprecated)]
+    fn fleet_observation_validation_enforces_variant_epoch_payload_and_deadline_bounds() {
+        use keryx_proto::v1::{
+            fleet_observation_publish_v1, FleetObservationAcquireV1,
+            FleetObservationAuthorityEpochV1, FleetObservationSampleV1,
+        };
+        let selector = FleetObservationSelectorV1 {
+            source: "nodescale".to_string(),
+            network_id: "network".to_string(),
+            device_id: "device".to_string(),
+        };
+        let acquire = FleetObservationPublishV1 {
+            request: Some(fleet_observation_publish_v1::Request::Acquire(
+                FleetObservationAcquireV1 {
+                    selector: Some(selector.clone()),
+                },
+            )),
+        };
+        assert!(validate_fleet_observation_publish(&acquire).is_ok());
+        assert!(validate_fleet_observation_publish(&FleetObservationPublishV1::default()).is_err());
+
+        let mut publish = FleetObservationPublishV1 {
+            request: Some(fleet_observation_publish_v1::Request::Publish(
+                FleetObservationSampleV1 {
+                    selector: Some(selector),
+                    authority_epoch: Some(FleetObservationAuthorityEpochV1 {
+                        binding_id: "binding".to_string(),
+                        authenticated_peer_id: "peer".to_string(),
+                        binding_generation: 1,
+                        projection_generation: 2,
+                    }),
+                    observation_json: br#"{"observed_at_ms":1}"#.to_vec(),
+                    sample_bytes: Vec::new(),
+                },
+            )),
+        };
+        assert!(validate_fleet_observation_publish(&publish).is_ok());
+        let encoded = publish.encode_to_vec();
+        let decoded = FleetObservationPublishV1::decode(encoded.as_slice()).unwrap();
+        assert!(validate_fleet_observation_publish(&decoded).is_ok());
+        if let Some(fleet_observation_publish_v1::Request::Publish(sample)) =
+            publish.request.as_mut()
+        {
+            sample.sample_bytes = b"unsupported".to_vec();
+        }
+        let legacy_wire = publish.encode_to_vec();
+        let decoded_legacy = FleetObservationPublishV1::decode(legacy_wire.as_slice()).unwrap();
+        assert!(validate_fleet_observation_publish(&decoded_legacy).is_err());
+        if let Some(fleet_observation_publish_v1::Request::Publish(sample)) =
+            publish.request.as_mut()
+        {
+            sample.sample_bytes.clear();
+            sample.observation_json = vec![b'x'; MAX_FLEET_OBSERVATION_JSON_BYTES];
+        }
+        assert!(validate_fleet_observation_publish(&publish).is_ok());
+        if let Some(fleet_observation_publish_v1::Request::Publish(sample)) =
+            publish.request.as_mut()
+        {
+            sample.observation_json.push(b'x');
+        }
+        assert!(validate_fleet_observation_publish(&publish).is_err());
+        if let Some(fleet_observation_publish_v1::Request::Publish(sample)) =
+            publish.request.as_mut()
+        {
+            sample.observation_json = br#"{"observed_at_ms":1}"#.to_vec();
+        }
+        if let Some(fleet_observation_publish_v1::Request::Publish(sample)) =
+            publish.request.as_mut()
+        {
+            sample.authority_epoch.as_mut().unwrap().binding_generation = 0;
+        }
+        assert!(validate_fleet_observation_publish(&publish).is_err());
+
+        let valid_epoch = FleetObservationAuthorityEpochV1 {
+            binding_id: "binding".to_string(),
+            authenticated_peer_id: "peer".to_string(),
+            binding_generation: 1,
+            projection_generation: 2,
+        };
+        assert!(
+            validate_fleet_observation_result(&FleetObservationPublishResultV1 {
+                disposition: FleetObservationPublishDisposition::Acquired as i32,
+                accepted: true,
+                authority_epoch: Some(valid_epoch.clone()),
+                reason: String::new(),
+                code: String::new(),
+            })
+            .is_ok()
+        );
+        let mut invalid_epoch = valid_epoch;
+        invalid_epoch.authenticated_peer_id.clear();
+        assert!(
+            validate_fleet_observation_result(&FleetObservationPublishResultV1 {
+                disposition: FleetObservationPublishDisposition::Acquired as i32,
+                accepted: true,
+                authority_epoch: Some(invalid_epoch),
+                reason: String::new(),
+                code: String::new(),
+            })
+            .is_err()
+        );
+
+        assert_eq!(
+            validate_fleet_observation_deadline(unix_ms_now() - 1)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert!(validate_fleet_observation_deadline(
+            unix_ms_now() + MAX_FLEET_OBSERVATION_DEADLINE_MS + 1
+        )
+        .is_err());
+    }
 
     #[test]
     fn task_publication_identity_excludes_only_relay_owned_feature_projection() {
@@ -1896,6 +2281,125 @@ mod tests {
         assert_eq!(
             runtime.ack_frame(DESTINATION_NODE_ID, &frame_id),
             FrameAcknowledgement::UnknownFrame
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_observation_rpc_projects_authenticated_source_and_settles_only_at_destination() {
+        use keryx_proto::v1::{
+            fleet_observation_publish_v1, FleetObservationAcquireV1,
+            FleetObservationAuthorityEpochV1,
+        };
+        let runtime = RelayRuntime::new("fleet-observation-rpc-test");
+        let registry = Arc::new(SkillRegistry::new());
+        registry
+            .register_with_features(
+                DESTINATION_NODE_ID.parse().unwrap(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                vec![FLEET_OBSERVATION_PUBLISH_FEATURE.to_string()],
+                None,
+            )
+            .await;
+        let service = direct_service(Arc::clone(&runtime), registry, HashSet::new());
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(runtime.connect_node(DESTINATION_NODE_ID, sender), 0);
+        let operation = FleetObservationPublishV1 {
+            request: Some(fleet_observation_publish_v1::Request::Acquire(
+                FleetObservationAcquireV1 {
+                    selector: Some(FleetObservationSelectorV1 {
+                        source: "nodescale".to_string(),
+                        network_id: "network".to_string(),
+                        device_id: "device".to_string(),
+                    }),
+                },
+            )),
+        };
+        let mut request = Request::new(PublishFleetObservationRequest {
+            operation: Some(operation.clone()),
+            target_node_id: DESTINATION_NODE_ID.to_string(),
+            deadline_ms: unix_ms_now() + 5_000,
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+        let publish_service = Arc::clone(&service);
+        let publish = tokio::spawn(async move {
+            KeryxRelay::publish_fleet_observation(publish_service.as_ref(), request).await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.authenticated_source_node_id, SOURCE_NODE_ID);
+        assert_eq!(frame.destination_node_id, DESTINATION_NODE_ID);
+        assert_eq!(frame.fleet_observation_publish_v1, Some(operation));
+        assert!(frame.task.is_none() && frame.result.is_none());
+
+        let result = FleetObservationPublishResultV1 {
+            disposition: FleetObservationPublishDisposition::Acquired as i32,
+            accepted: true,
+            authority_epoch: Some(FleetObservationAuthorityEpochV1 {
+                binding_id: "binding".to_string(),
+                authenticated_peer_id: SOURCE_NODE_ID.to_string(),
+                binding_generation: 1,
+                projection_generation: 2,
+            }),
+            reason: String::new(),
+            code: String::new(),
+        };
+        let mut wrong = Request::new(CompleteFleetObservationRequest {
+            frame_id: frame.frame_id.clone(),
+            result: Some(result.clone()),
+        });
+        wrong
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, SOURCE_NODE_ID.parse().unwrap());
+        wrong
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, SOURCE_TOKEN.parse().unwrap());
+        assert_eq!(
+            KeryxRelay::complete_fleet_observation(service.as_ref(), wrong)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut completion = Request::new(CompleteFleetObservationRequest {
+            frame_id: frame.frame_id.clone(),
+            result: Some(result),
+        });
+        completion
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, DESTINATION_NODE_ID.parse().unwrap());
+        completion.metadata_mut().insert(
+            NODE_TOKEN_METADATA_KEY,
+            "destination-token".parse().unwrap(),
+        );
+        assert!(
+            KeryxRelay::complete_fleet_observation(service.as_ref(), completion)
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
+        let published = publish.await.unwrap().unwrap().into_inner();
+        assert_eq!(published.frame_id, frame.frame_id);
+        assert_eq!(published.destination_node_id, DESTINATION_NODE_ID);
+        assert_eq!(
+            FleetObservationPublishDisposition::try_from(published.result.unwrap().disposition)
+                .unwrap(),
+            FleetObservationPublishDisposition::Acquired
+        );
+        assert_eq!(
+            runtime.test_pending_fleet_observation_state(DESTINATION_NODE_ID),
+            (0, 0)
         );
     }
 

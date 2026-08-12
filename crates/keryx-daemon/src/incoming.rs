@@ -49,7 +49,10 @@ impl IncomingRelayTask {
         let exact_task_payload = frame.task.is_some()
             && frame.result.is_none()
             && frame.nodescale_identity_bind_v1.is_none()
-            && frame.nodescale_identity_challenge_v1.is_none();
+            && frame.nodescale_identity_challenge_v1.is_none()
+            && frame.nodescale_identity_bind_v2.is_none()
+            && frame.nodescale_identity_challenge_v2.is_none()
+            && frame.fleet_observation_publish_v1.is_none();
         if !exact_task_payload {
             return Err("relay task extraction requires exactly one task payload");
         }
@@ -440,6 +443,30 @@ mod tests {
         bind_with_task.nodescale_identity_bind_v1 = None;
         bind_with_task.nodescale_identity_challenge_v1 =
             Some(keryx_proto::v1::NodescaleIdentityChallengeV1::default());
+        assert!(
+            IncomingRelayTask::from_relay_frame("node-remote", bind_with_task.clone()).is_err()
+        );
+
+        bind_with_task.frame_id = "bind-v2-with-task".to_string();
+        bind_with_task.nodescale_identity_challenge_v1 = None;
+        bind_with_task.nodescale_identity_bind_v2 =
+            Some(keryx_proto::v1::NodescaleIdentityBindV2::default());
+        assert!(
+            IncomingRelayTask::from_relay_frame("node-remote", bind_with_task.clone()).is_err()
+        );
+
+        bind_with_task.frame_id = "challenge-v2-with-task".to_string();
+        bind_with_task.nodescale_identity_bind_v2 = None;
+        bind_with_task.nodescale_identity_challenge_v2 =
+            Some(keryx_proto::v1::NodescaleIdentityChallengeV2::default());
+        assert!(
+            IncomingRelayTask::from_relay_frame("node-remote", bind_with_task.clone()).is_err()
+        );
+
+        bind_with_task.frame_id = "fleet-observation-with-task".to_string();
+        bind_with_task.nodescale_identity_challenge_v2 = None;
+        bind_with_task.fleet_observation_publish_v1 =
+            Some(keryx_proto::v1::FleetObservationPublishV1::default());
         assert!(IncomingRelayTask::from_relay_frame("node-remote", bind_with_task).is_err());
 
         for frame in [

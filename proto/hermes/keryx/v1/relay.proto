@@ -28,6 +28,10 @@ service KeryxRelay {
   rpc PublishNodescaleIdentityChallengeV2(PublishNodescaleIdentityChallengeV2Request) returns (PublishNodescaleIdentityChallengeResponse);
   // Destination-only typed challenge completion for a relay-issued control frame.
   rpc CompleteNodescaleIdentityChallenge(CompleteNodescaleIdentityChallengeRequest) returns (CompleteNodescaleIdentityChallengeResponse);
+  // Internal non-execution Fleet observation control. The body is either an
+  // acquire(selector-only) request or a publish(epoch plus bounded sample).
+  rpc PublishFleetObservation(PublishFleetObservationRequest) returns (PublishFleetObservationResponse);
+  rpc CompleteFleetObservation(CompleteFleetObservationRequest) returns (CompleteFleetObservationResponse);
   rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
   // Destination-owned acknowledgement; the authenticated caller must own the relay frame.
   rpc AckFrame(AckFrameRequest) returns (AckFrameResponse);
@@ -61,6 +65,7 @@ message RelayFrame {
   NodescaleIdentityChallengeV1 nodescale_identity_challenge_v1 = 7;
   NodescaleIdentityBindV2 nodescale_identity_bind_v2 = 8;
   NodescaleIdentityChallengeV2 nodescale_identity_challenge_v2 = 9;
+  FleetObservationPublishV1 fleet_observation_publish_v1 = 10;
 }
 message RegisterNodeRequest { NodeId node_id = 1; string token = 2; }
 message RegisterNodeResponse { bool accepted = 1; }
@@ -125,6 +130,23 @@ message CompleteNodescaleIdentityChallengeRequest {
   NodescaleIdentityChallengeResult result = 2;
 }
 message CompleteNodescaleIdentityChallengeResponse { bool accepted = 1; }
+message PublishFleetObservationRequest {
+  FleetObservationPublishV1 operation = 1;
+  string target_node_id = 2;
+  // Absolute Unix epoch milliseconds. It must be in the future and within the
+  // bounded direct-control window; it is not a task deadline.
+  int64 deadline_ms = 3;
+}
+message PublishFleetObservationResponse {
+  string frame_id = 1;
+  string destination_node_id = 2;
+  FleetObservationPublishResultV1 result = 3;
+}
+message CompleteFleetObservationRequest {
+  string frame_id = 1;
+  FleetObservationPublishResultV1 result = 2;
+}
+message CompleteFleetObservationResponse { bool accepted = 1; }
 message AckTaskRequest { TaskId task_id = 1; }
 message AckTaskResponse { bool accepted = 1; }
 message AckFrameRequest { string frame_id = 1; }

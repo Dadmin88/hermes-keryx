@@ -14,10 +14,11 @@ use keryx_proto::v1::keryx_relay_client::KeryxRelayClient;
 use keryx_proto::v1::registry_service_client::RegistryServiceClient;
 use keryx_proto::v1::{
     AckFrameRequest, AckResultDeliveryRequest, ClaimNextResultDeliveryRequest,
-    CompleteNodescaleIdentityBindRequest, CompleteNodescaleIdentityChallengeRequest,
-    FailResultDeliveryRequest, IngestRemoteResultRequest, NodeFrame,
-    NodescaleIdentityBindDisposition, NodescaleIdentityBindResult, NodescaleIdentityBindV1,
-    NodescaleIdentityBindV2, NodescaleIdentityChallengeDisposition,
+    CompleteFleetObservationRequest, CompleteNodescaleIdentityBindRequest,
+    CompleteNodescaleIdentityChallengeRequest, FailResultDeliveryRequest,
+    FleetObservationPublishResultV1, FleetObservationPublishV1, IngestRemoteResultRequest,
+    NodeFrame, NodescaleIdentityBindDisposition, NodescaleIdentityBindResult,
+    NodescaleIdentityBindV1, NodescaleIdentityBindV2, NodescaleIdentityChallengeDisposition,
     NodescaleIdentityChallengeResult, NodescaleIdentityChallengeV1, NodescaleIdentityChallengeV2,
     PublishResultRequest, SubmitRemoteTaskRequest,
 };
@@ -213,6 +214,19 @@ pub struct AuthenticatedDirectContext {
 }
 
 impl AuthenticatedDirectContext {
+    #[cfg(test)]
+    pub(crate) fn new(
+        authenticated_source_node_id: impl Into<String>,
+        destination_node_id: impl Into<String>,
+        relay_frame_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            authenticated_source_node_id: authenticated_source_node_id.into(),
+            destination_node_id: destination_node_id.into(),
+            relay_frame_id: relay_frame_id.into(),
+        }
+    }
+
     /// Source identity projected from the relay-authenticated frame.
     #[must_use]
     pub fn authenticated_source_node_id(&self) -> &str {
@@ -287,12 +301,23 @@ pub trait NodescaleIdentityChallengeV2Handler: Send + Sync {
     ) -> Result<NodescaleIdentityChallengeResult>;
 }
 
+/// Closed typed Fleet observation seam. It cannot receive a daemon or task envelope.
+#[tonic::async_trait]
+pub trait FleetObservationPublishHandler: Send + Sync {
+    async fn handle_fleet_observation_publish(
+        &self,
+        context: AuthenticatedDirectContext,
+        operation: FleetObservationPublishV1,
+    ) -> Result<FleetObservationPublishResultV1>;
+}
+
 #[derive(Clone, Default)]
 pub struct DirectControlHandlers {
     pub nodescale_identity_bind_v1: Option<Arc<dyn NodescaleIdentityBindHandler>>,
     pub nodescale_identity_bind_v2: Option<Arc<dyn NodescaleIdentityBindV2Handler>>,
     pub nodescale_identity_challenge_v1: Option<Arc<dyn NodescaleIdentityChallengeHandler>>,
     pub nodescale_identity_challenge_v2: Option<Arc<dyn NodescaleIdentityChallengeV2Handler>>,
+    pub fleet_observation_publish: Option<Arc<dyn FleetObservationPublishHandler>>,
 }
 
 impl DirectControlHandlers {
@@ -305,6 +330,33 @@ impl DirectControlHandlers {
     pub fn has_nodescale_identity_challenge_handler(&self) -> bool {
         self.nodescale_identity_challenge_v1.is_some()
     }
+
+    #[must_use]
+    pub fn has_fleet_observation_publish_handler(&self) -> bool {
+        self.fleet_observation_publish.is_some()
+    }
+}
+
+/// Dispatch a typed direct control operation without any daemon/task dependency.
+pub(crate) async fn dispatch_fleet_observation_publish(
+    handlers: &DirectControlHandlers,
+    context: AuthenticatedDirectContext,
+    operation: FleetObservationPublishV1,
+) -> Result<FleetObservationPublishResultV1> {
+    anyhow::ensure!(
+        !context.authenticated_source_node_id.trim().is_empty()
+            && !context.destination_node_id.trim().is_empty()
+            && !context.relay_frame_id.trim().is_empty()
+            && operation.request.is_some(),
+        "Fleet observation control provenance and request are required"
+    );
+    let handler = handlers
+        .fleet_observation_publish
+        .as_ref()
+        .context("Fleet observation publish handler is not installed")?;
+    handler
+        .handle_fleet_observation_publish(context, operation)
+        .await
 }
 
 /// Dispatch a typed direct control operation without any daemon/task dependency.
@@ -400,6 +452,7 @@ pub(crate) async fn dispatch_nodescale_identity_challenge_v2(
 pub(crate) enum LocalTypedControlDispatch {
     Bind(NodescaleIdentityBindResult),
     Challenge(NodescaleIdentityChallengeResult),
+    FleetObservation(FleetObservationPublishResultV1),
 }
 
 pub(crate) async fn dispatch_relay_typed_control_for_local(
@@ -412,6 +465,7 @@ pub(crate) async fn dispatch_relay_typed_control_for_local(
         && frame.nodescale_identity_challenge_v1.is_none()
         && frame.nodescale_identity_bind_v2.is_none()
         && frame.nodescale_identity_challenge_v2.is_none()
+        && frame.fleet_observation_publish_v1.is_none()
     {
         return Ok(None);
     }
@@ -419,6 +473,16 @@ pub(crate) async fn dispatch_relay_typed_control_for_local(
         frame.destination_node_id == registry_peer_id,
         "typed direct control frame destination does not match the registered local node"
     );
+
+    if let Some(operation) = frame.fleet_observation_publish_v1.clone() {
+        return dispatch_fleet_observation_publish(
+            handlers,
+            AuthenticatedDirectContext::from_authenticated_relay_frame(frame),
+            operation,
+        )
+        .await
+        .map(|result| Some(LocalTypedControlDispatch::FleetObservation(result)));
+    }
 
     if let Some(operation) = frame.nodescale_identity_challenge_v2.clone() {
         return dispatch_nodescale_identity_challenge_v2(
@@ -471,7 +535,8 @@ async fn dispatch_relay_typed_control_for_local_bounded(
         || frame.nodescale_identity_challenge_v2.is_some();
     let is_bind =
         frame.nodescale_identity_bind_v1.is_some() || frame.nodescale_identity_bind_v2.is_some();
-    if !is_challenge && !is_bind {
+    let is_fleet_observation = frame.fleet_observation_publish_v1.is_some();
+    if !is_challenge && !is_bind && !is_fleet_observation {
         return Ok(None);
     }
     anyhow::ensure!(
@@ -491,19 +556,31 @@ async fn dispatch_relay_typed_control_for_local_bounded(
                 relay_frame_id = %frame.frame_id,
                 "typed direct-control handler failed; completing with a bounded rejection"
             );
-            Ok(Some(direct_control_rejection(is_challenge, false)))
+            Ok(Some(direct_control_rejection(
+                is_challenge,
+                is_fleet_observation,
+                false,
+            )))
         }
         Err(_) => {
             tracing::warn!(
                 relay_frame_id = %frame.frame_id,
                 "typed direct-control handler timed out; completing with a bounded rejection"
             );
-            Ok(Some(direct_control_rejection(is_challenge, true)))
+            Ok(Some(direct_control_rejection(
+                is_challenge,
+                is_fleet_observation,
+                true,
+            )))
         }
     }
 }
 
-fn direct_control_rejection(is_challenge: bool, timed_out: bool) -> LocalTypedControlDispatch {
+fn direct_control_rejection(
+    is_challenge: bool,
+    is_fleet_observation: bool,
+    timed_out: bool,
+) -> LocalTypedControlDispatch {
     let (reason, code) = if timed_out {
         ("direct-control handler timed out", "handler_timeout")
     } else {
@@ -515,6 +592,14 @@ fn direct_control_rejection(is_challenge: bool, timed_out: bool) -> LocalTypedCo
             reason: reason.to_string(),
             code: code.to_string(),
             ..NodescaleIdentityChallengeResult::default()
+        })
+    } else if is_fleet_observation {
+        LocalTypedControlDispatch::FleetObservation(FleetObservationPublishResultV1 {
+            disposition: keryx_proto::v1::FleetObservationPublishDisposition::Rejected as i32,
+            accepted: false,
+            reason: reason.to_string(),
+            code: code.to_string(),
+            ..FleetObservationPublishResultV1::default()
         })
     } else {
         LocalTypedControlDispatch::Bind(NodescaleIdentityBindResult {
@@ -573,6 +658,17 @@ async fn complete_local_typed_control(
                         .await
                         .context("keryx node stream: relay direct-control completion failed")?;
                 }
+                LocalTypedControlDispatch::FleetObservation(result) => {
+                    let mut request = Request::new(CompleteFleetObservationRequest {
+                        frame_id: frame_id.to_string(),
+                        result: Some(result),
+                    });
+                    add_node_auth_metadata(&mut request, registry_peer_id, node_token)?;
+                    completion_client
+                        .complete_fleet_observation(request)
+                        .await
+                        .context("keryx node stream: relay Fleet observation completion failed")?;
+                }
             }
             Ok(())
         },
@@ -630,6 +726,7 @@ pub async fn run_edge_node_with_direct_control_handlers(
         direct_control_handlers
             .nodescale_identity_challenge_v2
             .is_some(),
+        direct_control_handlers.fleet_observation_publish.is_some(),
     )
     .await?;
 
@@ -1018,7 +1115,8 @@ fn validate_relay_frame_exactly_one_payload(frame: &keryx_proto::v1::RelayFrame)
         + usize::from(frame.nodescale_identity_bind_v1.is_some())
         + usize::from(frame.nodescale_identity_challenge_v1.is_some())
         + usize::from(frame.nodescale_identity_bind_v2.is_some())
-        + usize::from(frame.nodescale_identity_challenge_v2.is_some());
+        + usize::from(frame.nodescale_identity_challenge_v2.is_some())
+        + usize::from(frame.fleet_observation_publish_v1.is_some());
     anyhow::ensure!(
         payload_count == 1,
         "relay frame must carry exactly one payload kind"
@@ -1077,6 +1175,7 @@ async fn register_node_skills(
     nodescale_identity_challenge_v1_enabled: bool,
     nodescale_identity_bind_v2_enabled: bool,
     nodescale_identity_challenge_v2_enabled: bool,
+    fleet_observation_publish_enabled: bool,
 ) -> Result<()> {
     let Some(endpoint) = registry_endpoint() else {
         return Ok(());
@@ -1100,6 +1199,9 @@ async fn register_node_skills(
     }
     if nodescale_identity_challenge_v2_enabled {
         protocol_features.push("nodescale.identity.challenge.v2".to_string());
+    }
+    if fleet_observation_publish_enabled {
+        protocol_features.push("fleet.observation.publish.v1".to_string());
     }
 
     let mut client = connect_registry_client(&endpoint).await?;

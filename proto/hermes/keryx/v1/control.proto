@@ -86,3 +86,55 @@ message NodescaleIdentityChallengeResult {
   string reason = 7;
   string code = 8;
 }
+
+// Internal non-execution Fleet observation control. The relay derives sender
+// provenance from authenticated transport metadata; no sender or admission
+// token is carried in this body.
+message FleetObservationSelectorV1 {
+  string source = 1;
+  string network_id = 2;
+  string device_id = 3;
+}
+
+message FleetObservationAcquireV1 {
+  FleetObservationSelectorV1 selector = 1;
+}
+
+message FleetObservationAuthorityEpochV1 {
+  string binding_id = 1;
+  string authenticated_peer_id = 2;
+  uint64 binding_generation = 3;
+  uint64 projection_generation = 4;
+}
+
+message FleetObservationSampleV1 {
+  FleetObservationSelectorV1 selector = 1;
+  FleetObservationAuthorityEpochV1 authority_epoch = 2;
+  bytes observation_json = 3;
+  // Reserved for wire compatibility only. V1 receivers reject non-empty values;
+  // the canonical Fleet observation is carried exclusively in observation_json.
+  bytes sample_bytes = 4 [deprecated = true];
+}
+
+message FleetObservationPublishV1 {
+  oneof request {
+    FleetObservationAcquireV1 acquire = 1;
+    FleetObservationSampleV1 publish = 2;
+  }
+}
+
+enum FleetObservationPublishDisposition {
+  FLEET_OBSERVATION_PUBLISH_DISPOSITION_UNSPECIFIED = 0;
+  FLEET_OBSERVATION_PUBLISH_DISPOSITION_ACQUIRED = 1;
+  FLEET_OBSERVATION_PUBLISH_DISPOSITION_PUBLISHED = 2;
+  FLEET_OBSERVATION_PUBLISH_DISPOSITION_ALREADY_RECORDED = 3;
+  FLEET_OBSERVATION_PUBLISH_DISPOSITION_REJECTED = 4;
+}
+
+message FleetObservationPublishResultV1 {
+  FleetObservationPublishDisposition disposition = 1;
+  bool accepted = 2;
+  FleetObservationAuthorityEpochV1 authority_epoch = 3;
+  string reason = 4;
+  string code = 5;
+}
