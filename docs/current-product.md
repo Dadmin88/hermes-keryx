@@ -140,6 +140,12 @@ The destination acknowledges a relay frame only after local durable ingestion su
 
 Task and result mutations require authenticated node credentials when relay authentication is configured. Missing, invalid, revoked, or identity-mismatched credentials fail closed.
 
+On Unix, a TOML-configured relay can atomically reload the complete owner-managed
+`security.node_tokens_path` authentication snapshot on SIGHUP without restarting
+the relay or disconnecting existing streams. Invalid or missing replacement files
+leave the previous working snapshot active; allowlist and token reload outcomes
+are independent.
+
 Registry registration/deregistration ownership is also derived from authenticated node metadata. Request-body identity cannot authorize mutation of another peer's registry entry.
 
 Read-only skill discovery remains separate from mutation authority.

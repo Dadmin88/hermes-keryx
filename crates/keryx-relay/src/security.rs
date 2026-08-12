@@ -108,16 +108,28 @@ impl Allowlist {
 
 /// Node-token registry used to authenticate relay control-plane callers.
 #[derive(Clone, Default)]
-pub struct NodeTokenAuth {
+struct NodeTokenAuthSnapshot {
     tokens: HashMap<NodeId, String>,
     revoked_nodes: HashSet<NodeId>,
 }
 
+#[derive(Clone, Default)]
+pub struct NodeTokenAuth {
+    snapshot: Arc<RwLock<NodeTokenAuthSnapshot>>,
+}
+
 impl fmt::Debug for NodeTokenAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         f.debug_struct("NodeTokenAuth")
-            .field("tokens", &format_args!("{} configured", self.tokens.len()))
-            .field("revoked_nodes", &self.revoked_nodes)
+            .field(
+                "tokens",
+                &format_args!("{} configured", snapshot.tokens.len()),
+            )
+            .field("revoked_nodes", &snapshot.revoked_nodes)
             .finish()
     }
 }
@@ -126,19 +138,30 @@ impl NodeTokenAuth {
     #[must_use]
     pub fn new(tokens: HashMap<NodeId, String>, revoked_nodes: HashSet<NodeId>) -> Self {
         Self {
-            tokens,
-            revoked_nodes,
+            snapshot: Arc::new(RwLock::new(NodeTokenAuthSnapshot {
+                tokens,
+                revoked_nodes,
+            })),
         }
     }
 
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        !self.tokens.is_empty()
+        !self
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .tokens
+            .is_empty()
     }
 
     #[must_use]
     pub fn is_revoked(&self, node_id: &NodeId) -> bool {
-        self.revoked_nodes.contains(node_id)
+        self.snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .revoked_nodes
+            .contains(node_id)
     }
 
     pub fn authenticate(
@@ -154,7 +177,11 @@ impl NodeTokenAuth {
         node_id: &NodeId,
         presented_token: Option<&str>,
     ) -> std::result::Result<NodeAuthSuccess, NodeAuthFailure> {
-        if self.is_revoked(node_id) {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if snapshot.revoked_nodes.contains(node_id) {
             let failure = NodeAuthFailure::RevokedNode {
                 node_id: node_id.to_string(),
             };
@@ -162,7 +189,7 @@ impl NodeTokenAuth {
             return Err(failure);
         }
 
-        let Some(expected) = self.tokens.get(node_id) else {
+        let Some(expected) = snapshot.tokens.get(node_id) else {
             let failure = NodeAuthFailure::UnknownNode {
                 node_id: node_id.to_string(),
             };
@@ -198,6 +225,38 @@ impl NodeTokenAuth {
         let file: NodeTokenFile = toml::from_str(&raw)
             .with_context(|| format!("parse node token auth {}", path.display()))?;
         Self::from_entries(file.tokens, file.revoked_nodes)
+    }
+
+    /// Fully load and validate a replacement file before atomically publishing it.
+    pub fn reload_from_path(&self, path: &Path) -> Result<()> {
+        self.replace(Self::load(path)?);
+        Ok(())
+    }
+
+    fn replace(&self, replacement: Self) {
+        let replacement = replacement
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = replacement;
+    }
+
+    fn extend(&self, additional: Self) {
+        let additional = additional
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot.tokens.extend(additional.tokens);
+        snapshot.revoked_nodes.extend(additional.revoked_nodes);
     }
 
     fn from_entries(entries: Vec<NodeTokenEntry>, revoked_nodes: Vec<String>) -> Result<Self> {
@@ -503,7 +562,7 @@ impl RelayTomlConfig {
     }
 
     pub fn load_node_token_auth(&self, config_path: &Path) -> Result<NodeTokenAuth> {
-        let mut auth = if let Some(path) = self.resolved_node_tokens_path(config_path)? {
+        let auth = if let Some(path) = self.resolved_node_tokens_path(config_path)? {
             NodeTokenAuth::load(&path)?
         } else {
             NodeTokenAuth::default()
@@ -518,9 +577,18 @@ impl RelayTomlConfig {
             .collect::<Vec<_>>();
         let inline =
             NodeTokenAuth::from_entries(inline_entries, self.security.revoked_nodes.clone())?;
-        auth.tokens.extend(inline.tokens);
-        auth.revoked_nodes.extend(inline.revoked_nodes);
+        auth.extend(inline);
         Ok(auth)
+    }
+
+    /// Reload the complete configured token authentication set without partial application.
+    pub fn reload_node_token_auth(
+        &self,
+        config_path: &Path,
+        current: &NodeTokenAuth,
+    ) -> Result<()> {
+        current.replace(self.load_node_token_auth(config_path)?);
+        Ok(())
     }
 }
 
@@ -746,5 +814,100 @@ mod tests {
         assert!(auth
             .authenticate(&node_id, "node-token-secure-1234567890")
             .is_ok());
+    }
+
+    #[test]
+    fn config_reload_replaces_file_snapshot_and_reapplies_inline_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("relay.toml");
+        let tokens_path = dir.path().join("tokens.toml");
+        let config: RelayTomlConfig = toml::from_str(
+            r#"
+                [security]
+                node_tokens_path = "tokens.toml"
+
+                [[security.node_tokens]]
+                node_id = "node:inline"
+                token = "inline-token-secure-1234567890"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            &tokens_path,
+            "[[tokens]]\nnode_id = \"node:file-a\"\ntoken = \"file-a-token-secure-1234567890\"\n",
+        )
+        .unwrap();
+        let auth = config.load_node_token_auth(&config_path).unwrap();
+
+        std::fs::write(
+            &tokens_path,
+            "[[tokens]]\nnode_id = \"node:file-b\"\ntoken = \"file-b-token-secure-1234567890\"\n",
+        )
+        .unwrap();
+        config.reload_node_token_auth(&config_path, &auth).unwrap();
+
+        assert!(auth
+            .authenticate(
+                &"node:inline".parse().unwrap(),
+                "inline-token-secure-1234567890"
+            )
+            .is_ok());
+        assert!(auth
+            .authenticate(
+                &"node:file-b".parse().unwrap(),
+                "file-b-token-secure-1234567890"
+            )
+            .is_ok());
+        assert!(matches!(
+            auth.authenticate(
+                &"node:file-a".parse().unwrap(),
+                "file-a-token-secure-1234567890"
+            ),
+            Err(NodeAuthFailure::UnknownNode { .. })
+        ));
+    }
+
+    #[test]
+    fn node_token_reload_is_atomic_and_debug_redacts_tokens() {
+        let worker: NodeId = "node:worker".parse().unwrap();
+        let control: NodeId = "node:control".parse().unwrap();
+        let worker_token = "worker-token-secure-1234567890";
+        let control_token = "control-token-secure-1234567890";
+        let auth = NodeTokenAuth::new(
+            HashMap::from([(worker.clone(), worker_token.to_string())]),
+            HashSet::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-tokens.toml");
+
+        assert!(matches!(
+            auth.authenticate(&control, control_token),
+            Err(NodeAuthFailure::UnknownNode { .. })
+        ));
+
+        std::fs::write(
+            &path,
+            format!(
+                "[[tokens]]\nnode_id = \"{worker}\"\ntoken = \"{worker_token}\"\n\n[[tokens]]\nnode_id = \"{control}\"\ntoken = \"{control_token}\"\n"
+            ),
+        )
+        .unwrap();
+        auth.reload_from_path(&path).unwrap();
+        assert!(auth.authenticate(&worker, worker_token).is_ok());
+        assert!(auth.authenticate(&control, control_token).is_ok());
+
+        std::fs::write(&path, "[[tokens]]\nnode_id = ").unwrap();
+        assert!(auth.reload_from_path(&path).is_err());
+        assert!(auth.authenticate(&worker, worker_token).is_ok());
+        assert!(auth.authenticate(&control, control_token).is_ok());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(auth.reload_from_path(&path).is_err());
+        assert!(auth.authenticate(&worker, worker_token).is_ok());
+        assert!(auth.authenticate(&control, control_token).is_ok());
+
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(worker_token));
+        assert!(!debug.contains(control_token));
     }
 }

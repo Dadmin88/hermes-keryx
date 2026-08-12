@@ -229,7 +229,13 @@ peer_id = "<libp2p-peer-id>"
 ed25519_public_key_b64 = "<base64-32-byte-public-key>"
 ```
 
-On Unix, send SIGHUP to a TOML-configured relay to reload the allowlist file.
+On Unix, send SIGHUP to a TOML-configured relay to reload the allowlist file and,
+when `security.node_tokens_path` is configured, the complete owner-managed node
+token authentication file. The two reloads are independent. A token file is
+fully parsed and validated before one atomic in-process replacement; a missing
+or invalid replacement leaves the previous authentication snapshot active.
+Existing relay streams are not disconnected by this reload. Reload logs report
+only success or failure and never include node-token values.
 
 ### Relay code defaults vs dual-run defaults
 

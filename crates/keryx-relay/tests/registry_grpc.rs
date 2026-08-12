@@ -101,6 +101,101 @@ async fn start_unauthenticated_test_server(
 }
 
 #[tokio::test]
+async fn running_registry_uses_reloaded_node_token_snapshot() {
+    let worker = NodeId::new("worker-existing").unwrap();
+    let control = NodeId::new("control-dedicated").unwrap();
+    let worker_token = "worker-existing-test-token";
+    let control_token = "control-dedicated-test-token";
+    let auth = Arc::new(NodeTokenAuth::new(
+        HashMap::from([(worker.clone(), worker_token.to_string())]),
+        HashSet::new(),
+    ));
+    let registry = Arc::new(SkillRegistry::new());
+    let (mut client, server) = start_test_server_with_service(RegistryRpcService::with_auth(
+        Arc::clone(&registry),
+        Arc::clone(&auth),
+    ))
+    .await;
+
+    let mut worker_request = Request::new(RegisterSkillsRequest {
+        peer_id: worker.to_string(),
+        skills: vec![],
+        name: "Worker".into(),
+        description: "Existing worker stream".into(),
+        ttl_seconds: 60,
+        protocol_features: vec![],
+    });
+    worker_request
+        .metadata_mut()
+        .insert(NODE_ID_METADATA_KEY, worker.as_str().parse().unwrap());
+    worker_request
+        .metadata_mut()
+        .insert(NODE_TOKEN_METADATA_KEY, worker_token.parse().unwrap());
+    assert!(
+        client
+            .register_skills(worker_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted
+    );
+
+    let mut unknown_request = Request::new(RegisterSkillsRequest {
+        peer_id: control.to_string(),
+        skills: vec![],
+        name: "Control".into(),
+        description: "Dedicated control edge".into(),
+        ttl_seconds: 60,
+        protocol_features: vec![],
+    });
+    unknown_request
+        .metadata_mut()
+        .insert(NODE_ID_METADATA_KEY, control.as_str().parse().unwrap());
+    unknown_request
+        .metadata_mut()
+        .insert(NODE_TOKEN_METADATA_KEY, control_token.parse().unwrap());
+    let unknown = client.register_skills(unknown_request).await.unwrap_err();
+    assert_eq!(unknown.code(), Code::Unauthenticated);
+    assert!(unknown.message().contains("unknown_node"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node-tokens.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[[tokens]]\nnode_id = \"{worker}\"\ntoken = \"{worker_token}\"\n\n[[tokens]]\nnode_id = \"{control}\"\ntoken = \"{control_token}\"\n"
+        ),
+    )
+    .unwrap();
+    auth.reload_from_path(&path).unwrap();
+
+    for (node, token, name) in [
+        (&worker, worker_token, "Worker"),
+        (&control, control_token, "Control"),
+    ] {
+        let mut request = Request::new(RegisterSkillsRequest {
+            peer_id: node.to_string(),
+            skills: vec![],
+            name: name.into(),
+            description: "Reloaded identity".into(),
+            ttl_seconds: 60,
+            protocol_features: vec![],
+        });
+        request
+            .metadata_mut()
+            .insert(NODE_ID_METADATA_KEY, node.as_str().parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(NODE_TOKEN_METADATA_KEY, token.parse().unwrap());
+        let response = client.register_skills(request).await.unwrap().into_inner();
+        assert!(response.accepted);
+    }
+
+    assert_eq!(registry.registration_count().await, 2);
+    server.abort();
+}
+
+#[tokio::test]
 async fn grpc_registry_tls_accepts_authenticated_mutation() {
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
