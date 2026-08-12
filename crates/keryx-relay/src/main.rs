@@ -21,7 +21,10 @@ use keryx_relay::{
     registry::{SkillRegistry, DEFAULT_CLEANUP_INTERVAL, REGISTRY_GOSSIP_TOPIC},
     registry_server::{serve_registry_rpc_with_tls, RegistryRpcService},
     runtime::RelayRuntime,
-    security::{new_shared_allowlist, sync_allowlist_to_swarm, RelayTomlConfig, SharedAllowlist},
+    security::{
+        new_shared_allowlist, sync_allowlist_to_swarm, NodeTokenAuth, RelayTomlConfig,
+        SharedAllowlist,
+    },
     transport::{
         build_relay_server_swarm, load_or_generate_keypair, RelayServerBehaviourEvent,
         RelayServerOptions,
@@ -83,6 +86,11 @@ fn load_process_config(path: &Path) -> Result<ProcessConfig> {
     }
 }
 
+fn node_auth_service_enabled(toml: Option<&RelayTomlConfig>, node_auth: &NodeTokenAuth) -> bool {
+    node_auth.is_configured()
+        || toml.is_some_and(|config| config.security.node_tokens_path.is_some())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
         .map(|config| config.load_node_token_auth(&config_path))
         .transpose()?
         .unwrap_or_default();
-    let node_auth_configured = node_auth.is_configured();
+    let node_auth_configured = node_auth_service_enabled(process.toml.as_ref(), &node_auth);
     let node_auth = Arc::new(node_auth);
     let grpc_tls_identity = load_grpc_tls_identity(&config_path, &process.relay)?;
 
@@ -191,6 +199,7 @@ async fn main() -> Result<()> {
         &process,
         &config_path,
         &shared_allowlist,
+        &node_auth,
         health_shutdown_tx,
     )
     .await?;
@@ -246,6 +255,7 @@ async fn run_relay_loop_unix(
     process: &ProcessConfig,
     config_path: &Path,
     shared_allowlist: &Option<SharedAllowlist>,
+    node_auth: &Arc<NodeTokenAuth>,
     health_shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -281,6 +291,16 @@ async fn run_relay_loop_unix(
                         }
                     } else {
                         tracing::warn!("SIGHUP received but security.allowlist_path is not set");
+                    }
+                }
+                if let Some(toml) = &process.toml {
+                    match toml.resolved_node_tokens_path(config_path) {
+                        Ok(Some(path)) => match reload_node_token_auth(toml, config_path, node_auth) {
+                            Ok(()) => info!(path = %path.display(), "node token authentication reloaded from disk"),
+                            Err(_) => tracing::warn!(path = %path.display(), "node token authentication reload failed; previous snapshot retained"),
+                        },
+                        Ok(None) => {}
+                        Err(_) => tracing::warn!("node token authentication reload path resolution failed; previous snapshot retained"),
                     }
                 }
             }
@@ -364,5 +384,64 @@ fn publish_registry_gossip(
         .publish(topic, payload)
     {
         tracing::debug!(error = %err, "registry gossip publish skipped");
+    }
+}
+
+fn reload_node_token_auth(
+    config: &RelayTomlConfig,
+    config_path: &Path,
+    node_auth: &NodeTokenAuth,
+) -> Result<()> {
+    config.reload_node_token_auth(config_path, node_auth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_core::NodeId;
+    use keryx_relay::security::NodeTokenAuth;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn configured_empty_token_file_still_enables_reloadable_auth_service() {
+        let config: RelayTomlConfig =
+            toml::from_str("[security]\nnode_tokens_path = \"node-tokens.toml\"\n").unwrap();
+        let auth = NodeTokenAuth::default();
+
+        assert!(node_auth_service_enabled(Some(&config), &auth));
+        assert!(!node_auth_service_enabled(None, &auth));
+    }
+
+    #[test]
+    fn configured_node_token_reload_is_independent_and_preserves_previous_snapshot_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("relay.toml");
+        let tokens_path = dir.path().join("node-tokens.toml");
+        let worker: NodeId = "worker-existing".parse().unwrap();
+        let control: NodeId = "control-dedicated".parse().unwrap();
+        let worker_token = "worker-existing-test-token";
+        let control_token = "control-dedicated-test-token";
+        let config: RelayTomlConfig =
+            toml::from_str("[security]\nnode_tokens_path = \"node-tokens.toml\"\n").unwrap();
+        let auth = Arc::new(NodeTokenAuth::new(
+            HashMap::from([(worker.clone(), worker_token.to_string())]),
+            HashSet::new(),
+        ));
+
+        std::fs::write(
+            &tokens_path,
+            format!(
+                "[[tokens]]\nnode_id = \"{worker}\"\ntoken = \"{worker_token}\"\n\n[[tokens]]\nnode_id = \"{control}\"\ntoken = \"{control_token}\"\n"
+            ),
+        )
+        .unwrap();
+        reload_node_token_auth(&config, &config_path, &auth).unwrap();
+        assert!(auth.authenticate(&worker, worker_token).is_ok());
+        assert!(auth.authenticate(&control, control_token).is_ok());
+
+        std::fs::write(&tokens_path, "[[tokens]]\nnode_id = ").unwrap();
+        assert!(reload_node_token_auth(&config, &config_path, &auth).is_err());
+        assert!(auth.authenticate(&worker, worker_token).is_ok());
+        assert!(auth.authenticate(&control, control_token).is_ok());
     }
 }
