@@ -245,9 +245,14 @@ impl FleetObservationPublishHandler for FleetObservationUdsBridge {
         {
             fleet_observation_publish_v1::Request::Acquire(acquire) => {
                 let selector = acquire.selector.context("selector is required")?;
-                json!({"schema":SCHEMA,"kind":"acquire","selector":{
-                    "source":selector.source,"network_id":selector.network_id,"device_id":selector.device_id
-                }})
+                json!({
+                    "authenticated_context": {
+                        "sender_peer_id": context.authenticated_source_node_id()
+                    },
+                    "request": {"schema":SCHEMA,"kind":"acquire","selector":{
+                        "source":selector.source,"network_id":selector.network_id,"device_id":selector.device_id
+                    }}
+                })
             }
             fleet_observation_publish_v1::Request::Publish(publish) => {
                 let selector = publish.selector.context("selector is required")?;
@@ -507,6 +512,82 @@ mod tests {
             .await
             .unwrap();
         assert!(result.accepted);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acquire_injects_authenticated_context_sender_into_owner_only_bridge() {
+        let temporary = tempdir().unwrap();
+        let socket = temporary.path().join("fleet.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut payload = vec![0_u8; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut payload).await.unwrap();
+            let request: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                request,
+                json!({
+                    "authenticated_context": {"sender_peer_id": "peer-authenticated"},
+                    "request": {
+                        "schema": SCHEMA,
+                        "kind": "acquire",
+                        "selector": {
+                            "source": "nodescale",
+                            "network_id": "network-1",
+                            "device_id": "device-1"
+                        }
+                    }
+                })
+            );
+            let response = serde_json::to_vec(&json!({
+                "schema": SCHEMA,
+                "kind": "acquire",
+                "ok": true,
+                "result": {
+                    "binding_id": "binding-1",
+                    "authenticated_peer_id": "peer-authenticated",
+                    "binding_generation": 7,
+                    "projection_generation": 9
+                }
+            }))
+            .unwrap();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        let bridge = FleetObservationUdsBridge::new(socket).unwrap();
+        let result = bridge
+            .handle_fleet_observation_publish(
+                AuthenticatedDirectContext::new(
+                    "peer-authenticated",
+                    "peer-katana",
+                    "frame-acquire",
+                ),
+                FleetObservationPublishV1 {
+                    request: Some(fleet_observation_publish_v1::Request::Acquire(
+                        keryx_proto::v1::FleetObservationAcquireV1 {
+                            selector: Some(FleetObservationSelectorV1 {
+                                source: "nodescale".into(),
+                                network_id: "network-1".into(),
+                                device_id: "device-1".into(),
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.accepted);
+        assert_eq!(
+            result.disposition,
+            FleetObservationPublishDisposition::Acquired as i32
+        );
         server.await.unwrap();
     }
 
