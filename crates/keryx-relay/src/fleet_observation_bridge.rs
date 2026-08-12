@@ -9,8 +9,11 @@ use keryx_proto::v1::{
     fleet_observation_publish_v1, FleetObservationAuthorityEpochV1,
     FleetObservationPublishDisposition, FleetObservationPublishResultV1, FleetObservationPublishV1,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::{
+    de::{Error as _, MapAccess, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
+use serde_json::{json, Map, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
@@ -23,6 +26,98 @@ pub(crate) const MAX_FLEET_OBSERVATION_JSON_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_FLEET_OBSERVATION_BRIDGE_FRAME_BYTES: usize = 128 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const SCHEMA: &str = "fleet.remote-observation-internal.v1";
+
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJson)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJson>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJson(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom("duplicate JSON object member"));
+            }
+            let value = object.next_value::<UniqueJson>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJson(Value::Object(values)))
+    }
+}
+
+fn parse_unique_json(input: &[u8]) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let value = UniqueJson::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value.0)
+}
 
 #[derive(Clone, Debug)]
 pub struct FleetObservationUdsBridge {
@@ -159,8 +254,12 @@ impl FleetObservationPublishHandler for FleetObservationUdsBridge {
                 let epoch = publish
                     .authority_epoch
                     .context("authority epoch is required")?;
-                let observation: Value = serde_json::from_slice(&publish.observation_json)
-                    .context("observation JSON is invalid")?;
+                anyhow::ensure!(
+                    !publish.observation_json.is_empty()
+                        && publish.observation_json.len() <= MAX_FLEET_OBSERVATION_JSON_BYTES,
+                    "observation JSON is outside the semantic bound"
+                );
+                let observation = parse_unique_json(&publish.observation_json)?;
                 json!({
                     "authenticated_context": {
                         "sender_peer_id": context.authenticated_source_node_id()
@@ -269,6 +368,84 @@ mod tests {
         let oversized = json!({"payload":"x".repeat(MAX_FLEET_OBSERVATION_BRIDGE_FRAME_BYTES)});
         let error = bridge.transact(oversized).await.unwrap_err();
         assert!(error.to_string().contains("request is outside bounds"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_observation_members_reject_before_connect() {
+        for observation_json in [
+            br#"{"observed_at_ms":1,"observed_at_ms":2}"#.as_slice(),
+            br#"{"resources":{"cpu":1,"cpu":2}}"#.as_slice(),
+        ] {
+            let temporary = tempdir().unwrap();
+            let bridge =
+                FleetObservationUdsBridge::new(temporary.path().join("absent.sock")).unwrap();
+            let error = bridge
+                .handle_fleet_observation_publish(
+                    AuthenticatedDirectContext::new(
+                        "peer-authenticated",
+                        "peer-katana",
+                        "frame-duplicate",
+                    ),
+                    FleetObservationPublishV1 {
+                        request: Some(fleet_observation_publish_v1::Request::Publish(
+                            FleetObservationSampleV1 {
+                                selector: Some(FleetObservationSelectorV1 {
+                                    source: "nodescale".into(),
+                                    network_id: "network-1".into(),
+                                    device_id: "device-1".into(),
+                                }),
+                                authority_epoch: Some(FleetObservationAuthorityEpochV1 {
+                                    binding_id: "binding-1".into(),
+                                    authenticated_peer_id: "peer-authenticated".into(),
+                                    binding_generation: 7,
+                                    projection_generation: 9,
+                                }),
+                                observation_json: observation_json.to_vec(),
+                                sample_bytes: Vec::new(),
+                            },
+                        )),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("duplicate JSON object member"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_semantic_observation_rejects_before_connect() {
+        let temporary = tempdir().unwrap();
+        let bridge = FleetObservationUdsBridge::new(temporary.path().join("absent.sock")).unwrap();
+        let error = bridge
+            .handle_fleet_observation_publish(
+                AuthenticatedDirectContext::new(
+                    "peer-authenticated",
+                    "peer-katana",
+                    "frame-oversized",
+                ),
+                FleetObservationPublishV1 {
+                    request: Some(fleet_observation_publish_v1::Request::Publish(
+                        FleetObservationSampleV1 {
+                            selector: Some(FleetObservationSelectorV1 {
+                                source: "nodescale".into(),
+                                network_id: "network-1".into(),
+                                device_id: "device-1".into(),
+                            }),
+                            authority_epoch: Some(FleetObservationAuthorityEpochV1 {
+                                binding_id: "binding-1".into(),
+                                authenticated_peer_id: "peer-authenticated".into(),
+                                binding_generation: 7,
+                                projection_generation: 9,
+                            }),
+                            observation_json: vec![b'0'; MAX_FLEET_OBSERVATION_JSON_BYTES + 1],
+                            sample_bytes: Vec::new(),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("semantic bound"));
     }
 
     #[tokio::test]
