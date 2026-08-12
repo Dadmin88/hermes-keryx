@@ -1,6 +1,7 @@
 pub mod autonat;
 pub mod bootstrap;
 pub mod config;
+pub mod fleet_observation_bridge;
 pub mod health;
 pub mod health_server;
 pub mod node;

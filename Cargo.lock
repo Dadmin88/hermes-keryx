@@ -1681,6 +1681,7 @@ dependencies = [
  "keryx-observe",
  "keryx-proto",
  "keryx-store",
+ "libc",
  "libp2p",
  "prost",
  "rcgen 0.13.2",

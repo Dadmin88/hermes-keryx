@@ -59,6 +59,11 @@ class KeryxRelayStub:
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.FromString,
                 _registered_method=True)
+        self.PublishNodescaleIdentityBindV2 = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityBindV2',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindV2Request.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.FromString,
+                _registered_method=True)
         self.CompleteNodescaleIdentityBind = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxRelay/CompleteNodescaleIdentityBind',
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindRequest.SerializeToString,
@@ -69,10 +74,25 @@ class KeryxRelayStub:
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeResponse.FromString,
                 _registered_method=True)
+        self.PublishNodescaleIdentityChallengeV2 = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityChallengeV2',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeV2Request.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeResponse.FromString,
+                _registered_method=True)
         self.CompleteNodescaleIdentityChallenge = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxRelay/CompleteNodescaleIdentityChallenge',
                 request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeRequest.SerializeToString,
                 response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeResponse.FromString,
+                _registered_method=True)
+        self.PublishFleetObservation = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/PublishFleetObservation',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationResponse.FromString,
+                _registered_method=True)
+        self.CompleteFleetObservation = channel.unary_unary(
+                '/hermes.keryx.v1.KeryxRelay/CompleteFleetObservation',
+                request_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationRequest.SerializeToString,
+                response_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationResponse.FromString,
                 _registered_method=True)
         self.AckTask = channel.unary_unary(
                 '/hermes.keryx.v1.KeryxRelay/AckTask',
@@ -130,6 +150,12 @@ class KeryxRelayServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PublishNodescaleIdentityBindV2(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CompleteNodescaleIdentityBind(self, request, context):
         """Destination-only typed completion for a relay-issued control frame.
         """
@@ -146,9 +172,29 @@ class KeryxRelayServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PublishNodescaleIdentityChallengeV2(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CompleteNodescaleIdentityChallenge(self, request, context):
         """Destination-only typed challenge completion for a relay-issued control frame.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PublishFleetObservation(self, request, context):
+        """Internal non-execution Fleet observation control. The body is either an
+        acquire(selector-only) request or a publish(epoch plus bounded sample).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CompleteFleetObservation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -200,6 +246,11 @@ def add_KeryxRelayServicer_to_server(servicer, server):
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.SerializeToString,
             ),
+            'PublishNodescaleIdentityBindV2': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishNodescaleIdentityBindV2,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindV2Request.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.SerializeToString,
+            ),
             'CompleteNodescaleIdentityBind': grpc.unary_unary_rpc_method_handler(
                     servicer.CompleteNodescaleIdentityBind,
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityBindRequest.FromString,
@@ -210,10 +261,25 @@ def add_KeryxRelayServicer_to_server(servicer, server):
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeResponse.SerializeToString,
             ),
+            'PublishNodescaleIdentityChallengeV2': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishNodescaleIdentityChallengeV2,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeV2Request.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeResponse.SerializeToString,
+            ),
             'CompleteNodescaleIdentityChallenge': grpc.unary_unary_rpc_method_handler(
                     servicer.CompleteNodescaleIdentityChallenge,
                     request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeRequest.FromString,
                     response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeResponse.SerializeToString,
+            ),
+            'PublishFleetObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishFleetObservation,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationResponse.SerializeToString,
+            ),
+            'CompleteFleetObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.CompleteFleetObservation,
+                    request_deserializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationRequest.FromString,
+                    response_serializer=hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationResponse.SerializeToString,
             ),
             'AckTask': grpc.unary_unary_rpc_method_handler(
                     servicer.AckTask,
@@ -377,6 +443,33 @@ class KeryxRelay:
             _registered_method=True)
 
     @staticmethod
+    def PublishNodescaleIdentityBindV2(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityBindV2',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindV2Request.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityBindResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CompleteNodescaleIdentityBind(request,
             target,
             options=(),
@@ -431,6 +524,33 @@ class KeryxRelay:
             _registered_method=True)
 
     @staticmethod
+    def PublishNodescaleIdentityChallengeV2(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/PublishNodescaleIdentityChallengeV2',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeV2Request.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishNodescaleIdentityChallengeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CompleteNodescaleIdentityChallenge(request,
             target,
             options=(),
@@ -447,6 +567,60 @@ class KeryxRelay:
             '/hermes.keryx.v1.KeryxRelay/CompleteNodescaleIdentityChallenge',
             hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeRequest.SerializeToString,
             hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteNodescaleIdentityChallengeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PublishFleetObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/PublishFleetObservation',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.PublishFleetObservationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CompleteFleetObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hermes.keryx.v1.KeryxRelay/CompleteFleetObservation',
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationRequest.SerializeToString,
+            hermes_dot_keryx_dot_v1_dot_relay__pb2.CompleteFleetObservationResponse.FromString,
             options,
             channel_credentials,
             insecure,

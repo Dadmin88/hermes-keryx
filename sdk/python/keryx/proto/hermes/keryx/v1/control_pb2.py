@@ -24,23 +24,43 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dhermes/keryx/v1/control.proto\x12\x0fhermes.keryx.v1\"\xb9\x01\n\x17NodescaleIdentityBindV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\rbinding_nonce\x18\x05 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x06 \x01(\x04\x12\x15\n\ragent_version\x18\x07 \x01(\t\"\xcf\x01\n\x1bNodescaleIdentityBindResult\x12\x46\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x31.hermes.keryx.v1.NodescaleIdentityBindDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x12\n\nbinding_id\x18\x03 \x01(\t\x12\x12\n\ngeneration\x18\x04 \x01(\x04\x12\x10\n\x08revision\x18\x05 \x01(\x04\x12\x0e\n\x06reason\x18\x06 \x01(\t\x12\x0c\n\x04\x63ode\x18\x07 \x01(\t\"\x8b\x01\n\x1cNodescaleIdentityChallengeV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\ragent_version\x18\x05 \x01(\t\"\x87\x02\n NodescaleIdentityChallengeResult\x12K\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x36.hermes.keryx.v1.NodescaleIdentityChallengeDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x14\n\x0c\x63hallenge_id\x18\x03 \x01(\t\x12\x18\n\x10\x63hallenge_secret\x18\x04 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x05 \x01(\x04\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x06 \x01(\x04\x12\x0e\n\x06reason\x18\x07 \x01(\t\x12\x0c\n\x04\x63ode\x18\x08 \x01(\t*\xf4\x01\n NodescaleIdentityBindDisposition\x12\x33\n/NODESCALE_IDENTITY_BIND_DISPOSITION_UNSPECIFIED\x10\x00\x12.\n*NODESCALE_IDENTITY_BIND_DISPOSITION_ACTIVE\x10\x01\x12\x39\n5NODESCALE_IDENTITY_BIND_DISPOSITION_ALREADY_CONFIRMED\x10\x02\x12\x30\n,NODESCALE_IDENTITY_BIND_DISPOSITION_REJECTED\x10\x03*\xcd\x01\n%NodescaleIdentityChallengeDisposition\x12\x38\n4NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_UNSPECIFIED\x10\x00\x12\x33\n/NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_ISSUED\x10\x01\x12\x35\n1NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_REJECTED\x10\x02\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dhermes/keryx/v1/control.proto\x12\x0fhermes.keryx.v1\"\xb9\x01\n\x17NodescaleIdentityBindV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\rbinding_nonce\x18\x05 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x06 \x01(\x04\x12\x15\n\ragent_version\x18\x07 \x01(\t\"\xbd\x01\n\x17NodescaleIdentityBindV2\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x1b\n\x13provider_binding_id\x18\x04 \x01(\t\x12\x15\n\rbinding_nonce\x18\x05 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x06 \x01(\x04\x12\x15\n\ragent_version\x18\x07 \x01(\t\"\xcf\x01\n\x1bNodescaleIdentityBindResult\x12\x46\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x31.hermes.keryx.v1.NodescaleIdentityBindDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x12\n\nbinding_id\x18\x03 \x01(\t\x12\x12\n\ngeneration\x18\x04 \x01(\x04\x12\x10\n\x08revision\x18\x05 \x01(\x04\x12\x0e\n\x06reason\x18\x06 \x01(\t\x12\x0c\n\x04\x63ode\x18\x07 \x01(\t\"\x8b\x01\n\x1cNodescaleIdentityChallengeV1\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x17\n\x0fjoin_session_id\x18\x04 \x01(\t\x12\x15\n\ragent_version\x18\x05 \x01(\t\"\x8f\x01\n\x1cNodescaleIdentityChallengeV2\x12\x14\n\x0coperation_id\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\x12\x1b\n\x13provider_binding_id\x18\x04 \x01(\t\x12\x15\n\ragent_version\x18\x05 \x01(\t\"\x87\x02\n NodescaleIdentityChallengeResult\x12K\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x36.hermes.keryx.v1.NodescaleIdentityChallengeDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x14\n\x0c\x63hallenge_id\x18\x03 \x01(\t\x12\x18\n\x10\x63hallenge_secret\x18\x04 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x05 \x01(\x04\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x06 \x01(\x04\x12\x0e\n\x06reason\x18\x07 \x01(\t\x12\x0c\n\x04\x63ode\x18\x08 \x01(\t\"S\n\x1a\x46leetObservationSelectorV1\x12\x0e\n\x06source\x18\x01 \x01(\t\x12\x12\n\nnetwork_id\x18\x02 \x01(\t\x12\x11\n\tdevice_id\x18\x03 \x01(\t\"Z\n\x19\x46leetObservationAcquireV1\x12=\n\x08selector\x18\x01 \x01(\x0b\x32+.hermes.keryx.v1.FleetObservationSelectorV1\"\x90\x01\n FleetObservationAuthorityEpochV1\x12\x12\n\nbinding_id\x18\x01 \x01(\t\x12\x1d\n\x15\x61uthenticated_peer_id\x18\x02 \x01(\t\x12\x1a\n\x12\x62inding_generation\x18\x03 \x01(\x04\x12\x1d\n\x15projection_generation\x18\x04 \x01(\x04\"\xd9\x01\n\x18\x46leetObservationSampleV1\x12=\n\x08selector\x18\x01 \x01(\x0b\x32+.hermes.keryx.v1.FleetObservationSelectorV1\x12J\n\x0f\x61uthority_epoch\x18\x02 \x01(\x0b\x32\x31.hermes.keryx.v1.FleetObservationAuthorityEpochV1\x12\x18\n\x10observation_json\x18\x03 \x01(\x0c\x12\x18\n\x0csample_bytes\x18\x04 \x01(\x0c\x42\x02\x18\x01\"\xa3\x01\n\x19\x46leetObservationPublishV1\x12=\n\x07\x61\x63quire\x18\x01 \x01(\x0b\x32*.hermes.keryx.v1.FleetObservationAcquireV1H\x00\x12<\n\x07publish\x18\x02 \x01(\x0b\x32).hermes.keryx.v1.FleetObservationSampleV1H\x00\x42\t\n\x07request\"\xe7\x01\n\x1f\x46leetObservationPublishResultV1\x12H\n\x0b\x64isposition\x18\x01 \x01(\x0e\x32\x33.hermes.keryx.v1.FleetObservationPublishDisposition\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12J\n\x0f\x61uthority_epoch\x18\x03 \x01(\x0b\x32\x31.hermes.keryx.v1.FleetObservationAuthorityEpochV1\x12\x0e\n\x06reason\x18\x04 \x01(\t\x12\x0c\n\x04\x63ode\x18\x05 \x01(\t*\xf4\x01\n NodescaleIdentityBindDisposition\x12\x33\n/NODESCALE_IDENTITY_BIND_DISPOSITION_UNSPECIFIED\x10\x00\x12.\n*NODESCALE_IDENTITY_BIND_DISPOSITION_ACTIVE\x10\x01\x12\x39\n5NODESCALE_IDENTITY_BIND_DISPOSITION_ALREADY_CONFIRMED\x10\x02\x12\x30\n,NODESCALE_IDENTITY_BIND_DISPOSITION_REJECTED\x10\x03*\xcd\x01\n%NodescaleIdentityChallengeDisposition\x12\x38\n4NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_UNSPECIFIED\x10\x00\x12\x33\n/NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_ISSUED\x10\x01\x12\x35\n1NODESCALE_IDENTITY_CHALLENGE_DISPOSITION_REJECTED\x10\x02*\xb4\x02\n\"FleetObservationPublishDisposition\x12\x35\n1FLEET_OBSERVATION_PUBLISH_DISPOSITION_UNSPECIFIED\x10\x00\x12\x32\n.FLEET_OBSERVATION_PUBLISH_DISPOSITION_ACQUIRED\x10\x01\x12\x33\n/FLEET_OBSERVATION_PUBLISH_DISPOSITION_PUBLISHED\x10\x02\x12:\n6FLEET_OBSERVATION_PUBLISH_DISPOSITION_ALREADY_RECORDED\x10\x03\x12\x32\n.FLEET_OBSERVATION_PUBLISH_DISPOSITION_REJECTED\x10\x04\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'hermes.keryx.v1.control_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_start=857
-  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_end=1101
-  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_start=1104
-  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_end=1309
+  _globals['_FLEETOBSERVATIONSAMPLEV1'].fields_by_name['sample_bytes']._loaded_options = None
+  _globals['_FLEETOBSERVATIONSAMPLEV1'].fields_by_name['sample_bytes']._serialized_options = b'\030\001'
+  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_start=2139
+  _globals['_NODESCALEIDENTITYBINDDISPOSITION']._serialized_end=2383
+  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_start=2386
+  _globals['_NODESCALEIDENTITYCHALLENGEDISPOSITION']._serialized_end=2591
+  _globals['_FLEETOBSERVATIONPUBLISHDISPOSITION']._serialized_start=2594
+  _globals['_FLEETOBSERVATIONPUBLISHDISPOSITION']._serialized_end=2902
   _globals['_NODESCALEIDENTITYBINDV1']._serialized_start=51
   _globals['_NODESCALEIDENTITYBINDV1']._serialized_end=236
-  _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_start=239
-  _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_end=446
-  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_start=449
-  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_end=588
-  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_start=591
-  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_end=854
+  _globals['_NODESCALEIDENTITYBINDV2']._serialized_start=239
+  _globals['_NODESCALEIDENTITYBINDV2']._serialized_end=428
+  _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_start=431
+  _globals['_NODESCALEIDENTITYBINDRESULT']._serialized_end=638
+  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_start=641
+  _globals['_NODESCALEIDENTITYCHALLENGEV1']._serialized_end=780
+  _globals['_NODESCALEIDENTITYCHALLENGEV2']._serialized_start=783
+  _globals['_NODESCALEIDENTITYCHALLENGEV2']._serialized_end=926
+  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_start=929
+  _globals['_NODESCALEIDENTITYCHALLENGERESULT']._serialized_end=1192
+  _globals['_FLEETOBSERVATIONSELECTORV1']._serialized_start=1194
+  _globals['_FLEETOBSERVATIONSELECTORV1']._serialized_end=1277
+  _globals['_FLEETOBSERVATIONACQUIREV1']._serialized_start=1279
+  _globals['_FLEETOBSERVATIONACQUIREV1']._serialized_end=1369
+  _globals['_FLEETOBSERVATIONAUTHORITYEPOCHV1']._serialized_start=1372
+  _globals['_FLEETOBSERVATIONAUTHORITYEPOCHV1']._serialized_end=1516
+  _globals['_FLEETOBSERVATIONSAMPLEV1']._serialized_start=1519
+  _globals['_FLEETOBSERVATIONSAMPLEV1']._serialized_end=1736
+  _globals['_FLEETOBSERVATIONPUBLISHV1']._serialized_start=1739
+  _globals['_FLEETOBSERVATIONPUBLISHV1']._serialized_end=1902
+  _globals['_FLEETOBSERVATIONPUBLISHRESULTV1']._serialized_start=1905
+  _globals['_FLEETOBSERVATIONPUBLISHRESULTV1']._serialized_end=2136
 # @@protoc_insertion_point(module_scope)

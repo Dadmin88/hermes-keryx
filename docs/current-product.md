@@ -180,7 +180,8 @@ Current examples include:
 - `result_artifact_bytes_v1` for bounded byte-bearing terminal result artifacts;
 - `daemon_task_consumer_v1` for nodes backed by a daemon that can consume task and result frames;
 - `nodescale_identity_bind_v1` and `nodescale_identity_bind_v2` for the versioned typed Nodescale identity-binding control paths;
-- `nodescale.identity.challenge.v1` and `nodescale.identity.challenge.v2` for the versioned authenticated Nodescale challenge control paths.
+- `nodescale.identity.challenge.v1` and `nodescale.identity.challenge.v2` for the versioned authenticated Nodescale challenge control paths;
+- `fleet.observation.publish.v1` for bounded authenticated Fleet observation acquire/publish direct control.
 
 Unknown or unsupported destinations fail explicitly when a requested feature cannot safely be downgraded.
 
