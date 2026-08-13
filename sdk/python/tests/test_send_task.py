@@ -16,6 +16,7 @@ from keryx import (
     TaskResultUnavailableError,
 )
 from keryx.client import DaemonClient
+from keryx.task import Message, Part
 
 
 @pytest.fixture
@@ -70,7 +71,8 @@ async def test_send_task_to_mock_daemon(
     client.send_task.assert_awaited_once()
     kwargs = client.send_task.await_args.kwargs
     assert kwargs["target_peer_id"] == "peer-remote"
-    assert kwargs["message_text"] == "hi"
+    assert kwargs["message"].parts[0].text == "hi"
+    assert kwargs["message"].parts[0].media_type == "text/plain"
     await node.stop()
 
 
@@ -100,6 +102,146 @@ async def test_remote_send_preserves_caller_execution_identity(
     kwargs = client.send_task.await_args.kwargs
     assert kwargs["task_id"] == "execution-123"
     assert kwargs["idempotency_key"] == "execution-123"
+    await node.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_send_preserves_one_binary_task_part(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    client.send_task = AsyncMock(
+        return_value=daemon_pb2.SendTaskResponse(
+            task_id=common_pb2.TaskId(value="execution-binary-1"),
+            status="submitted",
+            routed_to="peer-remote",
+            delivery_route="relay",
+        )
+    )
+    await node.start()
+
+    await node.send_task(
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "raw": b"exact-package-bytes",
+                    "media_type": "application/vnd.hermes.fleet.agency-package.v1+tar",
+                    "metadata": {"sha256": "sha256:" + "a" * 64},
+                }
+            ],
+        },
+        peer_id="peer-remote",
+        task_id="execution-binary-1",
+        idempotency_key="execution-binary-1",
+    )
+
+    message = client.send_task.await_args.kwargs["message"]
+    assert message.parts[0].raw == b"exact-package-bytes"
+    assert message.parts[0].text == ""
+    assert message.parts[0].media_type == (
+        "application/vnd.hermes.fleet.agency-package.v1+tar"
+    )
+    assert dict(message.parts[0].metadata) == {"sha256": "sha256:" + "a" * 64}
+    await node.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_send_preserves_typed_binary_part(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    await node.start()
+
+    await node.send_task(
+        Message(
+            parts=[
+                Part(
+                    raw=b"typed-package",
+                    media_type="application/x-test",
+                    metadata={"digest": "sha256:test"},
+                )
+            ],
+            metadata={"contract": "v1"},
+        ),
+        peer_id="peer-remote",
+    )
+
+    message = client.send_task.await_args.kwargs["message"]
+    assert message.parts[0].raw == b"typed-package"
+    assert message.parts[0].media_type == "application/x-test"
+    assert dict(message.parts[0].metadata) == {"digest": "sha256:test"}
+    assert dict(message.metadata) == {"contract": "v1"}
+    await node.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_send_rejects_ambiguous_or_unscoped_binary_parts(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    await node.start()
+
+    with pytest.raises(ValueError, match="requires a media type"):
+        await node.send_task(
+            {"role": "user", "parts": [{"raw": b"bytes"}]},
+            peer_id="peer-remote",
+        )
+    with pytest.raises(ValueError, match="text and raw"):
+        await node.send_task(
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": "ambiguous",
+                        "raw": b"bytes",
+                        "media_type": "application/vnd.hermes.fleet.agency-package.v1+tar",
+                    }
+                ],
+            },
+            peer_id="peer-remote",
+        )
+    with pytest.raises(ValueError, match="text must be a string"):
+        await node.send_task(
+            {"role": "user", "parts": [{"text": 7}]},
+            peer_id="peer-remote",
+        )
+    with pytest.raises(ValueError, match="raw content must be bytes"):
+        await node.send_task(
+            {
+                "role": "user",
+                "parts": [{"raw": "bytes", "media_type": "application/x-test"}],
+            },
+            peer_id="peer-remote",
+        )
+    with pytest.raises(ValueError, match="keys and values must be strings"):
+        await node.send_task(
+            {
+                "role": "user",
+                "parts": [{"text": "text", "metadata": {"bad": 7}}],
+            },
+            peer_id="peer-remote",
+        )
+    for invalid_part, message in (
+        ({"text": "text", "raw": False}, "raw content must be bytes"),
+        ({"text": "text", "raw": 0}, "raw content must be bytes"),
+        ({"text": "text", "raw": None}, "raw content must be bytes"),
+        ({"text": "text", "media_type": False}, "media type"),
+        ({"text": "text", "media_type": 0}, "media type"),
+        ({"text": "text", "metadata": False}, "metadata must be a mapping"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            await node.send_task(
+                {"role": "user", "parts": [invalid_part]},
+                peer_id="peer-remote",
+            )
+    with pytest.raises(ValueError, match="message metadata must be a mapping"):
+        await node.send_task(
+            {"role": "user", "parts": [{"text": "text"}], "metadata": False},
+            peer_id="peer-remote",
+        )
+
+    client.send_task.assert_not_awaited()
     await node.stop()
 
 

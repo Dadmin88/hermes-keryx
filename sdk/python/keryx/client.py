@@ -293,7 +293,8 @@ class DaemonClient:
         *,
         target_peer_id: str,
         task_id: str,
-        message_text: str,
+        message_text: str | None = None,
+        message: task_pb2.TaskMessage | None = None,
         idempotency_key: str | None = None,
         metadata: dict[str, str] | None = None,
         deadline_ms: int = 0,
@@ -308,19 +309,26 @@ class DaemonClient:
             raise ValueError(
                 "deadline_ms must be zero or a positive signed 64-bit integer"
             )
+        if (message_text is None) == (message is None):
+            raise ValueError("exactly one task message representation is required")
+        if message is not None and type(message) is not task_pb2.TaskMessage:
+            raise TypeError("message must be a TaskMessage")
+        task_message = (
+            message
+            if message is not None
+            else task_pb2.TaskMessage(
+                parts=[
+                    task_pb2.TaskMessagePart(
+                        text=message_text,
+                        media_type="text/plain",
+                    )
+                ]
+            )
+        )
         envelope = task_pb2.TaskEnvelope(
             task_id=common_pb2.TaskId(value=task_id),
             status=task_pb2.TASK_STATUS_CREATED,
-            messages=[
-                task_pb2.TaskMessage(
-                    parts=[
-                        task_pb2.TaskMessagePart(
-                            text=message_text,
-                            media_type="text/plain",
-                        )
-                    ]
-                )
-            ],
+            messages=[task_message],
             metadata=metadata or {},
             deadline_ms=deadline_ms,
         )

@@ -11,7 +11,13 @@ import pytest
 from keryx.card import AgentCard, Skill
 from keryx.client import DaemonClient, PeerInfo
 from keryx.node import KeryxNode
-from hermes.keryx.v1 import common_pb2, daemon_pb2, registry_pb2, result_pb2
+from hermes.keryx.v1 import (
+    common_pb2,
+    daemon_pb2,
+    registry_pb2,
+    result_pb2,
+    task_pb2,
+)
 
 
 def _make_peer_id(pubkey_bytes: bytes) -> str:
@@ -362,6 +368,52 @@ async def test_daemon_client_carries_remote_idempotency_identity() -> None:
     envelope = client._fake_daemon.sent[0].envelope
     assert envelope.task_id.value == "execution-123"
     assert envelope.idempotency_key.value == "execution-123"
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_preserves_structured_binary_message() -> None:
+    client = FakeDaemonClient(local_peer_id="peer-local")
+    await client.connect()
+    message = task_pb2.TaskMessage(
+        parts=[
+            task_pb2.TaskMessagePart(
+                media_type="application/x-test",
+                raw=b"\x00\xffexact",
+                metadata={"digest": "sha256:test"},
+            )
+        ]
+    )
+
+    await client.send_task(
+        target_peer_id="peer-remote",
+        task_id="task-binary",
+        message=message,
+    )
+
+    part = client._fake_daemon.sent[0].envelope.messages[0].parts[0]
+    assert part.raw == b"\x00\xffexact"
+    assert part.text == ""
+    assert part.media_type == "application/x-test"
+    assert dict(part.metadata) == {"digest": "sha256:test"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_rejects_missing_or_ambiguous_message_representation() -> None:
+    client = FakeDaemonClient(local_peer_id="peer-local")
+    await client.connect()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await client.send_task(
+            target_peer_id="peer-remote",
+            task_id="task-no-message",
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        await client.send_task(
+            target_peer_id="peer-remote",
+            task_id="task-two-messages",
+            message_text="text",
+            message=task_pb2.TaskMessage(),
+        )
 
 
 @pytest.mark.asyncio
