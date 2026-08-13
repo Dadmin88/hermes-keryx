@@ -6,7 +6,8 @@ See also: [current-product.md](current-product.md), [observability.md](observabi
 
 ## Versioned binary releases
 
-A signed repository tag matching `v*` runs `.github/workflows/release.yml` and
+A repository tag using a release name such as `v1.0.0` runs
+`.github/workflows/release.yml` and
 publishes one Linux x86-64 archive containing `keryx`, `keryxd`, `keryx-relay`,
 and `keryx-node`, together with a SHA-256 checksum. The archive contains no
 relay configuration, node token, identity key, TLS material, or durable state.
