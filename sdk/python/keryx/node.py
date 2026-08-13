@@ -803,7 +803,7 @@ class KeryxNode:
         if url is not None:
             raise NotImplementedError("HTTP bridge outbound is not implemented in keryx-py yet")
         assert peer_id is not None
-        text = _message_text(message)
+        task_message = _validated_outbound_message(message)
         caller_task_id = task_id is not None
         requested_task_id = _validate_task_id(task_id or str(uuid.uuid4()))
         if idempotency_key is not None:
@@ -813,7 +813,7 @@ class KeryxNode:
                 target_peer_id=peer_id,
                 task_id=requested_task_id,
                 idempotency_key=idempotency_key,
-                message_text=text,
+                message=task_message,
                 metadata=metadata,
                 deadline_ms=deadline_ms,
             )
@@ -1417,6 +1417,23 @@ def _validate_task_id(task_id: str) -> str:
     return task_id
 
 
+def _validated_outbound_message(
+    message: dict[str, Any] | Message,
+) -> task_pb2.TaskMessage:
+    task_message = _task_message(message)
+    if len(task_message.parts) != 1:
+        raise ValueError("outbound task must contain exactly one message part")
+    part = task_message.parts[0]
+    if part.text and part.raw:
+        raise ValueError("outbound task part cannot contain text and raw bytes")
+    if part.raw:
+        if not part.media_type or part.media_type == "text/plain":
+            raise ValueError("outbound binary task part requires a media type")
+    elif part.media_type != "text/plain" or not part.text:
+        raise ValueError("outbound text task part is invalid")
+    return task_message
+
+
 def _task_envelope(
     *,
     task_id: str,
@@ -1449,13 +1466,18 @@ def _task_message(message: str | Message | Mapping[str, Any]) -> task_pb2.TaskMe
         )
     if isinstance(message, Message):
         return task_pb2.TaskMessage(
-            parts=[
-                task_pb2.TaskMessagePart(media_type="text/plain", text=part.text or "")
-                for part in message.parts
-            ]
+            parts=[_message_part(part) for part in message.parts],
+            metadata=_string_metadata(message.metadata, "message metadata"),
         )
+    if not isinstance(message, Mapping):
+        raise ValueError("task message must be a string, Message, or mapping")
     parts = message.get("parts", [])
-    metadata = dict(message.get("metadata", {}) or {})
+    if not isinstance(parts, list | tuple):
+        raise ValueError("task message parts must be a list or tuple")
+    metadata = _string_metadata(
+        message["metadata"] if "metadata" in message else {},
+        "message metadata",
+    )
     return task_pb2.TaskMessage(
         parts=[_message_part(part) for part in parts],
         metadata=metadata,
@@ -1464,15 +1486,41 @@ def _task_message(message: str | Message | Mapping[str, Any]) -> task_pb2.TaskMe
 
 def _message_part(part: Any) -> task_pb2.TaskMessagePart:
     if isinstance(part, Part):
-        return task_pb2.TaskMessagePart(media_type="text/plain", text=part.text or "")
-    if isinstance(part, str):
+        text = part.text
+        raw = part.raw
+        media_type = part.media_type
+        metadata = part.metadata
+    elif isinstance(part, str):
         return task_pb2.TaskMessagePart(media_type="text/plain", text=part)
+    elif isinstance(part, Mapping):
+        text = part.get("text")
+        raw = part["raw"] if "raw" in part else b""
+        media_type = part["media_type"] if "media_type" in part else "text/plain"
+        metadata = part["metadata"] if "metadata" in part else {}
+    elif not isinstance(part, Part):
+        raise ValueError("task message part must be a string, Part, or mapping")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("task message part text must be a string")
+    if not isinstance(raw, bytes):
+        raise ValueError("task message part raw content must be bytes")
+    if not isinstance(media_type, str) or not media_type:
+        raise ValueError("task message part media type must be a nonempty string")
     return task_pb2.TaskMessagePart(
-        media_type=str(part.get("media_type") or "text/plain"),
-        text=str(part.get("text") or ""),
-        raw=part.get("raw") or b"",
-        metadata=dict(part.get("metadata", {}) or {}),
+        media_type=media_type,
+        text=text or "",
+        raw=raw,
+        metadata=_string_metadata(metadata, "task message part metadata"),
     )
+
+
+def _string_metadata(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    if not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise ValueError(f"{label} keys and values must be strings")
+    return dict(value)
 
 
 def _artifact_proto(item: TaskArtifact | Mapping[str, Any]) -> daemon_pb2.TaskArtifact:
@@ -1509,17 +1557,6 @@ def _is_unknown_peer_error(exc: BaseException) -> bool:
         detail_text = None
     text = " ".join(str(part) for part in (detail_text, exc) if part)
     return status_code == grpc.StatusCode.NOT_FOUND and "unknown peer" in text.lower()
-
-def _message_text(message: dict[str, Any] | Message) -> str:
-    if isinstance(message, dict):
-        parts = message.get("parts") or []
-        if parts and isinstance(parts[0], dict):
-            return str(parts[0].get("text") or "")
-        if parts:
-            return str(parts[0])
-        return ""
-    return (message.parts[0].text if message.parts else "") or ""
-
 
 def _proto_to_dict(message: Any) -> dict[str, Any]:
     if is_dataclass(message) and not isinstance(message, type):
