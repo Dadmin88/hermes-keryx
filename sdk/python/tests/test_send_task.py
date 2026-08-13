@@ -75,6 +75,52 @@ async def test_send_task_to_mock_daemon(
 
 
 @pytest.mark.asyncio
+async def test_remote_send_preserves_caller_execution_identity(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, client = started_node
+    client.send_task = AsyncMock(
+        return_value=daemon_pb2.SendTaskResponse(
+            task_id=common_pb2.TaskId(value="execution-123"),
+            status="submitted",
+            routed_to="peer-remote",
+            delivery_route="relay",
+        )
+    )
+    await node.start()
+
+    handle = await node.send_task(
+        {"role": "user", "parts": [{"text": "execute once"}]},
+        peer_id="peer-remote",
+        task_id="execution-123",
+        idempotency_key="execution-123",
+    )
+
+    assert handle.task_id == "execution-123"
+    kwargs = client.send_task.await_args.kwargs
+    assert kwargs["task_id"] == "execution-123"
+    assert kwargs["idempotency_key"] == "execution-123"
+    await node.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_send_rejects_mismatched_receipt_identity(
+    started_node: tuple[KeryxNode, AsyncMock],
+) -> None:
+    node, _client = started_node
+    await node.start()
+
+    with pytest.raises(RuntimeError, match="task identity"):
+        await node.send_task(
+            {"role": "user", "parts": [{"text": "execute once"}]},
+            peer_id="peer-remote",
+            task_id="execution-expected",
+            idempotency_key="execution-expected",
+        )
+    await node.stop()
+
+
+@pytest.mark.asyncio
 async def test_remote_terminal_without_durable_result_raises_stable_error(
     started_node: tuple[KeryxNode, AsyncMock],
 ) -> None:

@@ -114,6 +114,12 @@ A relay-accepted receipt proves relay acceptance, not remote execution.
 
 `TaskHandle.wait()` observes the origin daemon's durable result record. `node.task_handle(task_id)` can reopen status/result observation after the controller process restarts.
 
+Controllers that must recover an uncertain submission can preassign both
+`task_id` and `idempotency_key` to `send_task()`. Keryx carries those exact
+identities into its durable envelope and rejects a response whose task identity
+does not match the caller's request. Recovery should inspect the preassigned
+task ID before deciding whether any submission is still required.
+
 Historical terminal rows that predate durable result storage raise `TaskResultUnavailableError` rather than fabricating a terminal result.
 
 ## Deadlines
