@@ -256,6 +256,7 @@ async def test_registration_lifecycle_refreshes_then_deregisters() -> None:
         name="worker",
         description="Worker",
         skills=[Skill(id="backend", tags=["python", "linux"])],
+        protocol_features=["fleet.observation.publish.v1"],
     )
     node = KeryxNode(card)
     node._client = client
@@ -276,6 +277,9 @@ async def test_registration_lifecycle_refreshes_then_deregisters() -> None:
     assert client.register_skills.await_count == refresh_count
     assert client.register_skills.await_args.kwargs["skills"] == [
         ("backend", "", ["python", "linux"])
+    ]
+    assert client.register_skills.await_args.kwargs["protocol_features"] == [
+        "fleet.observation.publish.v1"
     ]
     client.unregister_skills.assert_awaited_once_with(
         peer_id="peer-worker", skill_ids=["backend"]
