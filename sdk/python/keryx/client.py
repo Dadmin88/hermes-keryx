@@ -294,6 +294,7 @@ class DaemonClient:
         target_peer_id: str,
         task_id: str,
         message_text: str,
+        idempotency_key: str | None = None,
         metadata: dict[str, str] | None = None,
         deadline_ms: int = 0,
         timeout_ms: int = 0,
@@ -323,6 +324,10 @@ class DaemonClient:
             metadata=metadata or {},
             deadline_ms=deadline_ms,
         )
+        if idempotency_key is not None:
+            envelope.idempotency_key.CopyFrom(
+                common_pb2.IdempotencyKey(value=idempotency_key)
+            )
         request = daemon_pb2.SendTaskRequest(
             target_peer_id=target_peer_id,
             envelope=envelope,

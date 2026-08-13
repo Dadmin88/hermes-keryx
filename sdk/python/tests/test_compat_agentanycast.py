@@ -348,6 +348,23 @@ async def test_daemon_client_keeps_execution_deadline_distinct_from_delivery_tim
 
 
 @pytest.mark.asyncio
+async def test_daemon_client_carries_remote_idempotency_identity() -> None:
+    client = FakeDaemonClient(local_peer_id="peer-local")
+    await client.connect()
+
+    await client.send_task(
+        target_peer_id="peer-remote",
+        task_id="execution-123",
+        idempotency_key="execution-123",
+        message_text="hello",
+    )
+
+    envelope = client._fake_daemon.sent[0].envelope
+    assert envelope.task_id.value == "execution-123"
+    assert envelope.idempotency_key.value == "execution-123"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("deadline_ms", [True, -1, 2**63])
 async def test_daemon_client_rejects_invalid_execution_deadline(deadline_ms: int) -> None:
     client = FakeDaemonClient(local_peer_id="peer-local")

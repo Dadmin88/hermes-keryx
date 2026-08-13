@@ -784,6 +784,8 @@ class KeryxNode:
         peer_id: str | None = None,
         skill: str | None = None,
         url: str | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
         metadata: dict[str, str] | None = None,
         deadline_ms: int = 0,
     ) -> TaskHandle:
@@ -802,11 +804,15 @@ class KeryxNode:
             raise NotImplementedError("HTTP bridge outbound is not implemented in keryx-py yet")
         assert peer_id is not None
         text = _message_text(message)
-        task_id = str(uuid.uuid4())
+        caller_task_id = task_id is not None
+        requested_task_id = _validate_task_id(task_id or str(uuid.uuid4()))
+        if idempotency_key is not None:
+            idempotency_key = _validate_task_id(idempotency_key)
         try:
             response = await self._client.send_task(
                 target_peer_id=peer_id,
-                task_id=task_id,
+                task_id=requested_task_id,
+                idempotency_key=idempotency_key,
                 message_text=text,
                 metadata=metadata,
                 deadline_ms=deadline_ms,
@@ -820,8 +826,11 @@ class KeryxNode:
                     "delivery requires a relay-backed daemon route / task publisher."
                 ) from exc
             raise
+        returned_task_id = response.task_id.value or requested_task_id
+        if caller_task_id and returned_task_id != requested_task_id:
+            raise RuntimeError("Keryx returned a mismatched task identity")
         task = Task(
-            task_id=response.task_id.value or task_id,
+            task_id=returned_task_id,
             status=LegacyTaskStatus.SUBMITTED,
         )
         return self._remote_task_handle(
