@@ -1,0 +1,41 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binaries
+        run: |
+          cargo build --release -p keryx-cli --bin keryx
+          cargo build --release -p keryx-daemon --bin keryxd
+          cargo build --release -p keryx-relay --bins
+      - name: Package exact-version artifact
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          artifact="keryx-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/$artifact"
+          for binary in keryx keryxd keryx-relay keryx-node
+          do
+            install -m 0755 "target/release/$binary" "dist/$artifact/$binary"
+          done
+          tar -C dist -czf "dist/$artifact.tar.gz" "$artifact"
+          sha256sum "dist/$artifact.tar.gz" > "dist/$artifact.tar.gz.sha256"
+      - name: Publish versioned artifacts and checksums
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
