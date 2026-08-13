@@ -4,6 +4,19 @@ Operator runbook for `keryxd`, `keryx-relay`, `keryx-node`, the `keryx` CLI, hea
 
 See also: [current-product.md](current-product.md), [observability.md](observability.md), and [worker-loop.md](worker-loop.md).
 
+## Versioned binary releases
+
+A repository tag using a release name such as `v1.0.0` runs
+`.github/workflows/release.yml` and
+publishes one Linux x86-64 archive containing `keryx`, `keryxd`, `keryx-relay`,
+and `keryx-node`, together with a SHA-256 checksum. The archive contains no
+relay configuration, node token, identity key, TLS material, or durable state.
+
+Ordinary installations should select an exact tag and verify the adjacent
+checksum before replacing binaries. A moving branch archive or developer
+checkout is not an installation artifact. Pull-request CI validates changes
+but never publishes a release.
+
 ## Quick paths
 
 | Goal | Command |
