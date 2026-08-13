@@ -954,6 +954,7 @@ class KeryxNode:
                 (skill.id, skill.description, list(skill.tags))
                 for skill in active_card.skills
             ],
+            protocol_features=list(active_card.protocol_features),
             ttl_seconds=ttl_seconds,
         )
         return {
