@@ -164,6 +164,21 @@ impl NodeTokenAuth {
             .contains(node_id)
     }
 
+    /// Return the node identities currently permitted to authenticate.
+    #[must_use]
+    pub fn authorized_node_ids(&self) -> HashSet<String> {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot
+            .tokens
+            .keys()
+            .filter(|node_id| !snapshot.revoked_nodes.contains(*node_id))
+            .map(ToString::to_string)
+            .collect()
+    }
+
     pub fn authenticate(
         &self,
         node_id: &NodeId,

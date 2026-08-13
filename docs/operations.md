@@ -234,8 +234,9 @@ when `security.node_tokens_path` is configured, the complete owner-managed node
 token authentication file. The two reloads are independent. A token file is
 fully parsed and validated before one atomic in-process replacement; a missing
 or invalid replacement leaves the previous authentication snapshot active.
-Existing relay streams are not disconnected by this reload. Reload logs report
-only success or failure and never include node-token values.
+Existing relay streams for nodes removed from the replacement or listed as revoked are
+disconnected immediately. Reload logs report success or failure and the number of
+disconnected streams, but never include node-token values.
 
 ### Relay code defaults vs dual-run defaults
 

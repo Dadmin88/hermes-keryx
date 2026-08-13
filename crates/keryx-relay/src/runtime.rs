@@ -270,6 +270,32 @@ impl RelayRuntime {
         }
     }
 
+    /// Disconnect streams whose node identities are absent from an authorization snapshot.
+    pub fn disconnect_unauthorized_nodes(&self, authorized_node_ids: &HashSet<String>) -> usize {
+        let disconnected = {
+            let mut guard = self.lock_peers();
+            let unauthorized = guard
+                .connected_nodes
+                .keys()
+                .filter(|node_id| !authorized_node_ids.contains(*node_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let disconnected = unauthorized
+                .iter()
+                .filter_map(|node_id| guard.connected_nodes.remove(node_id))
+                .collect::<Vec<_>>();
+            self.sync_connected_peer_metric(&guard);
+            disconnected
+        };
+        let count = disconnected.len();
+        for connected in disconnected {
+            let _ = connected.sender.try_send(Err(Status::unauthenticated(
+                "node authorization was revoked",
+            )));
+        }
+        count
+    }
+
     /// Disconnect the current generation with a terminal stream status.
     pub fn disconnect_node_with_status_if_current(
         &self,

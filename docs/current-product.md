@@ -142,9 +142,10 @@ Task and result mutations require authenticated node credentials when relay auth
 
 On Unix, a TOML-configured relay can atomically reload the complete owner-managed
 `security.node_tokens_path` authentication snapshot on SIGHUP without restarting
-the relay or disconnecting existing streams. Invalid or missing replacement files
-leave the previous working snapshot active; allowlist and token reload outcomes
-are independent.
+the relay. Streams belonging to removed or revoked nodes are disconnected as the
+new snapshot is applied, while authorized streams remain connected. Invalid or
+missing replacement files leave the previous working snapshot active; allowlist
+and token reload outcomes are independent.
 
 Registry registration/deregistration ownership is also derived from authenticated node metadata. Request-body identity cannot authorize mutation of another peer's registry entry.
 

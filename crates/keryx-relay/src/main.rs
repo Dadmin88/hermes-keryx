@@ -295,8 +295,8 @@ async fn run_relay_loop_unix(
                 }
                 if let Some(toml) = &process.toml {
                     match toml.resolved_node_tokens_path(config_path) {
-                        Ok(Some(path)) => match reload_node_token_auth(toml, config_path, node_auth) {
-                            Ok(()) => info!(path = %path.display(), "node token authentication reloaded from disk"),
+                        Ok(Some(path)) => match reload_node_token_auth(toml, config_path, node_auth, runtime) {
+                            Ok(disconnected) => info!(path = %path.display(), disconnected, "node token authentication reloaded from disk"),
                             Err(_) => tracing::warn!(path = %path.display(), "node token authentication reload failed; previous snapshot retained"),
                         },
                         Ok(None) => {}
@@ -391,8 +391,10 @@ fn reload_node_token_auth(
     config: &RelayTomlConfig,
     config_path: &Path,
     node_auth: &NodeTokenAuth,
-) -> Result<()> {
-    config.reload_node_token_auth(config_path, node_auth)
+    runtime: &RelayRuntime,
+) -> Result<usize> {
+    config.reload_node_token_auth(config_path, node_auth)?;
+    Ok(runtime.disconnect_unauthorized_nodes(&node_auth.authorized_node_ids()))
 }
 
 #[cfg(test)]
@@ -427,6 +429,7 @@ mod tests {
             HashMap::from([(worker.clone(), worker_token.to_string())]),
             HashSet::new(),
         ));
+        let runtime = RelayRuntime::new("relay-test");
 
         std::fs::write(
             &tokens_path,
@@ -435,13 +438,68 @@ mod tests {
             ),
         )
         .unwrap();
-        reload_node_token_auth(&config, &config_path, &auth).unwrap();
+        reload_node_token_auth(&config, &config_path, &auth, &runtime).unwrap();
         assert!(auth.authenticate(&worker, worker_token).is_ok());
         assert!(auth.authenticate(&control, control_token).is_ok());
 
         std::fs::write(&tokens_path, "[[tokens]]\nnode_id = ").unwrap();
-        assert!(reload_node_token_auth(&config, &config_path, &auth).is_err());
+        assert!(reload_node_token_auth(&config, &config_path, &auth, &runtime).is_err());
         assert!(auth.authenticate(&worker, worker_token).is_ok());
         assert!(auth.authenticate(&control, control_token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn configured_node_token_reload_disconnects_removed_and_revoked_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("relay.toml");
+        let tokens_path = dir.path().join("node-tokens.toml");
+        let config: RelayTomlConfig =
+            toml::from_str("[security]\nnode_tokens_path = \"node-tokens.toml\"\n").unwrap();
+        let auth = Arc::new(NodeTokenAuth::new(
+            HashMap::from([
+                (
+                    "node:retained".parse().unwrap(),
+                    "retained-token-secure".into(),
+                ),
+                (
+                    "node:removed".parse().unwrap(),
+                    "removed-token-secure".into(),
+                ),
+                (
+                    "node:revoked".parse().unwrap(),
+                    "revoked-token-secure".into(),
+                ),
+            ]),
+            HashSet::new(),
+        ));
+        let runtime = RelayRuntime::new("relay-test");
+        let (retained_tx, mut retained_rx) = tokio::sync::mpsc::channel(1);
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(1);
+        let (revoked_tx, mut revoked_rx) = tokio::sync::mpsc::channel(1);
+        runtime.connect_node("node:retained", retained_tx);
+        runtime.connect_node("node:removed", removed_tx);
+        runtime.connect_node("node:revoked", revoked_tx);
+        std::fs::write(
+            tokens_path,
+            "revoked_nodes = [\"node:revoked\"]\n\n[[tokens]]\nnode_id = \"node:retained\"\ntoken = \"retained-token-secure\"\n\n[[tokens]]\nnode_id = \"node:revoked\"\ntoken = \"revoked-token-secure\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            reload_node_token_auth(&config, &config_path, &auth, &runtime).unwrap(),
+            2
+        );
+        assert!(runtime.peer_identity("node:retained").unwrap().connected);
+        assert!(!runtime.peer_identity("node:removed").unwrap().connected);
+        assert!(!runtime.peer_identity("node:revoked").unwrap().connected);
+        assert!(retained_rx.try_recv().is_err());
+        assert_eq!(
+            removed_rx.recv().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            revoked_rx.recv().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 }
